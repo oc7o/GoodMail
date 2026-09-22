@@ -1,0 +1,18 @@
+{
+  "sessionState": "s1",
+  "methodResponses": [
+    ["Mailbox/get", {
+      "accountId": "u1234",
+      "state": "m42",
+      "notFound": [],
+      "list": [
+        {"id": "mb1", "name": "Inbox", "parentId": null, "role": "inbox", "sortOrder": 1,
+         "totalEmails": 120, "unreadEmails": 3, "totalThreads": 100, "unreadThreads": 2,
+         "isSubscribed": true, "myRights": {"mayReadItems": true}},
+        {"id": "mb2", "name": "Receipts", "parentId": "mb1", "role": null, "sortOrder": 10,
+         "totalEmails": 5, "unreadEmails": 0, "totalThreads": 5, "unreadThreads": 0,
+         "isSubscribed": true}
+      ]
+    }, "c0"]
+  ]
+}

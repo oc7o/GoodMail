@@ -1,0 +1,22 @@
+{
+  "sessionState": "s1",
+  "methodResponses": [
+    ["Email/query", {
+      "accountId": "u1234", "queryState": "q1", "canCalculateChanges": true,
+      "position": 0, "ids": ["e1"], "total": 1
+    }, "c0"],
+    ["Email/get", {
+      "accountId": "u1234", "state": "e9", "notFound": [],
+      "list": [{
+        "id": "e1", "threadId": "t1", "blobId": "b1",
+        "mailboxIds": {"mb1": true}, "keywords": {"$seen": true},
+        "receivedAt": "2026-09-20T08:15:00Z", "sentAt": "2026-09-20T10:14:59+02:00",
+        "from": [{"name": "Newsletter", "email": "news@example.com"}],
+        "to": [{"name": null, "email": "shop.x7k2@fastmail.com"}],
+        "subject": "Weekly deals", "preview": "Our best offers", "hasAttachment": false,
+        "header:List-Unsubscribe:asURLs": ["mailto:unsub@example.com", "https://example.com/u?id=1"],
+        "header:List-Unsubscribe-Post:asText": "List-Unsubscribe=One-Click"
+      }]
+    }, "c1"]
+  ]
+}

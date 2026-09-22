@@ -1,0 +1,27 @@
+{
+  "capabilities": {
+    "urn:ietf:params:jmap:core": {"maxSizeUpload": 50000000, "maxCallsInRequest": 50},
+    "urn:ietf:params:jmap:mail": {},
+    "urn:ietf:params:jmap:submission": {},
+    "https://www.fastmail.com/dev/maskedemail": {}
+  },
+  "accounts": {
+    "u1234": {
+      "name": "user@fastmail.com",
+      "isPersonal": true,
+      "isReadOnly": false,
+      "accountCapabilities": {"urn:ietf:params:jmap:mail": {}, "https://www.fastmail.com/dev/maskedemail": {}}
+    }
+  },
+  "primaryAccounts": {
+    "urn:ietf:params:jmap:mail": "u1234",
+    "urn:ietf:params:jmap:submission": "u1234",
+    "https://www.fastmail.com/dev/maskedemail": "u1234"
+  },
+  "username": "user@fastmail.com",
+  "apiUrl": "https://api.fastmail.com/jmap/api/",
+  "downloadUrl": "https://www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}?type={type}",
+  "uploadUrl": "https://api.fastmail.com/jmap/upload/{accountId}/",
+  "eventSourceUrl": "https://api.fastmail.com/jmap/event/",
+  "state": "s1"
+}

@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test-packages:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test GoodMailKit
+        working-directory: GoodMailKit
+        run: swift test
+
+  build-app:
+    runs-on: macos-15
+    strategy:
+      matrix:
+        destination: ["platform=macOS", "generic/platform=iOS"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Generate Xcode project
+        run: brew install xcodegen && xcodegen generate
+      - name: Build
+        run: >
+          xcodebuild -project GoodMail.xcodeproj -scheme GoodMail
+          -destination '${{ matrix.destination }}' CODE_SIGNING_ALLOWED=NO build

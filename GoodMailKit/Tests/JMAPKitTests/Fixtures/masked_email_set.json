@@ -1,0 +1,10 @@
+{
+  "sessionState": "s1",
+  "methodResponses": [
+    ["MaskedEmail/set", {
+      "accountId": "u1234", "oldState": null, "newState": "me2",
+      "created": {"new": {"id": "masked-1", "email": "shop.x7k2@fastmail.com", "state": "enabled",
+                          "createdBy": "GoodMail", "createdAt": "2026-09-22T12:00:00Z"}}
+    }, "c0"]
+  ]
+}
