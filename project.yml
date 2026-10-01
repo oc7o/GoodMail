@@ -29,6 +29,12 @@ targets:
     dependencies:
       - package: GoodMailKit
         product: JMAPKit
+      - package: GoodMailKit
+        product: MailPrivacy
+      - package: GoodMailKit
+        product: GoodMailCore
+      - package: GoodMailKit
+        product: DemoAccount
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: dev.goodmail.GoodMail

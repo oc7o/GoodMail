@@ -1,15 +1,17 @@
+import DemoAccount
 import Foundation
+import GoodMailCore
 import JMAPKit
 import Observation
 
-/// Top-level app state: whether we're signed in, and the client for the account.
+/// Top-level app state: whether we're signed in, and the mail model for the account.
 @MainActor
 @Observable
 final class AppModel {
     enum State {
         case loading
         case signedOut
-        case signedIn(JMAPClient)
+        case signedIn(MailModel)
     }
 
     enum SignInError: LocalizedError {
@@ -36,8 +38,14 @@ final class AppModel {
 
     func restore() {
         guard case .loading = state else { return }
+        #if DEBUG
+        if UserDefaults.standard.bool(forKey: "demo") {
+            state = .signedIn(mailModel(for: JMAPClient(token: "demo", transport: DemoTransport())))
+            return
+        }
+        #endif
         if let token = try? keychain.read(tokenKey), !token.isEmpty {
-            state = .signedIn(JMAPClient(token: token))
+            state = .signedIn(mailModel(for: JMAPClient(token: token)))
         } else {
             state = .signedOut
         }
@@ -62,11 +70,15 @@ final class AppModel {
         }
 
         try keychain.write(token, for: tokenKey)
-        state = .signedIn(client)
+        state = .signedIn(mailModel(for: client))
     }
 
     func signOut() {
         try? keychain.delete(tokenKey)
         state = .signedOut
+    }
+
+    private func mailModel(for client: JMAPClient) -> MailModel {
+        MailModel(client: client) { [weak self] in self?.signOut() }
     }
 }

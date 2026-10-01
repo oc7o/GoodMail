@@ -31,3 +31,38 @@ public enum JMAPError: Error, Sendable, Equatable {
     case decoding(String)
     case transport(String)
 }
+
+extension JMAPError: LocalizedError {
+    public var errorDescription: String? {
+        switch self {
+        case .unauthorized:
+            "Fastmail no longer accepts this API token."
+        case .http(let status, let problemType):
+            "Fastmail returned an error (HTTP \(status)\(problemType.map { ", \($0)" } ?? ""))."
+        case .rateLimited:
+            "Fastmail is rate limiting requests. Try again in a moment."
+        case .missingCapability(let capability):
+            "This account doesn't offer \(capability)."
+        case .method(let error):
+            error.errorDescription
+        case .unexpectedResponse:
+            "Fastmail sent an incomplete response."
+        case .decoding(let details):
+            "Couldn't read Fastmail's response (\(details))."
+        case .transport(let message):
+            message
+        }
+    }
+}
+
+extension MethodError: LocalizedError {
+    public var errorDescription: String? {
+        "Fastmail rejected the request: \(description ?? type)."
+    }
+}
+
+extension SetError: LocalizedError {
+    public var errorDescription: String? {
+        "Fastmail couldn't apply the change: \(description ?? type)."
+    }
+}

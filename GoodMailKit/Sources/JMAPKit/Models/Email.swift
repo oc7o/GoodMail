@@ -8,8 +8,8 @@ public struct Email: QueryableObject, Equatable {
     public let id: String
     public let blobId: String?
     public let threadId: String?
-    public let mailboxIds: [String: Bool]?
-    public let keywords: [String: Bool]?
+    public internal(set) var mailboxIds: [String: Bool]?
+    public internal(set) var keywords: [String: Bool]?
     public let size: Int?
     public let receivedAt: Date?
 
@@ -208,5 +208,67 @@ public struct EmailGet: MethodCall {
     }
 }
 
+extension Email: SettableObject {
+    /// Untyped until compose lands: only `update` and `destroy` are used so far.
+    public typealias Create = JSONValue
+
+    /// The email as it will look once the server has applied `patch` to its keywords and mailboxes.
+    public func applying(_ patch: PatchObject) -> Email {
+        var email = self
+        for (path, value) in patch {
+            let components = path.split(separator: "/", maxSplits: 1).map(String.init)
+            let key = components.count == 2 ? JSONPointer.unescape(components[1]) : nil
+            switch components[0] {
+            case "keywords": email.keywords = Self.patched(email.keywords, key: key, value: value)
+            case "mailboxIds": email.mailboxIds = Self.patched(email.mailboxIds, key: key, value: value)
+            default: break
+            }
+        }
+        return email
+    }
+
+    private static func patched(_ flags: [String: Bool]?, key: String?, value: JSONValue) -> [String: Bool]? {
+        guard let key else {
+            guard case .object(let object) = value else { return flags }
+            return object.compactMapValues { $0 == .bool(true) ? true : nil }
+        }
+        var flags = flags ?? [:]
+        flags[key] = value == .bool(true) ? true : nil
+        return flags
+    }
+}
+
+extension PatchObject {
+    public static func setKeyword(_ keyword: Email.Keyword, _ isSet: Bool) -> PatchObject {
+        ["keywords/\(JSONPointer.escape(keyword.rawValue))": isSet ? .bool(true) : .null]
+    }
+
+    /// Adds the email to `destination`, taking it out of `source` if given.
+    public static func move(from source: String? = nil, to destination: String) -> PatchObject {
+        var patch: PatchObject = ["mailboxIds/\(JSONPointer.escape(destination))": .bool(true)]
+        if let source, source != destination {
+            patch["mailboxIds/\(JSONPointer.escape(source))"] = .null
+        }
+        return patch
+    }
+
+    /// Puts the email in `destination` and removes it from every other mailbox.
+    public static func moveExclusively(to destination: String) -> PatchObject {
+        ["mailboxIds": .object([destination: .bool(true)])]
+    }
+}
+
+/// RFC 6901 token escaping, as required for PatchObject paths.
+enum JSONPointer {
+    static func escape(_ token: String) -> String {
+        token.replacingOccurrences(of: "~", with: "~0").replacingOccurrences(of: "/", with: "~1")
+    }
+
+    static func unescape(_ token: String) -> String {
+        token.replacingOccurrences(of: "~1", with: "/").replacingOccurrences(of: "~0", with: "~")
+    }
+}
+
 public typealias EmailQuery = QueryRequest<Email>
 public typealias EmailChanges = ChangesRequest<Email>
+public typealias EmailSet = SetRequest<Email>

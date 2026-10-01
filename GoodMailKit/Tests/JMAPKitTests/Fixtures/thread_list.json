@@ -1,0 +1,30 @@
+{
+  "sessionState": "s1",
+  "methodResponses": [
+    ["Email/query", {
+      "accountId": "u1234", "queryState": "q1", "canCalculateChanges": true,
+      "position": 0, "ids": ["e3", "e4"], "total": 12
+    }, "c0"],
+    ["Email/get", {
+      "accountId": "u1234", "state": "e9", "notFound": [],
+      "list": [{"id": "e4", "threadId": "t2"}, {"id": "e3", "threadId": "t1"}]
+    }, "c1"],
+    ["Thread/get", {
+      "accountId": "u1234", "state": "t9", "notFound": [],
+      "list": [{"id": "t2", "emailIds": ["e4"]}, {"id": "t1", "emailIds": ["e1", "e2", "e3"]}]
+    }, "c2"],
+    ["Email/get", {
+      "accountId": "u1234", "state": "e9", "notFound": [],
+      "list": [
+        {"id": "e3", "threadId": "t1", "mailboxIds": {"mb1": true}, "keywords": {},
+         "receivedAt": "2026-09-21T09:00:00Z", "subject": "Re: Lunch", "hasAttachment": false},
+        {"id": "e1", "threadId": "t1", "mailboxIds": {"mb1": true}, "keywords": {"$seen": true, "$flagged": true},
+         "receivedAt": "2026-09-20T09:00:00Z", "subject": "Lunch", "hasAttachment": false},
+        {"id": "e2", "threadId": "t1", "mailboxIds": {"sent": true}, "keywords": {"$seen": true},
+         "receivedAt": "2026-09-20T12:00:00Z", "subject": "Re: Lunch", "hasAttachment": true},
+        {"id": "e4", "threadId": "t2", "mailboxIds": {"mb1": true}, "keywords": {"$seen": true},
+         "receivedAt": "2026-09-19T09:00:00Z", "subject": "Invoice", "hasAttachment": false}
+      ]
+    }, "c3"]
+  ]
+}

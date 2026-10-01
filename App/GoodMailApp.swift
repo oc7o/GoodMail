@@ -10,6 +10,9 @@ struct GoodMailApp: App {
                 .environment(model)
                 .task { model.restore() }
         }
+        #if os(macOS)
+        .defaultSize(width: 1180, height: 760)
+        #endif
     }
 }
 
@@ -22,8 +25,8 @@ struct RootView: View {
             ProgressView()
         case .signedOut:
             OnboardingView()
-        case .signedIn(let client):
-            MailboxListView(client: client)
+        case .signedIn(let mail):
+            MailView(model: mail)
         }
     }
 }

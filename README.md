@@ -2,7 +2,8 @@
 
 An open-source, privacy-first mail client for [Fastmail](https://www.fastmail.com), native on iOS and macOS (SwiftUI).
 
-> Status: early development (milestone M0: foundations). Not usable yet.
+> Status: early development. M1 is in progress: you can read and triage mail and manage Masked Email,
+> but there is no offline cache yet and you cannot compose.
 
 ## Goals
 
@@ -30,7 +31,10 @@ An open-source, privacy-first mail client for [Fastmail](https://www.fastmail.co
 project.yml           XcodeGen spec for the iOS + macOS app (the .xcodeproj is generated, not committed)
 App/                  SwiftUI app: onboarding, screens, Keychain
 GoodMailKit/          Swift package holding all non-UI logic
-  Sources/JMAPKit/    JMAP protocol layer (RFC 8620/8621 + Fastmail Masked Email)
+  Sources/JMAPKit/      JMAP protocol layer (RFC 8620/8621 + Fastmail Masked Email)
+  Sources/MailPrivacy/  Tracker removal, link cleaning and the locked-down HTML that messages render as
+  Sources/GoodMailCore/ App state behind the screens: mailboxes, thread list, triage, masked emails
+  Sources/DemoAccount/  In-memory fake Fastmail account with sample mail
 ```
 
 ## Development
@@ -44,6 +48,12 @@ open GoodMail.xcodeproj
 
 cd GoodMailKit && swift test   # run the package tests
 ```
+
+### Demo account
+
+Debug builds can run without a Fastmail account: pass the launch argument `-demo YES` (in Xcode under
+*Product → Scheme → Edit Scheme → Run → Arguments*) to get an in-memory account with sample mail.
+Nothing in it touches the network except the sample newsletter's image, and only after you press *Load Images*.
 
 ### Code signing
 

@@ -82,12 +82,28 @@ public actor JMAPClient {
         return try await send(batch).get(handle)
     }
 
+    // MARK: Blobs
+
+    /// Downloads a blob such as an attachment or inline image from the mail account.
+    public func download(blobId: String, type: String = "application/octet-stream", name: String = "blob") async throws -> Data {
+        let session = try await session()
+        let accountId = try session.primaryAccountId(for: Capability.mail)
+        guard let url = session.downloadURL(accountId: accountId, blobId: blobId, type: type, name: name) else {
+            throw JMAPError.transport("Invalid download URL")
+        }
+        var request = URLRequest(url: url)
+        request.setValue(type, forHTTPHeaderField: "Accept")
+        return try await perform(request)
+    }
+
     // MARK: HTTP
 
     private func perform(_ request: URLRequest) async throws -> Data {
         var request = request
         request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        if request.value(forHTTPHeaderField: "Accept") == nil {
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+        }
 
         var attempt = 0
         while true {
