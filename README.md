@@ -2,13 +2,13 @@
 
 An open-source, privacy-first mail client for [Fastmail](https://www.fastmail.com), native on iOS and macOS (SwiftUI).
 
-> Status: early development. M1 is in progress: you can read and triage mail and manage Masked Email,
-> but there is no offline cache yet and you cannot compose.
+> Status: early development. M1 is nearly done: you can read, triage and search mail, online and from the
+> encrypted local copy, and manage Masked Email. You cannot compose yet.
 
 ## Goals
 
 - **Built for Fastmail.** Uses JMAP directly, no IMAP. First-class **Masked Email**: create, send from, disable and delete masked addresses without leaving the app.
-- **Privacy first.** Remote content and tracking pixels are blocked by default, tracking parameters are stripped from links, the local cache is encrypted, and the app has an optional Face ID / Touch ID lock. No analytics, no third-party SDKs, and no servers of ours in the middle.
+- **Privacy first.** Remote content and tracking pixels are blocked by default, tracking parameters are stripped from links, the local cache is encrypted, and the app has an optional Face ID / Touch ID lock. No analytics, no closed-source SDKs, and no servers of ours in the middle.
 - **One-tap unsubscribe** via `List-Unsubscribe` / RFC 8058 one-click.
 - **Fast search and filtering.** Instant local full-text search merged with server-side search, plus saved searches.
 - Everything else a good mail client needs: threads, swipe actions, keyboard shortcuts, offline actions, and undo.
@@ -33,15 +33,37 @@ App/                  SwiftUI app: onboarding, screens, Keychain
 GoodMailKit/          Swift package holding all non-UI logic
   Sources/JMAPKit/      JMAP protocol layer (RFC 8620/8621 + Fastmail Masked Email)
   Sources/MailPrivacy/  Tracker removal, link cleaning and the locked-down HTML that messages render as
-  Sources/GoodMailCore/ App state behind the screens: mailboxes, thread list, triage, masked emails
+  Sources/MailStore/    Encrypted local copy of the account (SQLCipher) with a full-text index
+  Sources/GoodMailCore/ Sync between server and store, and the app state behind the screens
   Sources/DemoAccount/  In-memory fake Fastmail account with sample mail
+Vendor/GRDBSQLCipher/ GRDB built against SQLCipher (see Dependencies)
 ```
+
+## How mail is stored
+
+Mail is kept in a SQLCipher database in the app's container. Its 256-bit key is random, lives only in the
+device Keychain and never syncs, so the file is useless anywhere else; signing out deletes both. The store is
+a cache: stored emails are kept in step with Fastmail through JMAP change sync, older mail is filled in
+in the background, and bodies of recent mail are fetched ahead so they open offline. Search asks the local
+full-text index first and merges in Fastmail's results.
+
+## Dependencies
+
+| | Used for | License |
+|---|---|---|
+| [GRDB](https://github.com/groue/GRDB.swift) | SQLite toolkit | MIT |
+| [SQLCipher](https://github.com/sqlcipher/SQLCipher.swift) | Database encryption | BSD-style |
+
+GRDB only works with SQLCipher through an edited package manifest. Instead of a fork, `Vendor/GRDBSQLCipher`
+holds that manifest next to an unmodified, pinned upstream checkout (a git submodule). SQLCipher itself comes
+as the prebuilt framework published by its maintainers, pinned to an exact version.
 
 ## Development
 
-Requires Xcode 16+ (Swift 6). Minimum deployment targets are iOS 18 and macOS 15.
+Requires Xcode 16.3+ (Swift 6.1). Minimum deployment targets are iOS 18 and macOS 15.
 
 ```sh
+git clone --recurse-submodules https://github.com/oc7o/GoodMail.git   # or: git submodule update --init
 brew install xcodegen
 xcodegen generate          # creates GoodMail.xcodeproj
 open GoodMail.xcodeproj

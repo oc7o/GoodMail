@@ -1,10 +1,12 @@
 import Foundation
 import JMAPKit
+import MailStore
 import Observation
 
 /// State behind the mail screens of one account: mailboxes, the visible thread list, and masked emails.
 ///
-/// Everything is fetched from the server on demand; the offline cache will slot in underneath later.
+/// Lists are read from the local store, so they appear at once and work offline; the server is asked
+/// in parallel and whatever it returns lands in the store first.
 @MainActor
 @Observable
 public final class MailModel {
@@ -25,6 +27,8 @@ public final class MailModel {
         public var unreadOnly: Bool
 
         public var searchesEverywhere: Bool { scope == .everywhere && !search.isEmpty }
+        /// Whether this is simply everything in the mailbox, which is what coverage is tracked for.
+        var isWholeMailbox: Bool { search.isEmpty && !unreadOnly }
     }
 
     public struct MailboxRow: Identifiable {
@@ -36,6 +40,9 @@ public final class MailModel {
     public static let pageSize = 50
 
     public let client: JMAPClient
+    private let sync: MailSync
+    private var store: MailStore { sync.store }
+    private let syncsInBackground: Bool
     private let onUnauthorized: () -> Void
 
     public private(set) var username: String?
@@ -46,11 +53,19 @@ public final class MailModel {
     public var searchScope = SearchScope.mailbox
     public var showsUnreadOnly = false
     public private(set) var threads: [ThreadSummary] = []
-    public private(set) var totalThreads: Int?
+    public private(set) var hasMoreThreads = false
     public private(set) var isLoadingThreads = false
-    private var isLoadingMore = false
-    private var loadedQuery: ThreadQuery?
     public var selectedThreadID: String?
+
+    private var shownQuery: ThreadQuery?
+    private var visibleLimit = MailModel.pageSize
+    private var serverLoaded = 0
+    private var serverTotal: Int?
+    /// Threads that stay listed although the stored copy may not match the query (any more): server
+    /// search hits, and conversations that would otherwise vanish from a filtered list while being read.
+    private var pinnedThreadIDs: [String] = []
+    private var isLoadingMore = false
+    @ObservationIgnored private var backgroundTask: Task<Void, Never>?
 
     public private(set) var maskedEmails: [MaskedEmail] = [] {
         didSet {
@@ -61,33 +76,89 @@ public final class MailModel {
     @ObservationIgnored private var maskedEmailsByAddress: [String: MaskedEmail] = [:]
     public var selectedMaskedEmailID: String?
 
+    /// A failed action the user should hear about.
     public var errorMessage: String?
+    /// Why the server can't be reached right now, while lists keep showing stored mail.
+    public private(set) var connectionProblem: String?
 
-    public init(client: JMAPClient, onUnauthorized: @escaping () -> Void) {
+    /// - Parameter syncsInBackground: Keep polling for changes, backfilling older mail and prefetching
+    ///   bodies for as long as the model lives.
+    public init(
+        client: JMAPClient, store: MailStore, syncsInBackground: Bool = true, onUnauthorized: @escaping () -> Void
+    ) {
         self.client = client
+        self.sync = MailSync(client: client, store: store)
+        self.syncsInBackground = syncsInBackground
         self.onUnauthorized = onUnauthorized
     }
 
     public func start() async {
+        mailboxes = (try? await store.mailboxes()) ?? []
+        selectInboxIfNeeded()
         username = try? await client.session().username
-        await loadMailboxes()
-        if destination == nil, let inbox = mailbox(.inbox) ?? mailboxes.first {
-            destination = .mailbox(inbox.id)
-        }
+        await refresh()
+        selectInboxIfNeeded()
         await loadMaskedEmails()
+        if syncsInBackground { startBackgroundSync() }
     }
 
+    public func stop() {
+        backgroundTask?.cancel()
+        backgroundTask = nil
+    }
+
+    /// Brings mailboxes and stored mail up to date with the server.
     public func refresh() async {
         await loadMailboxes()
-        await loadThreads(debounce: false)
+        do {
+            let outcome = try await sync.syncChanges()
+            connectionProblem = nil
+            // Also covers a list that so far only shows stored mail, e.g. after starting offline.
+            if outcome == .reset || (serverTotal == nil && !isLoadingThreads) {
+                await loadThreads(debounce: false)
+                return
+            }
+        } catch {
+            report(error)
+        }
+        await showStoredThreads()
     }
 
-    private func report(_ error: Error) {
+    private func report(_ error: Error, userInitiated: Bool = false) {
         if Task.isCancelled { return }
         if case JMAPError.unauthorized = error {
             onUnauthorized()
-        } else {
+        } else if userInitiated {
             errorMessage = error.localizedDescription
+        } else {
+            connectionProblem = error.localizedDescription
+        }
+    }
+
+    // MARK: Background sync
+
+    private func startBackgroundSync() {
+        backgroundTask?.cancel()
+        backgroundTask = Task { [weak self] in
+            var lastRefresh = ContinuousClock.now
+            while !Task.isCancelled {
+                guard let hasMoreWork = await self?.performBackgroundWork() else { return }
+                try? await Task.sleep(for: hasMoreWork ? .milliseconds(500) : .seconds(20))
+                if ContinuousClock.now - lastRefresh >= .seconds(60) {
+                    await self?.refresh()
+                    lastRefresh = .now
+                }
+            }
+        }
+    }
+
+    /// One slice of low-priority work. Returns whether more is waiting.
+    private func performBackgroundWork() async -> Bool {
+        do {
+            if try await sync.backfillNextPage() { return true }
+            return try await sync.prefetchBodies() > 0
+        } catch {
+            return false
         }
     }
 
@@ -95,9 +166,16 @@ public final class MailModel {
 
     public func loadMailboxes() async {
         do {
-            mailboxes = try await client.mailboxes()
+            mailboxes = try await sync.refreshMailboxes()
+            connectionProblem = nil
         } catch {
             report(error)
+        }
+    }
+
+    private func selectInboxIfNeeded() {
+        if destination == nil, let inbox = mailbox(.inbox) ?? mailboxes.first {
+            destination = .mailbox(inbox.id)
         }
     }
 
@@ -139,55 +217,116 @@ public final class MailModel {
             scope: searchScope, unreadOnly: showsUnreadOnly)
     }
 
-    public var hasMoreThreads: Bool {
-        (totalThreads ?? 0) > threads.count
+    /// Number of conversations in the current list, as far as it is known.
+    public var totalThreads: Int? {
+        serverTotal ?? (shownQuery?.isWholeMailbox == true ? currentMailbox?.totalThreads : nil)
     }
 
     public func thread(id: String) -> ThreadSummary? {
         threads.first { $0.id == id }
     }
 
+    /// Shows what is stored for the current query right away, then asks the server for its first page.
     public func loadThreads(debounce: Bool = true) async {
         guard let query = threadQuery else { return }
-        if query.mailboxID != loadedQuery?.mailboxID {
-            threads = []
-            totalThreads = nil
-            selectedThreadID = nil
-            loadedQuery = nil
+        let isNewSearch = query.search != shownQuery?.search
+        if query.mailboxID != shownQuery?.mailboxID { selectedThreadID = nil }
+        if query != shownQuery {
+            visibleLimit = Self.pageSize
+            serverLoaded = 0
+            serverTotal = nil
+            pinnedThreadIDs = []
+            shownQuery = query
         }
-        if debounce, !query.search.isEmpty, query.search != loadedQuery?.search {
+        await showStoredThreads()
+
+        if debounce, !query.search.isEmpty, isNewSearch {
             try? await Task.sleep(for: .milliseconds(300))
         }
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, shownQuery == query else { return }
 
         isLoadingThreads = true
         do {
-            let page = try await client.threads(matching: filter(for: query), limit: Self.pageSize)
-            guard !Task.isCancelled else { return }
-            threads = page.threads
-            totalThreads = page.total
-            loadedQuery = query
+            let page = try await sync.fetchThreads(
+                matching: filter(for: query), position: 0, limit: Self.pageSize,
+                extendingCoverageOf: query.isWholeMailbox ? query.mailboxID : nil)
+            guard !Task.isCancelled, shownQuery == query else { return }
+            serverLoaded = page.threads.count
+            serverTotal = page.total
+            if !query.isWholeMailbox { pin(page.threads.map(\.id)) }
+            connectionProblem = nil
+            await showStoredThreads()
         } catch {
             report(error)
         }
-        if !Task.isCancelled { isLoadingThreads = false }
+        if !Task.isCancelled, shownQuery == query { isLoadingThreads = false }
     }
 
     public func loadMoreThreads() async {
-        guard let query = loadedQuery, query == threadQuery, hasMoreThreads, !isLoadingMore else { return }
+        guard let query = shownQuery, query == threadQuery, hasMoreThreads, !isLoadingMore else { return }
         isLoadingMore = true
         defer { isLoadingMore = false }
-        do {
-            let page = try await client.threads(
-                matching: filter(for: query), position: threads.count, limit: Self.pageSize)
-            guard loadedQuery == query else { return }
-            let known = Set(threads.map(\.id))
-            let fresh = page.threads.filter { !known.contains($0.id) }
-            threads += fresh
-            if fresh.isEmpty { totalThreads = threads.count }
-        } catch {
-            report(error)
+        if let total = serverTotal, total > serverLoaded {
+            do {
+                let page = try await sync.fetchThreads(
+                    matching: filter(for: query), position: serverLoaded, limit: Self.pageSize,
+                    extendingCoverageOf: query.isWholeMailbox ? query.mailboxID : nil)
+                guard shownQuery == query else { return }
+                serverLoaded += page.threads.count
+                serverTotal = page.threads.isEmpty ? serverLoaded : page.total
+                if !query.isWholeMailbox { pin(page.threads.map(\.id)) }
+            } catch {
+                report(error)
+            }
         }
+        visibleLimit += Self.pageSize
+        await showStoredThreads()
+    }
+
+    private func pin(_ threadIDs: [String]) {
+        let known = Set(pinnedThreadIDs)
+        pinnedThreadIDs += threadIDs.filter { !known.contains($0) }
+    }
+
+    /// Reads the current list from the store.
+    private func showStoredThreads() async {
+        guard let query = shownQuery else { return }
+        do {
+            var listed: [ThreadSummary] = []
+            var matchCount = 0
+            if let storeQuery = try await storeQuery(for: query) {
+                listed = try await store.threads(matching: storeQuery, limit: visibleLimit)
+                matchCount = try await store.threadCount(matching: storeQuery)
+            }
+            let hasMoreStored = matchCount > listed.count
+
+            let known = Set(listed.map(\.id))
+            let pinned = try await store.threads(ids: pinnedThreadIDs.filter { !known.contains($0) })
+            if !pinned.isEmpty {
+                listed = (listed + pinned.filter { isListed($0, in: query) }).sorted {
+                    ($0.anchor?.receivedAt ?? .distantPast, $0.id) > ($1.anchor?.receivedAt ?? .distantPast, $1.id)
+                }
+            }
+            guard shownQuery == query else { return }
+            if !query.isWholeMailbox { pin(listed.map(\.id)) }
+            threads = listed
+            hasMoreThreads = hasMoreStored || (serverTotal ?? 0) > serverLoaded
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// The store query matching `query`, or `nil` while nothing stored can answer it yet.
+    private func storeQuery(for query: ThreadQuery) async throws -> MailStore.ThreadQuery? {
+        if query.searchesEverywhere {
+            return .init(hiddenMailboxIDs: hiddenFromSearchMailboxIDs, search: query.search, unreadOnly: query.unreadOnly)
+        }
+        guard query.isWholeMailbox else {
+            return .init(mailboxID: query.mailboxID, search: query.search, unreadOnly: query.unreadOnly)
+        }
+        // A plain mailbox list must not have gaps, so it only reaches as far back as the copy is complete.
+        guard let coverage = try await store.coverage(mailboxID: query.mailboxID) else { return nil }
+        return .init(mailboxID: query.mailboxID, since: coverage)
     }
 
     private func filter(for query: ThreadQuery) -> Filter<Email.FilterCondition> {
@@ -217,13 +356,31 @@ public final class MailModel {
         return thread.emails.contains { $0.mailboxIds?[query.mailboxID] == true }
     }
 
+    // MARK: Reading
+
+    /// The conversation as stored, if every message's body is available without the network.
+    public func storedEmails(inThread threadID: String) async -> [Email]? {
+        (try? await store.emailsWithBodies(inThread: threadID)) ?? nil
+    }
+
+    /// The conversation from the server, which also refreshes the stored copy.
+    public func fetchEmails(inThread threadID: String) async throws -> [Email] {
+        let emails = try await sync.fetchThread(threadID)
+        await showStoredThreads()
+        return emails
+    }
+
     // MARK: Triage
 
-    public func setRead(_ isRead: Bool, threadID: String) async {
+    /// - Parameter userInitiated: Pass `false` when this happens as a side effect, such as opening a
+    ///   conversation, so that a failure doesn't interrupt the user.
+    public func setRead(_ isRead: Bool, threadID: String, userInitiated: Bool = true) async {
         guard let thread = thread(id: threadID) else { return }
         // Marking unread only touches the newest message, like every other mail client.
         let targets = isRead ? thread.emails.filter { !$0.has(.seen) } : [thread.anchor].compactMap { $0 }
-        await apply(Dictionary(uniqueKeysWithValues: targets.map { ($0.id, .setKeyword(.seen, isRead)) }))
+        await apply(
+            Dictionary(uniqueKeysWithValues: targets.map { ($0.id, .setKeyword(.seen, isRead)) }),
+            userInitiated: userInitiated)
     }
 
     public func toggleFlag(threadID: String) async {
@@ -264,37 +421,43 @@ public final class MailModel {
         await apply(Dictionary(uniqueKeysWithValues: targets.map { ($0.id, .moveExclusively(to: trash.id)) }))
     }
 
-    /// Updates the list right away, then tells the server; a failure reloads the real state.
-    private func apply(_ updates: [String: PatchObject]) async {
+    /// Changes the stored emails and the list right away, then tells the server; if it refuses, the
+    /// stored emails are put back.
+    private func apply(_ updates: [String: PatchObject], userInitiated: Bool = true) async {
         guard !updates.isEmpty else { return }
-        for index in threads.indices {
-            threads[index].emails = threads[index].emails.map { email in
-                updates[email.id].map(email.applying) ?? email
-            }
-        }
-        if let query = loadedQuery {
-            let gone = Set(threads.filter { !isListed($0, in: query) }.map(\.id))
-            if let selected = selectedThreadID, gone.contains(selected) {
-                selectedThreadID = neighbour(of: selected, excluding: gone)
-            }
-            threads.removeAll { gone.contains($0.id) }
-            if let total = totalThreads { totalThreads = max(threads.count, total - gone.count) }
-        }
-
+        let listedBefore = threads.map(\.id)
         do {
-            try await client.updateEmails(updates)
+            let originals = try await sync.stage(updates)
+            await showStoredThreads()
+            let removed = Set(listedBefore).subtracting(threads.map(\.id))
+            if let selected = selectedThreadID, removed.contains(selected) {
+                selectedThreadID = neighbour(of: selected, in: listedBefore, excluding: removed)
+            }
+            let serverCounts = (serverLoaded, serverTotal)
+            serverLoaded = max(0, serverLoaded - removed.count)
+            serverTotal = serverTotal.map { max(0, $0 - removed.count) }
+
+            do {
+                try await sync.commit(updates, reverting: originals)
+            } catch {
+                (serverLoaded, serverTotal) = serverCounts
+                report(error, userInitiated: userInitiated)
+                await showStoredThreads()
+                return
+            }
+            _ = try? await sync.syncChanges()
             await loadMailboxes()
+            await showStoredThreads()
         } catch {
-            report(error)
-            await refresh()
+            report(error, userInitiated: userInitiated)
         }
     }
 
-    private func neighbour(of threadID: String, excluding gone: Set<String>) -> String? {
-        guard let index = threads.firstIndex(where: { $0.id == threadID }) else { return nil }
-        let after = threads[(index + 1)...].first { !gone.contains($0.id) }
-        let before = threads[..<index].last { !gone.contains($0.id) }
-        return (after ?? before)?.id
+    private func neighbour(of threadID: String, in order: [String], excluding removed: Set<String>) -> String? {
+        guard let index = order.firstIndex(of: threadID) else { return nil }
+        let after = order[(index + 1)...].first { !removed.contains($0) }
+        let before = order[..<index].last { !removed.contains($0) }
+        return after ?? before
     }
 
     // MARK: Masked Email
@@ -331,7 +494,7 @@ public final class MailModel {
         do {
             try await client.updateMaskedEmail(id: id, patch)
         } catch {
-            report(error)
+            report(error, userInitiated: true)
         }
         await loadMaskedEmails()
     }

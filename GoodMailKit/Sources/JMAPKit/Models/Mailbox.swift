@@ -1,7 +1,7 @@
 import Foundation
 
 /// RFC 8621 §2.
-public struct Mailbox: QueryableObject, Equatable {
+public struct Mailbox: QueryableObject, Equatable, Encodable {
     public static let typeName = "Mailbox"
     public static let capability = Capability.mail
 

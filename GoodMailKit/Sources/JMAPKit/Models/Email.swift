@@ -1,7 +1,7 @@
 import Foundation
 
 /// RFC 8621 §4. All properties besides `id` are optional because callers choose which to fetch.
-public struct Email: QueryableObject, Equatable {
+public struct Email: QueryableObject, Equatable, Encodable {
     public static let typeName = "Email"
     public static let capability = Capability.mail
 
@@ -27,10 +27,10 @@ public struct Email: QueryableObject, Equatable {
 
     public let hasAttachment: Bool?
     public let preview: String?
-    public let bodyValues: [String: EmailBodyValue]?
-    public let textBody: [EmailBodyPart]?
-    public let htmlBody: [EmailBodyPart]?
-    public let attachments: [EmailBodyPart]?
+    public internal(set) var bodyValues: [String: EmailBodyValue]?
+    public internal(set) var textBody: [EmailBodyPart]?
+    public internal(set) var htmlBody: [EmailBodyPart]?
+    public internal(set) var attachments: [EmailBodyPart]?
 
     /// `List-Unsubscribe` (RFC 2369) parsed as URLs, e.g. `mailto:` and `https:`.
     public let listUnsubscribe: [String]?
@@ -47,6 +47,28 @@ public struct Email: QueryableObject, Equatable {
 
     public func has(_ keyword: Keyword) -> Bool {
         keywords?[keyword.rawValue] == true
+    }
+
+    /// Whether the body was fetched along with the email.
+    public var hasBody: Bool { bodyValues != nil }
+
+    /// The email reduced to what a list row needs, for compact storage.
+    public func strippingBody() -> Email {
+        var email = self
+        email.bodyValues = nil
+        email.textBody = nil
+        email.htmlBody = nil
+        email.attachments = nil
+        return email
+    }
+
+    /// This email with the keywords and mailboxes of `other`: the only properties that ever change
+    /// after delivery (RFC 8621 §4), so a stored body stays valid forever.
+    public func withFlags(of other: Email) -> Email {
+        var email = self
+        email.keywords = other.keywords
+        email.mailboxIds = other.mailboxIds
+        return email
     }
 
     public struct Keyword: RawRepresentable, Hashable, Sendable {

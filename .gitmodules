@@ -1,0 +1,4 @@
+[submodule "Vendor/GRDBSQLCipher/GRDB.swift"]
+	path = Vendor/GRDBSQLCipher/GRDB.swift
+	url = https://github.com/groue/GRDB.swift.git
+	shallow = true

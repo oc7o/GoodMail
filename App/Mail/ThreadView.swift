@@ -42,18 +42,30 @@ struct ThreadView: View {
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
-        .task { await load() }
+        // Runs again when a message joins the conversation while it is open.
+        .task(id: model.thread(id: threadID)?.emails.count) { await load() }
     }
 
+    /// Shows the stored copy at once if there is one, then whatever the server has.
     private func load() async {
-        do {
-            let emails = try await model.client.emails(inThread: threadID)
-            expanded = Set(emails.filter { !$0.has(.seen) }.map(\.id) + [emails.last?.id].compactMap { $0 })
-            self.emails = emails
-            await model.setRead(true, threadID: threadID)
-        } catch {
-            if !Task.isCancelled { self.error = error.localizedDescription }
+        if let stored = await model.storedEmails(inThread: threadID) {
+            show(stored)
         }
+        do {
+            show(try await model.fetchEmails(inThread: threadID))
+            error = nil
+        } catch {
+            if emails == nil, !Task.isCancelled { self.error = error.localizedDescription }
+        }
+        await model.setRead(true, threadID: threadID, userInitiated: false)
+    }
+
+    private func show(_ emails: [Email]) {
+        let known = Set(self.emails?.map(\.id) ?? [])
+        let unread = emails.filter { !$0.has(.seen) && !known.contains($0.id) }.map(\.id)
+        expanded.formUnion(unread)
+        if self.emails == nil, let last = emails.last { expanded.insert(last.id) }
+        if self.emails != emails { self.emails = emails }
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {

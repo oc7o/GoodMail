@@ -154,7 +154,7 @@ enum DemoData {
               subject: "We miss you", seen: true, text: "It has been a while since your last visit."),
     ]
 
-    private static func email(
+    static func email(
         _ id: String, thread: String, in mailbox: String, hoursAgo: Double, from: (String, String),
         to: (String, String) = ("Alex Berg", me), subject: String, seen: Bool = false, flagged: Bool = false,
         draft: Bool = false, text: String? = nil, html: String? = nil,

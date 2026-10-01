@@ -32,6 +32,8 @@ targets:
       - package: GoodMailKit
         product: MailPrivacy
       - package: GoodMailKit
+        product: MailStore
+      - package: GoodMailKit
         product: GoodMailCore
       - package: GoodMailKit
         product: DemoAccount
@@ -49,3 +51,5 @@ targets:
         ENABLE_APP_SANDBOX: YES
         ENABLE_OUTGOING_NETWORK_CONNECTIONS: YES
         ENABLE_HARDENED_RUNTIME: YES
+        # The embedded SQLCipher framework lives in Contents/Frameworks on the Mac.
+        "LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]": "$(inherited) @executable_path/../Frameworks"

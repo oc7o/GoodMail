@@ -25,6 +25,25 @@ public struct ThreadPage: Sendable, Equatable {
     public let position: Int
     /// Number of threads matching the query, if the server calculated it.
     public let total: Int?
+    /// The `Email` state the emails were read at, as a starting point for `emailChanges(since:)`.
+    public let state: String
+}
+
+/// What happened to emails since a known state (RFC 8620 §5.2).
+public struct EmailChangeSet: Sendable, Equatable {
+    public let newState: String
+    public let hasMoreChanges: Bool
+    /// Created and updated emails with their list properties.
+    public let changed: [Email]
+    public let destroyed: [String]
+}
+
+/// A slice of all mail, newest first.
+public struct EmailPage: Sendable, Equatable {
+    public let emails: [Email]
+    public let state: String
+    /// Whether the server has nothing older than this page.
+    public let isLast: Bool
 }
 
 extension JMAPClient {
@@ -65,7 +84,9 @@ extension JMAPClient {
             return ThreadSummary(
                 id: threadId, emails: thread.emailIds.compactMap { emailsById[$0] }, anchorId: anchorId)
         }
-        return ThreadPage(threads: summaries, position: queryResult.position, total: queryResult.total)
+        return ThreadPage(
+            threads: summaries, position: queryResult.position, total: queryResult.total,
+            state: try response.get(emails).state)
     }
 
     /// Every email of a thread with its displayable body, oldest first.
@@ -82,6 +103,49 @@ extension JMAPClient {
         let emailsById = Dictionary(
             try response.get(emails).list.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         return order.compactMap { emailsById[$0] }
+    }
+
+    /// Emails with their displayable bodies, for prefetching.
+    public func emails(ids: [String], maxBodyValueBytes: Int = 1_000_000) async throws -> [Email] {
+        guard !ids.isEmpty else { return [] }
+        let accountId = try await accountId(for: Capability.mail)
+        return try await call(EmailGet(
+            accountId: accountId, ids: .ids(ids), properties: Email.Properties.full,
+            fetchHTMLBodyValues: true, maxBodyValueBytes: maxBodyValueBytes)).list
+    }
+
+    /// Changes since `state`, with the affected emails fetched in the same round trip.
+    ///
+    /// Throws `JMAPError.method` with `cannotCalculateChanges` when the state is too old.
+    public func emailChanges(since state: String, maxChanges: Int = 200) async throws -> EmailChangeSet {
+        let accountId = try await accountId(for: Capability.mail)
+        var batch = Batch()
+        let changes = batch.add(EmailChanges(accountId: accountId, sinceState: state, maxChanges: maxChanges))
+        let created = batch.add(EmailGet(accountId: accountId, ids: .reference(changes.reference("/created"))))
+        let updated = batch.add(EmailGet(accountId: accountId, ids: .reference(changes.reference("/updated"))))
+        let response = try await send(batch)
+
+        let result = try response.get(changes)
+        return EmailChangeSet(
+            newState: result.newState, hasMoreChanges: result.hasMoreChanges,
+            changed: try response.get(created).list + response.get(updated).list,
+            destroyed: result.destroyed)
+    }
+
+    /// Up to `limit` emails received before `date` (or the newest ones), across all mailboxes.
+    public func emailPage(before date: Date? = nil, limit: Int = 200) async throws -> EmailPage {
+        let accountId = try await accountId(for: Capability.mail)
+        var batch = Batch()
+        let query = batch.add(EmailQuery(
+            accountId: accountId, filter: date.map { .condition(.init(before: $0)) },
+            sort: [Comparator(property: "receivedAt", isAscending: false)], limit: limit))
+        let emails = batch.add(EmailGet(accountId: accountId, ids: .reference(query.reference("/ids"))))
+        let response = try await send(batch)
+
+        let ids = try response.get(query).ids
+        let result = try response.get(emails)
+        let emailsById = Dictionary(result.list.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return EmailPage(emails: ids.compactMap { emailsById[$0] }, state: result.state, isLast: ids.count < limit)
     }
 
     /// Applies one patch per email id. Throws the first `SetError` if the server rejects any of them.

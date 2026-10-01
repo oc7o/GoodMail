@@ -63,6 +63,17 @@ struct ThreadListView: View {
             }
             #endif
         }
+        .safeAreaInset(edge: .bottom) {
+            if let problem = model.connectionProblem {
+                Label("Offline. Showing saved mail.", systemImage: "wifi.slash")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 6)
+                    .background(.bar)
+                    .help(problem)
+            }
+        }
         .refreshable { await model.refresh() }
         .task(id: model.threadQuery) { await model.loadThreads() }
     }

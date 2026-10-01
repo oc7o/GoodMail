@@ -1,7 +1,8 @@
 import Foundation
 
-enum JMAPCoding {
-    static func makeDecoder() -> JSONDecoder {
+/// JSON coders using JMAP's date format, also used to persist JMAP objects.
+public enum JMAPCoding {
+    public static func makeDecoder() -> JSONDecoder {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .custom { decoder in
             let container = try decoder.singleValueContainer()
@@ -13,7 +14,7 @@ enum JMAPCoding {
         return decoder
     }
 
-    static func makeEncoder() -> JSONEncoder {
+    public static func makeEncoder() -> JSONEncoder {
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .custom { date, encoder in
             var container = encoder.singleValueContainer()

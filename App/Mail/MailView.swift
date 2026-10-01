@@ -5,6 +5,7 @@ import SwiftUI
 /// The signed-in app: mailboxes, the list for the selected one, and the reading pane.
 struct MailView: View {
     @Bindable var model: MailModel
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         NavigationSplitView {
@@ -35,6 +36,9 @@ struct MailView: View {
             }
         }
         .task { await model.start() }
+        .onChange(of: scenePhase) { _, phase in
+            if phase == .active { Task { await model.refresh() } }
+        }
         .alert(
             "Something Went Wrong",
             isPresented: Binding(get: { model.errorMessage != nil }, set: { if !$0 { model.errorMessage = nil } })

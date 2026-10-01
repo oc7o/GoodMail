@@ -1,13 +1,27 @@
 import DemoAccount
 import Foundation
 import JMAPKit
+import MailStore
 import Testing
 @testable import GoodMailCore
 
 /// Runs the model against the in-memory demo account, which behaves like a small JMAP server.
 @MainActor
 struct MailModelTests {
-    let model = MailModel(client: JMAPClient(token: "demo", transport: DemoTransport()), onUnauthorized: {})
+    let server = DemoTransport()
+    let store: MailStore
+    let model: MailModel
+
+    init() throws {
+        store = try MailStore()
+        model = Self.makeModel(server: server, store: store)
+    }
+
+    private static func makeModel(server: DemoTransport, store: MailStore) -> MailModel {
+        MailModel(
+            client: JMAPClient(token: "demo", transport: server, maxRetries: 0), store: store,
+            syncsInBackground: false, onUnauthorized: {})
+    }
 
     private func started() async -> MailModel {
         await model.start()
@@ -169,5 +183,79 @@ struct MailModelTests {
 
         #expect(model.currentMailbox?.role == .inbox)
         #expect(model.threads.map(\.id) == ["t6"])
+    }
+
+    // MARK: Stored mail
+
+    @Test func nextLaunchWorksOfflineFromTheStore() async throws {
+        let model = await started()
+        _ = try await model.fetchEmails(inThread: "t1")
+
+        server.isOffline = true
+        let relaunched = Self.makeModel(server: server, store: store)
+        await relaunched.start()
+        await relaunched.loadThreads()
+
+        #expect(relaunched.currentMailbox?.role == .inbox)
+        #expect(relaunched.threads.map(\.id) == ["t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8"])
+        #expect(relaunched.totalThreads == 8)
+        #expect(relaunched.connectionProblem != nil)
+        #expect(relaunched.errorMessage == nil)
+        #expect(await relaunched.storedEmails(inThread: "t1")?.map(\.id) == ["e1", "e2", "e3"])
+        #expect(await relaunched.storedEmails(inThread: "t2") == nil)
+
+        server.isOffline = false
+        await relaunched.refresh()
+        #expect(relaunched.connectionProblem == nil)
+    }
+
+    @Test func refreshBringsInNewMail() async {
+        let model = await started()
+
+        server.deliver(id: "new1", threadId: "tNew", from: "Jonas", subject: "Lunch?", text: "Tomorrow?")
+        await model.refresh()
+
+        #expect(model.threads.first?.id == "tNew")
+        #expect(model.threads.first?.isUnread == true)
+        #expect(unreadThreads(in: .inbox) == 3)
+    }
+
+    @Test func storedMailIsSearchedBeforeAndWithoutTheServer() async throws {
+        let model = await started()
+        while try await MailSync(client: model.client, store: store).backfillNextPage() {}
+        server.isOffline = true
+
+        model.searchScope = .everywhere
+        model.searchText = "apartment view"
+        await model.loadThreads(debounce: false)
+
+        #expect(model.threads.map(\.id) == ["t9"])
+    }
+
+    @Test func conversationStaysInUnreadListWhileBeingRead() async {
+        let model = await started()
+        model.showsUnreadOnly = true
+        await model.loadThreads()
+        model.selectedThreadID = "t1"
+
+        await model.setRead(true, threadID: "t1")
+
+        #expect(model.threads.map(\.id) == ["t1", "t2"])
+        #expect(model.selectedThreadID == "t1")
+
+        await model.trash(threadID: "t1")
+        #expect(model.threads.map(\.id) == ["t2"])
+        #expect(model.selectedThreadID == "t2")
+    }
+
+    @Test func failedTriageIsReportedAndUndone() async {
+        let model = await started()
+        server.isOffline = true
+
+        await model.archive(threadID: "t1")
+
+        #expect(model.errorMessage != nil)
+        #expect(model.threads.map(\.id).first == "t1")
+        #expect(model.thread(id: "t1")?.emails.first?.mailboxIds == ["inbox": true])
     }
 }

@@ -10,6 +10,8 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Test GoodMailKit
         working-directory: GoodMailKit
         run: swift test
@@ -21,6 +23,8 @@ jobs:
         destination: ["platform=macOS", "generic/platform=iOS"]
     steps:
       - uses: actions/checkout@v4
+        with:
+          submodules: recursive
       - name: Generate Xcode project
         run: brew install xcodegen && xcodegen generate
       - name: Build
