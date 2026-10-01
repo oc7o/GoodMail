@@ -45,6 +45,22 @@ open GoodMail.xcodeproj
 cd GoodMailKit && swift test   # run the package tests
 ```
 
+### Code signing
+
+Out of the box the Mac app is ad-hoc signed, so it builds without an Apple developer account. Such builds
+keep the API token in the login keychain, and macOS asks for your login password again after each rebuild.
+
+To sign with your own team (a free Personal Team works), create `Config/Signing.local.xcconfig`, which is
+git-ignored, and run `xcodegen generate` again:
+
+```
+DEVELOPMENT_TEAM = <your team id>
+CODE_SIGN_IDENTITY[sdk=macosx*] = Apple Development
+CODE_SIGN_ENTITLEMENTS = Config/TeamSigned.entitlements
+```
+
+Team-signed builds store the token in the data protection keychain, as on iOS.
+
 ### Signing in
 
 GoodMail signs in with a Fastmail **API token** for now (OAuth comes later). Create one under

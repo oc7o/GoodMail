@@ -1,0 +1,6 @@
+// Ad-hoc signing by default, so the app builds without an Apple developer account.
+// To sign with your own team, create Signing.local.xcconfig next to this file (see README).
+CODE_SIGN_STYLE = Automatic
+CODE_SIGN_IDENTITY[sdk=macosx*] = -
+
+#include? "Signing.local.xcconfig"

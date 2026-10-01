@@ -23,6 +23,9 @@ targets:
     type: application
     supportedDestinations: [iOS, macOS]
     sources: [App]
+    configFiles:
+      Debug: Config/Signing.xcconfig
+      Release: Config/Signing.xcconfig
     dependencies:
       - package: GoodMailKit
         product: JMAPKit
@@ -40,5 +43,3 @@ targets:
         ENABLE_APP_SANDBOX: YES
         ENABLE_OUTGOING_NETWORK_CONNECTIONS: YES
         ENABLE_HARDENED_RUNTIME: YES
-        CODE_SIGN_STYLE: Automatic
-        "CODE_SIGN_IDENTITY[sdk=macosx*]": "-"
