@@ -181,6 +181,42 @@ struct DraftParserTests {
         #expect(tail.text == "On 9. Oct 2026, at 16:03, Maya Lindqvist <maya@lindqvist.example> wrote:\n> Shall we meet on Thursday?")
     }
 
+    /// What the sanitizer has to take out of the text can't be edited back in, so such a draft opens read-only and
+    /// Edit Anyway keeps the original in Trash (D32) instead of saving over it.
+    @Test(arguments: [
+        "<div>Call <a href=\"sms:+15551234\">me</a>, <a href=\"ftp://files.example/r.pdf\">the report</a>, <a href=\"#details\">details</a></div>",
+        "<div>Formula <math><mi>x</mi></math>; Press <button>Accept</button>; <svg><text>label</text></svg></div>",
+        "<ol type=\"a\"><li>one</li><li>two</li></ol>",
+        """
+        <html><head><style>p.MsoNormal{font-family:Calibri;color:#1F497D} .big{font-size:24pt;font-weight:bold}</style>\
+        </head><body><p class="MsoNormal">Hello <span class="big">big</span></p></body></html>
+        """,
+        "<div style=\"margin-left: 40px\">indented</div>",
+        "<div>shown <span style=\"visibility:hidden\">hidden</span></div>",
+    ])
+    func draftsWithWhatTheEditorCannotHoldAreSimplified(html: String) {
+        let email = Fixture.email(
+            id: "d6", from: [("Alex Berg", "alex@fastmail.com")], subject: "Note", html: html, text: nil, keywords: ["$draft"])
+        #expect(DraftParser.parse(email, fallbackDomain: "fastmail.com").fidelity == .simplified([.other]))
+    }
+
+    /// Fastmail's web client styles Outlook's paragraphs in everything it writes; a reply to Outlook mail has them
+    /// only in the quote, which is kept as it is, so the text stays exact. So does anything else lost in the quote.
+    @Test func lossesInTheQuoteDoNotSimplifyTheText() throws {
+        let html = """
+            <!DOCTYPE html><html><head><title></title><style type="text/css">p.MsoNormal,p.MsoNoSpacing{margin:0}</style>\
+            </head><body><div>Sounds good.</div><div><br></div><div>On Thu, 9 Oct 2026, at 16:03, Jonas Weber wrote:</div>\
+            <blockquote type="cite" id="qt"><p class="MsoNormal">Can we meet?<o:p></o:p></p><svg></svg></blockquote></body></html>
+            """
+        let email = Fixture.email(
+            id: "d7", from: [("Alex Berg", "alex@fastmail.com")], subject: "Re: Meeting", inReplyTo: ["m4@weber.example"],
+            html: html, text: nil, keywords: ["$draft"])
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+        #expect(parsed.fidelity == .exact)
+        #expect(String(parsed.draft.body.characters) == "Sounds good.")
+        #expect(try #require(parsed.draft.preservedTail).html.hasSuffix("<blockquote type=\"cite\"><p>Can we meet?</p></blockquote>"))
+    }
+
     @Test func plainTextDraftsAreExact() {
         let email = Fixture.email(
             id: "d3", subject: "Note", messageId: nil, html: nil, text: "Hello,\r\nthis is plain.\n\n-- \nMax", keywords: ["$draft"])

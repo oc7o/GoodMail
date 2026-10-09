@@ -10,6 +10,11 @@ import SwiftUI
 public enum MailBodyHTMLReader {
     public enum Feature: String, Sendable, Hashable, CaseIterable {
         case images, tables, fonts, colors, sizes, nestedLists, quotes, preformatted, other
+
+        /// What the sanitizer took away before the reader saw the HTML.
+        init(_ loss: OutgoingHTMLSanitizer.Loss) {
+            self = loss == .image ? .images : .other
+        }
     }
 
     public struct Result: Sendable, Equatable {
@@ -19,8 +24,12 @@ public enum MailBodyHTMLReader {
     }
 
     public static func read(_ html: String) -> Result {
-        let clean = OutgoingHTMLSanitizer.sanitize(html, options: .init(cleansLinks: false)).html
-        return read(nodes: HTMLNode.parse(clean))
+        let sanitized = OutgoingHTMLSanitizer.sanitize(html, options: .init(cleansLinks: false))
+        var flattened: String.Index?
+        var result = read(nodes: HTMLNode.parse(sanitized.html, firstFlattened: &flattened))
+        result.dropped.formUnion(sanitized.losses(through: .max).map(Feature.init))
+        if flattened != nil { result.dropped.insert(.other) }
+        return result
     }
 
     static func read(nodes: [HTMLNode]) -> Result {
@@ -55,6 +64,12 @@ public enum MailBodyHTMLReader {
         struct Block {
             var alignment: AttributedString.TextAlignment?
             var isRightToLeft = false
+        }
+
+        /// Margins an element sets to zero; any other margin is reported as dropped.
+        struct Margins {
+            var topIsZero = false
+            var bottomIsZero = false
         }
 
         var paragraphs: [(text: AttributedString, block: Block)] = []
@@ -193,7 +208,7 @@ public enum MailBodyHTMLReader {
             let savedStyle = style
             defer { style = savedStyle }
             var block = blocks[blocks.count - 1]
-            applyAttributes(of: name, attributes, to: &block)
+            let margins = applyAttributes(of: name, attributes, to: &block)
             if style.isHidden { return }
 
             switch name {
@@ -216,10 +231,11 @@ public enum MailBodyHTMLReader {
                 visitBlock(children, block)
                 if pendingPrefix != nil { endParagraph(force: true) }
             case "p" where lists.isEmpty:
+                // A paragraph's margins read as empty lines, unless they are zero.
                 boundary()
-                if !paragraphs.isEmpty { needsBlankLine = true }
+                if !paragraphs.isEmpty, !margins.topIsZero { needsBlankLine = true }
                 visitBlock(children, block)
-                if !paragraphs.isEmpty { needsBlankLine = true }
+                if !paragraphs.isEmpty, !margins.bottomIsZero { needsBlankLine = true }
             case "td", "th":
                 if hasContent {
                     append("\t")
@@ -243,7 +259,7 @@ public enum MailBodyHTMLReader {
         }
 
         /// The element's own meaning and its style, dir and align attributes; reports what can't be kept.
-        mutating func applyAttributes(of name: String, _ attributes: [String: String], to block: inout Block) {
+        mutating func applyAttributes(of name: String, _ attributes: [String: String], to block: inout Block) -> Margins {
             switch name {
             case "b", "strong": style.font.isBold = true
             case "i", "em", "cite", "dfn", "var", "address": style.font.isItalic = true
@@ -264,6 +280,13 @@ public enum MailBodyHTMLReader {
             case "table", "tr", "td", "th", "caption", "tbody", "thead", "tfoot": dropped.insert(.tables)
             case "sub", "sup", "mark", "q", "bdo", "dl", "dt", "dd": dropped.insert(.other)
             case "center": block.alignment = .center
+            case "ol":
+                if attributes["reversed"] != nil || attributes["type"].map({ $0 != "1" }) == true { dropped.insert(.other) }
+            case "ul":
+                if attributes["type"].map({ $0.lowercased() != "disc" }) == true { dropped.insert(.other) }
+            case "li":
+                let marker = lists.last?.ordered == true ? "1" : "disc"
+                if attributes["type"].map({ $0.lowercased() != marker }) == true { dropped.insert(.other) }
             case "font":
                 if let color = attributes["color"] { applyColor(color) }
                 if attributes["face"] != nil { dropped.insert(.fonts) }
@@ -286,10 +309,12 @@ public enum MailBodyHTMLReader {
             case "ltr"?: block.isRightToLeft = false
             default: break
             }
-            if let css = attributes["style"] { applyCSS(css, to: &block) }
+            var margins = Margins()
+            if let css = attributes["style"] { applyCSS(css, of: name, to: &block, margins: &margins) }
+            return margins
         }
 
-        mutating func applyCSS(_ css: String, to block: inout Block) {
+        mutating func applyCSS(_ css: String, of name: String, to block: inout Block, margins: inout Margins) {
             for declaration in css.split(separator: ";") {
                 let pair = declaration.split(separator: ":", maxSplits: 1)
                 guard pair.count == 2 else { continue }
@@ -320,7 +345,7 @@ public enum MailBodyHTMLReader {
                 case "color":
                     applyColor(value)
                 case "background", "background-color":
-                    if !Self.isNeutral(value) { dropped.insert(.colors) }
+                    if !Self.isNeutral(value) && value != "transparent" { dropped.insert(.colors) }
                 case "text-align":
                     switch value {
                     case "center": block.alignment = .center
@@ -337,11 +362,42 @@ public enum MailBodyHTMLReader {
                     if value == "none" {
                         style.isHidden = true
                         dropped.insert(.other)
+                    } else if value != Self.display(of: name) {
+                        dropped.insert(.other)
+                    }
+                case "visibility":
+                    if value == "hidden" || value == "collapse" {
+                        style.isHidden = true
+                        dropped.insert(.other)
+                    }
+                case "opacity":
+                    let opacity = value.hasSuffix("%") ? Double(value.dropLast()).map { $0 / 100 } : Double(value)
+                    if let opacity, opacity < 1 {
+                        dropped.insert(.other)
+                        if opacity <= 0 { style.isHidden = true }
                     }
                 case "vertical-align":
                     if ["sub", "super"].contains(value) { dropped.insert(.other) }
                 case "text-transform", "font-variant", "letter-spacing", "word-spacing", "text-indent":
-                    if !Self.isNeutral(value) && value != "normal" { dropped.insert(.other) }
+                    if !Self.isNeutral(value) && value != "normal" && !Self.isZeroLength(value) { dropped.insert(.other) }
+                case "margin", "margin-top", "margin-right", "margin-bottom", "margin-left",
+                     "padding", "padding-top", "padding-right", "padding-bottom", "padding-left":
+                    // The editor has no indentation or spacing; only zero is what it shows.
+                    guard value.split(whereSeparator: \.isWhitespace).allSatisfy(Self.isZeroLength) else {
+                        dropped.insert(.other)
+                        continue
+                    }
+                    if property == "margin" || property == "margin-top" { margins.topIsZero = true }
+                    if property == "margin" || property == "margin-bottom" { margins.bottomIsZero = true }
+                case "border", "border-top", "border-right", "border-bottom", "border-left", "border-style":
+                    if Self.visibleBorderStyles.contains(where: value.contains) { dropped.insert(.other) }
+                case "float", "overflow", "overflow-x", "overflow-y":
+                    if !["none", "visible"].contains(value) { dropped.insert(.other) }
+                case "list-style", "list-style-type":
+                    guard ["ol", "ul", "li"].contains(name) else { break }
+                    let ordered = name == "ol" || (name == "li" && lists.last?.ordered == true)
+                    let marker = value.split(whereSeparator: \.isWhitespace).filter { $0 != "outside" }
+                    if !marker.isEmpty, marker != [ordered ? "decimal" : "disc"] { dropped.insert(.other) }
                 default:
                     break
                 }
@@ -378,12 +434,35 @@ public enum MailBodyHTMLReader {
             if let entry = MailPalette.entry(css: value) {
                 style.color = entry.color
             } else if !Self.isNeutral(value) {
-                dropped.insert(.colors)
+                dropped.insert(.colors) // "transparent" too: invisible text the editor would show
             }
         }
 
         static func isNeutral(_ value: String) -> Bool {
-            ["inherit", "initial", "unset", "transparent", "none", "currentcolor", "revert"].contains(value)
+            ["inherit", "initial", "unset", "none", "currentcolor", "revert"].contains(value)
+        }
+
+        static func isZeroLength(_ value: some StringProtocol) -> Bool {
+            let number = value.prefix { "+-.0123456789".contains($0) }
+            guard let amount = Double(number), amount == 0 else { return false }
+            return ["", "px", "em", "rem", "pt", "pc", "cm", "mm", "in", "ex", "ch", "%", "vw", "vh"]
+                .contains(String(value.dropFirst(number.count)))
+        }
+
+        static let visibleBorderStyles = ["solid", "dashed", "dotted", "double", "groove", "ridge", "inset", "outset"]
+
+        /// How the element is laid out without a `display` declaration.
+        static func display(of name: String) -> String {
+            switch name {
+            case "li": "list-item"
+            case "table": "table"
+            case "tr": "table-row"
+            case "td", "th": "table-cell"
+            case "div", "p", "blockquote", "center", "address", "pre", "h1", "h2", "h3", "h4", "h5", "h6", "dl",
+                 "dt", "dd", "ul", "ol", "hr", "caption":
+                "block"
+            default: "inline"
+            }
         }
 
         static func isMonospaced(family: String) -> Bool {

@@ -1,4 +1,5 @@
 import Foundation
+import MailPrivacy
 import SwiftUI
 import Testing
 @testable import MailCompose
@@ -74,6 +75,23 @@ struct HTMLReaderTests {
         ("<pre>code\n  indented</pre>", [.preformatted]),
         ("<p>x<sup>2</sup></p>", [.other]),
         ("<div style=\"font-family: Menlo, monospace; color: #0040DD; font-size: 80%\">x</div>", []),
+        // List markers the editor's "1." and "•" can't show.
+        ("<ol type=\"a\"><li>x</li></ol>", [.other]), ("<ul type=\"square\"><li>x</li></ul>", [.other]),
+        ("<ol reversed><li>x</li></ol>", [.other]), ("<ol style=\"list-style-type: lower-roman\"><li>x</li></ol>", [.other]),
+        ("<ul style=\"list-style: none\"><li>x</li></ul>", [.other]),
+        ("<ol type=\"1\" style=\"list-style-type: decimal\"><li>x</li></ol><ul type=\"disc\"><li>y</li></ul>", []),
+        // Layout and visibility the editor has no way to hold.
+        ("<div style=\"margin-left: 40px\">x</div>", [.other]), ("<div style=\"padding: 0 0 0 2em\">x</div>", [.other]),
+        ("<p style=\"text-indent: 2em\">x</p>", [.other]), ("<span style=\"visibility: hidden\">x</span>", [.other]),
+        ("<span style=\"opacity: 0.5\">x</span>", [.other]), ("<span style=\"color: transparent\">x</span>", [.colors]),
+        ("<div style=\"float: right\">x</div>", [.other]), ("<span style=\"display: block\">x</span>", [.other]),
+        ("<div style=\"border: 1px solid #ccc\">x</div>", [.other]), ("<div style=\"overflow: hidden\">x</div>", [.other]),
+        ("<div style=\"margin: 0; padding: 0px; text-indent: 0; border: none; display: block\">x</div>", []),
+        // What the sanitizer removes.
+        ("<div><a href=\"sms:+15551234\">me</a></div>", [.other]), ("<div>a<svg><text>b</text></svg></div>", [.other]),
+        ("<div>Press <button>OK</button></div>", [.other]), ("<div>x <math><mi>y</mi></math></div>", [.other]),
+        ("<style>.big { font-size: 24pt }</style><div class=\"big\">x</div>", [.other]),
+        ("<div><img src=\"javascript:x()\">x</div>", [.images]),
     ])
     func reportsWhatItSimplifies(html: String, features: [MailBodyHTMLReader.Feature]) {
         #expect(MailBodyHTMLReader.read(html).dropped == Set(features))
@@ -87,6 +105,9 @@ struct HTMLReaderTests {
     @Test func paragraphMarginsReadAsEmptyLines() {
         let result = MailBodyHTMLReader.read("<p>first</p><p>second</p>\n<p>third</p><ul><li><p>item</p></li></ul>")
         #expect(String(result.text.characters) == "first\n\nsecond\n\nthird\n\n• item")
+        let zero = MailBodyHTMLReader.read("<p style=\"margin: 0\">one</p><p style=\"margin:0px\">two</p><p style=\"margin-top: 0\">three</p><div>four</div>")
+        #expect(String(zero.text.characters) == "one\ntwo\nthree\n\nfour")
+        #expect(zero.dropped.isEmpty)
     }
 
     @Test func lineBreaksInsideABlock() {
@@ -106,7 +127,14 @@ struct HTMLReaderTests {
             + "<div>after</div>"
         let result = MailBodyHTMLReader.read(html)
         #expect(String(result.text.characters) == "deep\nafter")
+        #expect(result.dropped == [.other]) // the formatting of what was flattened is lost
         #expect(HTMLNode.parse("<i>a<b>b</b></i><br>").count == 2)
+
+        // Deeper than the tree keeps, though not deeper than the sanitizer does.
+        let nested = String(repeating: "<div><b>", count: 50) + "deep" + String(repeating: "</b></div>", count: 50)
+        #expect(OutgoingHTMLSanitizer.sanitize(nested).firstLoss.isEmpty)
+        #expect(MailBodyHTMLReader.read(nested).dropped == [.other])
+        #expect(MailBodyHTMLReader.read(String(repeating: "<div><b>", count: 30) + "x").dropped.isEmpty)
     }
 
     @Test func untrustedMarkupIsSanitizedFirst() {

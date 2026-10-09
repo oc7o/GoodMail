@@ -46,6 +46,12 @@ struct HTMLNode {
     static let maximumDepth = 64
 
     static func parse(_ html: String) -> [HTMLNode] {
+        var flattened: String.Index?
+        return parse(html, firstFlattened: &flattened)
+    }
+
+    /// `firstFlattened` is where the first element too deep to keep began; its formatting is lost.
+    static func parse(_ html: String, firstFlattened: inout String.Index?) -> [HTMLNode] {
         struct Open {
             var name: String
             var attributes: [String: String]
@@ -91,6 +97,7 @@ struct HTMLNode {
                                     range: index..<after))
                 } else if stack.count >= maximumDepth || !unwrapped.isEmpty {
                     unwrapped.append(name)
+                    if firstFlattened == nil { firstFlattened = index }
                 } else {
                     stack.append(Open(name: name, attributes: attributes, start: index))
                 }

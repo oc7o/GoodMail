@@ -99,11 +99,16 @@ public enum DraftParser {
 
         init(html: String, plainAlternative: String, email: Email) {
             let options = OutgoingHTMLSanitizer.Options(cleansLinks: false, allowedClasses: ["signature"])
-            let clean = OutgoingHTMLSanitizer.sanitize(html, options: options).html
-            var nodes = HTMLNode.parse(clean)
+            let document = OutgoingHTMLSanitizer.sanitize(html, options: options)
+            let clean = document.html
+            var flattened: String.Index?
+            var nodes = HTMLNode.parse(clean, firstFlattened: &flattened)
+            // The user's text ends where the signature or the tail begins.
+            var textEnd = clean.endIndex
 
             if let (attribution, quote) = Self.removeTail(from: &nodes) {
                 let start = (attribution ?? quote).range.lowerBound
+                textEnd = start
                 let sanitized = OutgoingHTMLSanitizer.sanitize(String(clean[start..<quote.range.upperBound]))
                 tail = PreservedTail(
                     html: sanitized.html,
@@ -117,11 +122,17 @@ public enum DraftParser {
                nodes[last].name == "div",
                nodes[last].attributes["class"]?.split(separator: " ").contains("signature") == true
             {
+                textEnd = min(textEnd, nodes[last].range.lowerBound)
                 nodes.removeSubrange(last...)
                 Self.removeSeparator(from: &nodes)
                 hasSignature = true
             }
             body = MailBodyHTMLReader.read(nodes: nodes)
+            // What the sanitizer removed from the text (not from the quote, which is kept as sanitized) can't be
+            // edited back in either.
+            let offset = clean.utf8.distance(from: clean.startIndex, to: textEnd)
+            body.dropped.formUnion(document.losses(through: offset).map(MailBodyHTMLReader.Feature.init))
+            if let flattened, flattened < textEnd { body.dropped.insert(.other) }
         }
 
         /// Takes a trailing `<blockquote type="cite">` and the attribution line before it out of `nodes`, with the
