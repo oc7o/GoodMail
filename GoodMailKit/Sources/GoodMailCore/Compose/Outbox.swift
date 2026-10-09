@@ -186,7 +186,7 @@ public final class Outbox {
     @ObservationIgnored private let channels = OutboxChannels()
     @ObservationIgnored private let flushes = SingleFlight()
     @ObservationIgnored private var rows: [StoredDraft] = []
-    @ObservationIgnored private var decoded: [String: (revision: Int64, draft: MessageDraft)] = [:]
+    @ObservationIgnored private var headers: [String: (revision: Int64, header: DraftHeader)] = [:]
     @ObservationIgnored private var uploadTasks: [String: Task<Void, Never>] = [:]
     @ObservationIgnored private var wakeUp: Task<Void, Never>?
     /// Drafts whose open composer asked for a server save that hasn't happened yet.
@@ -284,8 +284,8 @@ public final class Outbox {
     /// The fraction of the draft's attachment bytes uploaded while uploads for it are pending, else `nil`.
     public func uploadProgress(for id: UUID) -> Double? {
         let key = id.uuidString
-        guard uploadTasks[key] != nil, let draft = decoded[key]?.draft else { return nil }
-        let local = draft.attachments.filter { $0.source == .local }
+        guard uploadTasks[key] != nil, let header = headers[key]?.header else { return nil }
+        let local = header.attachments.filter { $0.source == .local }
         let total = local.reduce(0) { $0 + max($1.size, 1) }
         guard total > 0 else { return nil }
         let done = local.filter { uploadStates[$0.id] == .uploaded }.reduce(0) { $0 + max($1.size, 1) }
@@ -1291,14 +1291,14 @@ public final class Outbox {
 
     private func subject(of id: String) async -> String {
         guard let row = try? await store.draft(id: id) else { return "" }
-        return MailSend.draft(from: row)?.subject ?? ""
+        return header(of: row)?.subject ?? ""
     }
 
-    private func content(of row: StoredDraft) -> MessageDraft? {
-        if let cached = decoded[row.id], cached.revision == row.revision { return cached.draft }
-        guard let draft = MailSend.draft(from: row) else { return nil }
-        decoded[row.id] = (row.revision, draft)
-        return draft
+    private func header(of row: StoredDraft) -> DraftHeader? {
+        if let cached = headers[row.id], cached.revision == row.revision { return cached.header }
+        guard let header = try? JSONDecoder().decode(DraftHeader.self, from: row.content) else { return nil }
+        headers[row.id] = (row.revision, header)
+        return header
     }
 
     func rebuildItems() {
@@ -1309,9 +1309,9 @@ public final class Outbox {
         for row in rows {
             guard let id = UUID(uuidString: row.id) else { continue }
             let record = row.record
-            let draft = content(of: row)
-            let subject = draft?.subject ?? ""
-            let recipients = draft.map { $0.to + $0.cc + $0.bcc } ?? []
+            let header = header(of: row)
+            let subject = header?.subject ?? ""
+            let recipients = header.map { $0.to + $0.cc + $0.bcc } ?? []
             func item(_ state: State) -> Item {
                 Item(id: id, subject: subject, recipients: recipients, state: state, updatedAt: row.updatedAt)
             }
@@ -1342,7 +1342,7 @@ public final class Outbox {
                 items.append(item(.failed(record.failure ?? .refused(type: "unknown", description: nil))))
             }
         }
-        decoded = decoded.filter { key, _ in rows.contains { $0.id == key } }
+        headers = headers.filter { key, _ in rows.contains { $0.id == key } }
         if self.items != items { self.items = items }
         if unsyncedDrafts != drafts { unsyncedDrafts = drafts }
         if self.undoable != undoable { self.undoable = undoable }
@@ -1462,5 +1462,25 @@ private final class FirstOf: Sendable {
             return stored
         }
         continuation?.resume()
+    }
+}
+
+/// The parts of a draft's content the outbox lists, read without decoding its body or quote.
+private struct DraftHeader: Decodable {
+    var subject: String
+    var to: [EmailAddress]
+    var cc: [EmailAddress]
+    var bcc: [EmailAddress]
+    var attachments: [DraftAttachment]
+
+    private enum CodingKeys: String, CodingKey { case subject, to, cc, bcc, attachments }
+
+    init(from decoder: any Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        subject = try container.decodeIfPresent(String.self, forKey: .subject) ?? ""
+        to = try container.decodeIfPresent([EmailAddress].self, forKey: .to) ?? []
+        cc = try container.decodeIfPresent([EmailAddress].self, forKey: .cc) ?? []
+        bcc = try container.decodeIfPresent([EmailAddress].self, forKey: .bcc) ?? []
+        attachments = try container.decodeIfPresent([DraftAttachment].self, forKey: .attachments) ?? []
     }
 }
