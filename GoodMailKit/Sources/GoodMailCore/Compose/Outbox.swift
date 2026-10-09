@@ -697,10 +697,10 @@ public final class Outbox {
                 return await submitted(id, submission: submission, context: context)
             case .released?:
                 return await finalize(id, context: context, notice: nil)
-            case .holdRefused?:
+            case .holdRefused(let submittedAt)?:
                 // C23: remembered for the account; this message waits out the rest of its Undo window here.
                 await host?.outboxRefusedHold()
-                let until = clock.now.addingTimeInterval(Self.undoWindow)
+                let until = submittedAt.addingTimeInterval(Self.undoWindow)
                 _ = try? await store.updateOutbox(id: id) { _, record in
                     record.localDelay = true
                     record.notBefore = until
@@ -771,6 +771,11 @@ public final class Outbox {
         var directory = context.directory
         if directory.identities.isEmpty, let reloaded = await host?.outboxReloadIdentities() {
             directory = reloaded
+        }
+        guard !directory.identities.isEmpty else {
+            // Not known yet, which says nothing about this address: try again later.
+            await backOff(id, host?.isOnline == false ? .connection : .busy)
+            return nil
         }
         switch directory.sendingIdentity(for: from, consent: record.consentedSendingIdentity, policy: maskedSending) {
         case .identity(let identity):

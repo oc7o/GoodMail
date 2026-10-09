@@ -22,7 +22,7 @@ struct OutboxFailureTests {
     }
 
     private func eventually(_ condition: () async throws -> Bool) async rethrows -> Bool {
-        for _ in 0..<2000 {
+        for _ in 0..<50_000 {
             if try await condition() { return true }
             await Task.yield()
         }

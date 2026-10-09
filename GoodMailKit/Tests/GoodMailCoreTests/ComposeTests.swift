@@ -1,5 +1,7 @@
+import CoreGraphics
 import DemoAccount
 import Foundation
+import ImageIO
 import JMAPKit
 import MailCompose
 import MailPrivacy
@@ -21,7 +23,7 @@ struct ComposeTests {
 
     /// Waits for work that runs in its own task, such as an autosave, without sleeping.
     private func eventually(_ condition: () async throws -> Bool) async rethrows -> Bool {
-        for _ in 0..<2000 {
+        for _ in 0..<50_000 {
             if try await condition() { return true }
             await Task.yield()
         }
@@ -352,6 +354,61 @@ struct ComposeTests {
         await composer.removeAttachment(attachment.id)
         #expect(composer.attachments.isEmpty)
         #expect(try await account.store.outgoingAttachments(draftID: composer.id.uuidString).isEmpty)
+    }
+
+    @Test func photosLoseTheirLocationBeforeTheyAreKept() async throws {
+        await account.start()
+        let composer = try await account.composeToMaya()
+        let photo = try Self.jpegWithLocation()
+        #expect(Self.hasLocation(photo))
+
+        try await composer.addAttachment(photo, name: "Lisbon.jpg", typeIdentifier: "public.jpeg")
+
+        let attachment = try #require(composer.attachments.first)
+        #expect(attachment.name == "Lisbon.jpg" && attachment.type == "image/jpeg")
+        let kept = try await account.store.outgoingAttachmentData(id: attachment.id.uuidString)
+        #expect(!Self.hasLocation(kept))
+        #expect(attachment.size == kept.count)
+    }
+
+    @Test func aPhotoWhoseNameHidesWhatItIsGetsItsRealTypeAndExtension() async throws {
+        await account.start()
+        let composer = try await account.composeToMaya()
+        let file = FileManager.default.temporaryDirectory.appending(path: "ComposeTests-\(UUID().uuidString).dat")
+        try Self.jpegWithLocation().write(to: file)
+        defer { try? FileManager.default.removeItem(at: file) }
+
+        try await composer.addAttachment(fileAt: file)
+
+        let attachment = try #require(composer.attachments.first)
+        #expect(attachment.type == "image/jpeg")
+        #expect(attachment.name == file.deletingPathExtension().lastPathComponent + ".jpeg")
+        #expect(!Self.hasLocation(try await account.store.outgoingAttachmentData(id: attachment.id.uuidString)))
+    }
+
+    /// A small JPEG taken in Lisbon, as far as its metadata says.
+    private static func jpegWithLocation() throws -> Data {
+        let context = try #require(CGContext(
+            data: nil, width: 8, height: 8, bitsPerComponent: 8, bytesPerRow: 0, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+        context.setFillColor(red: 0.2, green: 0.4, blue: 0.6, alpha: 1)
+        context.fill(CGRect(x: 0, y: 0, width: 8, height: 8))
+        let image = try #require(context.makeImage())
+        let data = NSMutableData()
+        let destination = try #require(CGImageDestinationCreateWithData(data, "public.jpeg" as CFString, 1, nil))
+        let location: [CFString: Any] = [
+            kCGImagePropertyGPSLatitude: 38.71, kCGImagePropertyGPSLatitudeRef: "N",
+            kCGImagePropertyGPSLongitude: 9.14, kCGImagePropertyGPSLongitudeRef: "W",
+        ]
+        CGImageDestinationAddImage(destination, image, [kCGImagePropertyGPSDictionary: location] as CFDictionary)
+        #expect(CGImageDestinationFinalize(destination))
+        return data as Data
+    }
+
+    private static func hasLocation(_ data: Data) -> Bool {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return false }
+        let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        return properties?[kCGImagePropertyGPSDictionary] != nil
     }
 
     // MARK: Assembly

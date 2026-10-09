@@ -274,8 +274,9 @@ struct MailSend: Sendable {
         case held(OutboxRecord.Submission)
         /// Released at once (no server hold).
         case released
-        /// The server refused to hold it: from now on the Undo window passes on this device (C23).
-        case holdRefused
+        /// The server refused to hold it: from now on the Undo window passes on this device (C23), for this
+        /// message counted from the start of its request.
+        case holdRefused(submittedAt: Date)
         case failed(OutboxFailure)
         /// These uploads are gone from the server; upload them again and retry.
         case blobsNotFound([String])
@@ -369,7 +370,7 @@ struct MailSend: Sendable {
             record.lastAttempt = nil
             row.state = .queued
         }
-        if refusesHold { return .holdRefused }
+        if refusesHold { return .holdRefused(submittedAt: start) }
         if let methodError {
             return methodError.type == MethodError.serverUnavailable
                 ? .busy : .failed(.refused(type: methodError.type, description: methodError.description))

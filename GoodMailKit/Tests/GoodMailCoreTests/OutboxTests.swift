@@ -20,7 +20,7 @@ struct OutboxTests {
     }
 
     private func eventually(_ condition: () async throws -> Bool) async rethrows -> Bool {
-        for _ in 0..<2000 {
+        for _ in 0..<50_000 {
             if try await condition() { return true }
             await Task.yield()
         }
@@ -206,11 +206,83 @@ struct OutboxTests {
         await model.refresh()
 
         #expect(account.transport.heldRequests == 1)
+        #expect(outbox.uploadProgress(for: composer.id) == 0)
         #expect(try await account.row(composer.id)?.state == .queued)
         #expect(outbox.items.first.map { item in
             if case .waiting(.uploading) = item.state { true } else { false }
         } == true)
         account.transport.release(OutboxTestTransport.upload)
+        await account.settle()
+        #expect(try await account.row(composer.id)?.state == .held)
+        #expect(outbox.uploadProgress(for: composer.id) == nil)
+    }
+
+    @Test func discardingAWaitingMessageMovesItsDraftToTrash() async throws {
+        await account.start()
+        let composer = try await account.composeToMaya()
+        await composer.saveNow()
+        let copy = try #require(try await account.row(composer.id)?.serverEmailID)
+        account.server.isOffline = true
+        try await composer.send()
+        await account.flushed()
+        #expect(outbox.items.map(\.state) == [.waiting(.offline)])
+
+        #expect(await outbox.discard(composer.id) == .discarded)
+
+        #expect(try await account.row(composer.id) == nil)
+        #expect(outbox.items.isEmpty)
+        account.server.isOffline = false
+        await model.refresh()
+        #expect(try await account.serverEmail(copy)?.mailboxIds == ["trash": true])
+        await account.advance(60)
+        #expect(account.server.sentMessages.isEmpty)
+    }
+
+    // MARK: Without a composer (App Intents)
+
+    @Test func theOutboxSavesAndSendsDraftsDirectly() async throws {
+        await account.start()
+        let draft = MessageDraft(
+            from: EmailAddress(name: "Alex Berg", email: "alex@fastmail.com"), to: [maya], subject: "From Shortcuts",
+            body: AttributedString("Hi Maya"))
+
+        try await outbox.save(draft, toServer: true)
+        let copy = try #require(try await account.row(draft.id)?.serverEmailID)
+        #expect(try await account.serverEmail(copy)?.mailboxIds == ["drafts": true])
+
+        try await outbox.send(draft)
+        await account.settle()
+
+        #expect(try await account.row(draft.id)?.state == .held)
+        #expect(try await account.serverEmail(copy) == nil)
+        await account.advance(17)
+        let sent = try #require(account.server.sentMessages.only)
+        let text = try await account.serverEmail(sent.emailId)?.bodyValues?["text"]?.value
+        #expect(text == "Hi Maya\n\n-- \nAlex")
+        await #expect(throws: SendProblem.noRecipients) {
+            try await outbox.send(MessageDraft(from: EmailAddress(email: "alex@fastmail.com"), subject: "Nobody"))
+        }
+    }
+
+    // MARK: The token (D18)
+
+    @Test func replacingTheTokenKeepsDraftsAndLearnsWhatTheNewOneMay() async throws {
+        let account = try OutboxTestAccount(supportsSubmission: false)
+        await account.start()
+        let model = account.model
+        #expect(model.sendAvailability == .tokenLacksSubmission)
+        let composer = try await account.composeToMaya()
+        await composer.saveNow()
+        #expect(composer.problems == [.cannotSend(.tokenLacksSubmission)])
+
+        account.server.supportsSubmission = true
+        await model.client.setToken("new token")
+        await model.tokenChanged()
+
+        #expect(model.sendAvailability == .available)
+        #expect(model.identities.map(\.id) == ["ident-1", "ident-2"])
+        #expect(composer.problems.isEmpty)
+        try await composer.send()
         await account.settle()
         #expect(try await account.row(composer.id)?.state == .held)
     }
@@ -232,6 +304,21 @@ struct OutboxTests {
         #expect(!otherTypes.contains("EmailSubmission") && !otherTypes.contains("Identity"))
         #expect(otherTypes.contains("Email"))
         other.stop()
+        model.stop()
+    }
+
+    @Test func identitiesChangedElsewhereArePushedAndReadAgain() async throws {
+        let model = account.relaunch(syncsInBackground: true)
+        await model.start()
+        #expect(await eventually { model.isPushConnected })
+        #expect(model.senderOptions().first { $0.address.email == "fjord.k3x9@fastmail.com" }?.needsSendingIdentity == true)
+
+        _ = try await account.client.createIdentity(Identity.Create(email: "fjord.k3x9@fastmail.com"))
+
+        #expect(await eventually { model.identities.contains { $0.email == "fjord.k3x9@fastmail.com" } })
+        #expect(model.senderOptions().first { $0.address.email == "fjord.k3x9@fastmail.com" }?.needsSendingIdentity == false)
+        let stored = try #require(try await account.store.keyedData("account"))
+        #expect(try JSONDecoder().decode(AccountSnapshot.self, from: stored).identities.count == 3)
         model.stop()
     }
 

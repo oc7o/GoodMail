@@ -258,10 +258,14 @@ public final class Composer: Identifiable {
         if kind == .forwardAsAttachment, directory.isMasked(from.email) {
             return "The attached message shows the address it was delivered to."
         }
-        if let receivedAt, receivedAt.reason != .defaultIdentity, receivedAt.reason != .loginName,
-           receivedAt.address.email.lowercased() != from.email.lowercased() {
-            let received = receivedAt.address.email
-            return "You received this at \(received). Sending from \(from.email) shows \(from.email) to the recipients."
+        if let receivedAt, receivedAt.address.email.lowercased() != from.email.lowercased() {
+            let original = receivedAt.address.email
+            let sending = "Sending from \(from.email) shows \(from.email) to the recipients."
+            switch receivedAt.reason {
+            case .deliveredToMask, .deliveredToIdentity: return "You received this at \(original). " + sending
+            case .originalFromYou: return "You wrote this from \(original). " + sending
+            case .defaultIdentity, .loginName: break
+            }
         }
         return nil
     }
@@ -521,9 +525,7 @@ public final class Composer: Identifiable {
             origin = nil
             savedRevision = revision
             savedEdits = max(savedEdits, edits)
-            if case .savedToServer = saveStatus { saveStatus = .savedLocally } else if saveStatus != .savedLocally {
-                saveStatus = .savedLocally
-            }
+            if saveStatus != .savedLocally { saveStatus = .savedLocally }
             return true
         } catch {
             saveStatus = .failed(error.localizedDescription)
