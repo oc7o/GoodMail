@@ -4,12 +4,14 @@ import Synchronization
 
 /// An in-memory stand-in for Fastmail with sample mail, for running the app without an account.
 ///
-/// It understands just the JMAP calls the app makes, and pushes its state changes to event-source
-/// connections (RFC 8620 §7.3). The app uses it when launched with `-demo YES`.
+/// It understands the JMAP calls the app makes, sending included: drafts, uploads, identities with Fastmail's
+/// rules for masked addresses, and submissions that it holds and releases on its `DemoClock`, the way Cyrus
+/// does. It pushes its state changes to event-source connections (RFC 8620 §7.3). For tests it can also play a
+/// failing network, a busy server and other devices. The app uses it when launched with `-demo YES`.
 public final class DemoTransport: HTTPTransport {
-    private typealias Object = [String: JSONValue]
+    typealias Object = [String: JSONValue]
 
-    private struct Change {
+    struct Change {
         enum Kind { case created, updated, destroyed }
         let state: Int
         let id: String
@@ -17,7 +19,7 @@ public final class DemoTransport: HTTPTransport {
     }
 
     /// An open event-source response.
-    private struct EventStream {
+    struct EventStream {
         let continuation: AsyncThrowingStream<Data, any Error>.Continuation
         /// The types to push, or `nil` for all of them.
         let types: Set<String>?
@@ -27,7 +29,7 @@ public final class DemoTransport: HTTPTransport {
     }
 
     /// What the store has for an event stream, handed over once its lock is released (see `pushLock`).
-    private enum Push {
+    enum Push {
         case event(Data, AsyncThrowingStream<Data, any Error>.Continuation)
         case end(EventStream, (any Error)?)
 
@@ -42,12 +44,66 @@ public final class DemoTransport: HTTPTransport {
         }
     }
 
-    private struct Store {
+    /// What goes wrong with the next API request, after the server ran it.
+    enum ResponseFault {
+        case lost
+        case status(Int)
+    }
+
+    /// A blob that isn't part of the sample mail: an upload, or one an email was made of.
+    struct Blob {
+        var data: Data
+        var type: String
+        /// `nil` once an email refers to it, which keeps it for good (RFC 8620 §6).
+        var expires: Date?
+    }
+
+    /// One method call's answer: its own, and for `EmailSubmission/set` the implicit `Email/set` after it.
+    struct Answer: Sendable {
+        let name: String
+        let arguments: Object
+
+        static func error(_ type: String, description: String? = nil) -> Answer {
+            var arguments: Object = ["type": .string(type)]
+            if let description { arguments["description"] = .string(description) }
+            return Answer(name: "error", arguments: arguments)
+        }
+    }
+
+    /// What the calls of one request share: the capabilities it uses, and the ids of what it created so far.
+    struct RequestContext {
+        let using: Set<String>
+        var createdIDs: [String: String] = [:]
+    }
+
+    struct Store {
+        typealias Object = DemoTransport.Object
+
         var emails: [Object]
         var maskedEmails: [Object]
+        var identities: [Object]
+        /// Header fields of emails beyond those their properties make, by email id, topmost first.
+        var headers: [String: [DemoHeader]]
+        var blobs: [String: Blob] = [:]
+        var submissions: [Submission] = []
+        var sentMessages: [DemoSentMessage] = []
+        var oneClickRequests: [URLRequest] = []
+        var supportsSubmission: Bool
+        var requiresIdentityForMaskedFrom = true
+        var rejectsHoldFor = false
+        var ignoresHeaderFilter = false
+        var releaseDelay: TimeInterval = 0
+        var nextResponseFault: ResponseFault?
+        var nextSubmissionMethodError: String?
+        var nextSubmissionRejection: SetError?
+        /// Pending submissions a task waits to release, on a clock that follows the system clock.
+        var scheduledReleases: Set<String> = []
+        var nextID = 1
         var state = 1
         var deliveryState = 1
         var maskedEmailState = 1
+        var submissionState = 1
+        var identityState = 1
         var changes: [Change] = []
         /// Changes up to this state have been forgotten, like a server that pruned its history.
         var oldestKnownState = 0
@@ -55,6 +111,7 @@ public final class DemoTransport: HTTPTransport {
         var rejectedEmailIDs: Set<String> = []
         var updateRequestCount = 0
         var downloadCount = 0
+        var uploadCount = 0
         /// Types whose state changed since the last push.
         var unpushedTypes: Set<String> = []
         var eventStreams: [Int: EventStream] = [:]
@@ -63,33 +120,48 @@ public final class DemoTransport: HTTPTransport {
 
         /// What `Foo/get` returns as `state` for each type; EmailDelivery exists only for push (RFC 8621 §1.5).
         var typeStates: [String: String] {
-            Self.typeStates(mail: state, delivery: deliveryState, maskedEmail: maskedEmailState)
+            Self.typeStates([state, deliveryState, maskedEmailState, submissionState, identityState],
+                            includesSubmission: supportsSubmission)
         }
 
         /// Encodes the state of every type, so a reconnecting client's `Last-Event-ID` shows what it missed.
-        var eventID: String { "\(state).\(deliveryState).\(maskedEmailState)" }
+        var eventID: String {
+            [state, deliveryState, maskedEmailState, submissionState, identityState].map(String.init)
+                .joined(separator: ".")
+        }
 
-        static func typeStates(mail: Int, delivery: Int, maskedEmail: Int) -> [String: String] {
-            [
-                "Email": String(mail), "Thread": String(mail), "Mailbox": String(mail),
-                "EmailDelivery": String(delivery), "MaskedEmail": String(maskedEmail),
+        static func typeStates(_ states: [Int], includesSubmission: Bool) -> [String: String] {
+            var types = [
+                "Email": String(states[0]), "Thread": String(states[0]), "Mailbox": String(states[0]),
+                "EmailDelivery": String(states[1]), "MaskedEmail": String(states[2]),
             ]
-        }
-
-        func knows(blobId: String) -> Bool {
-            emails.contains { email in
-                guard case .array(let parts)? = email["attachments"] else { return false }
-                return parts.contains { part in
-                    if case .object(let part) = part { part["blobId"] == .string(blobId) } else { false }
-                }
+            if includesSubmission {
+                types["EmailSubmission"] = String(states[3])
+                types["Identity"] = String(states[4])
             }
+            return types
         }
 
-        mutating func record(_ id: String, _ kind: Change.Kind) {
+        mutating func makeID(_ prefix: String) -> String {
+            defer { nextID += 1 }
+            return "\(prefix)\(nextID)"
+        }
+
+        func email(_ id: String) -> Object? {
+            emails.first { $0["id"] == .string(id) }
+        }
+
+        /// Every header field of an email, as in its message.
+        func allHeaders(of email: Object) -> [DemoHeader] {
+            (headers[DemoTransport.string(email["id"])] ?? []) + DemoMessages.standardHeaders(email)
+        }
+
+        /// - Parameter isDelivery: Whether the change is new mail arriving, as opposed to a client creating it.
+        mutating func record(_ id: String, _ kind: Change.Kind, isDelivery: Bool = false) {
             state += 1
             changes.append(Change(state: state, id: id, kind: kind))
             unpushedTypes.formUnion(["Email", "Thread", "Mailbox"])
-            if kind == .created {
+            if isDelivery {
                 deliveryState += 1
                 unpushedTypes.insert("EmailDelivery")
             }
@@ -100,11 +172,21 @@ public final class DemoTransport: HTTPTransport {
             unpushedTypes.insert("MaskedEmail")
         }
 
+        mutating func recordSubmissionChange() {
+            submissionState += 1
+            unpushedTypes.insert("EmailSubmission")
+        }
+
+        mutating func recordIdentityChange() {
+            identityState += 1
+            unpushedTypes.insert("Identity")
+        }
+
         /// The current states of the types that changed since the event `eventID`; all of them for an id that
         /// isn't one of ours.
         func typeStates(changedSince eventID: String) -> [String: String] {
             let seen = eventID.split(separator: ".").compactMap { Int($0) }
-            let old = seen.count == 3 ? Self.typeStates(mail: seen[0], delivery: seen[1], maskedEmail: seen[2]) : [:]
+            let old = seen.count == 5 ? Self.typeStates(seen, includesSubmission: supportsSubmission) : [:]
             return typeStates.filter { old[$0.key] != $0.value }
         }
 
@@ -155,26 +237,37 @@ public final class DemoTransport: HTTPTransport {
         }
     }
 
-    private enum Outcome {
-        case result(Object)
-        case error(String)
-    }
-
-    private static let accountId = "demo"
-    private static let mailboxes: [(id: String, name: String, role: String?, parent: String?)] = [
+    static let host = "demo.invalid"
+    static let accountId = "demo"
+    static let mailboxes: [(id: String, name: String, role: String?, parent: String?)] = [
         ("inbox", "Inbox", "inbox", nil), ("archive", "Archive", "archive", nil), ("drafts", "Drafts", "drafts", nil),
         ("sent", "Sent", "sent", nil), ("junk", "Spam", "junk", nil), ("trash", "Trash", "trash", nil),
         ("receipts", "Receipts", nil, nil), ("travel", "Travel", nil, nil), ("lisbon", "Lisbon 2026", nil, "travel"),
     ]
 
-    private let store = Mutex(Store(emails: DemoData.emails, maskedEmails: DemoData.maskedEmails))
+    /// The URL where the demo newsletter takes one-click unsubscribe requests (see `oneClickRequests`).
+    public static var oneClickUnsubscribeURL: URL { DemoData.oneClickURL }
+
+    /// The time everything on this server happens at.
+    public let clock: DemoClock
+    let store: Mutex<Store>
     /// Held while the store's outbox is filled and delivered, so every stream gets its events in order.
     ///
     /// Delivering under `store`'s lock instead would deadlock: yielding takes a runtime lock of the consumer's
     /// task, which cancelling the consumer holds while it runs `onTermination`, which takes `store`'s lock.
-    private let pushLock = Mutex(())
+    let pushLock = Mutex(())
 
-    public init() {}
+    /// - Parameters:
+    ///   - clock: A manual clock lets tests move time, such as past the hold of a sent message.
+    ///   - supportsSubmission: Whether the token has the "Email submission" scope.
+    public init(clock: DemoClock = DemoClock(), supportsSubmission: Bool = true) {
+        self.clock = clock
+        let now = clock.now
+        store = Mutex(Store(
+            emails: DemoData.emails(relativeTo: now), maskedEmails: DemoData.maskedEmails(relativeTo: now),
+            identities: DemoData.identities, headers: DemoData.headers, supportsSubmission: supportsSubmission))
+        clock.addObserver(self)
+    }
 
     // MARK: Simulating the outside world
 
@@ -190,10 +283,23 @@ public final class DemoTransport: HTTPTransport {
         }
     }
 
+    /// Whether the token has the "Email submission" scope. Without it the session leaves submission out, and
+    /// every request using it is refused with HTTP 403, as Fastmail does.
+    public var supportsSubmission: Bool {
+        get { store.withLock { $0.supportsSubmission } }
+        set { store.withLock { $0.supportsSubmission = newValue } }
+    }
+
     /// Emails whose `Email/set` updates are refused with a `forbidden` SetError.
     public var rejectedEmailIDs: Set<String> {
         get { store.withLock { $0.rejectedEmailIDs } }
         set { store.withLock { $0.rejectedEmailIDs = newValue } }
+    }
+
+    /// Whether `Email/query` ignores the `header` filter, as a server might, and returns everything else.
+    public var ignoresHeaderFilter: Bool {
+        get { store.withLock { $0.ignoresHeaderFilter } }
+        set { store.withLock { $0.ignoresHeaderFilter = newValue } }
     }
 
     /// How many `Email/set` calls have been received.
@@ -216,13 +322,34 @@ public final class DemoTransport: HTTPTransport {
         store.withLock { $0.eventStreamConnections }
     }
 
+    /// The next API request runs, then fails as if the connection dropped before its answer arrived.
+    public func loseNextResponse() {
+        store.withLock { $0.nextResponseFault = .lost }
+    }
+
+    /// The next API request runs, then is answered with `status` and no body instead of its result, like a
+    /// proxy giving up on a slow server (e.g. 503).
+    public func answerNext(withStatus status: Int) {
+        store.withLock { $0.nextResponseFault = .status(status) }
+    }
+
     /// Delivers a new plain-text message, as if someone had just sent it.
-    public func deliver(id: String, threadId: String, from: String, subject: String, text: String, to mailboxId: String = "inbox") {
+    ///
+    /// - Parameters:
+    ///   - toAddress: The recipient in To; the login name if `nil`.
+    ///   - deliveredTo: The address Fastmail delivered it to, as its `X-Delivered-To` header field names it.
+    public func deliver(
+        id: String, threadId: String, from: String, subject: String, text: String, to mailboxId: String = "inbox",
+        toAddress: String? = nil, deliveredTo: String? = nil
+    ) {
+        let now = clock.now
         update { store in
             store.emails.append(DemoData.email(
-                id, thread: threadId, in: mailboxId, hoursAgo: 0, from: (from, "\(from.lowercased())@example.com"),
-                subject: subject, text: text))
-            store.record(id, .created)
+                id, thread: threadId, in: mailboxId, hoursAgo: 0, before: now,
+                from: (from, "\(from.lowercased())@example.com"),
+                to: toAddress.map { ("", $0) } ?? ("Alex Berg", DemoData.me), subject: subject, text: text))
+            if let deliveredTo { store.headers[id] = [DemoHeader("X-Delivered-To", deliveredTo)] }
+            store.record(id, .created, isDelivery: true)
         }
     }
 
@@ -230,6 +357,7 @@ public final class DemoTransport: HTTPTransport {
     public func destroyEmail(id: String) {
         update { store in
             store.emails.removeAll { $0["id"] == .string(id) }
+            store.headers[id] = nil
             store.record(id, .destroyed)
         }
     }
@@ -249,7 +377,7 @@ public final class DemoTransport: HTTPTransport {
     }
 
     /// Changes the server's data, then pushes the new state of every type that changed.
-    private func update<Result: Sendable>(_ body: (inout Store) -> Result) -> Result {
+    func update<Result: Sendable>(_ body: (inout Store) -> Result) -> Result {
         pushLock.withLock { _ in
             let (result, outbox) = store.withLock { store in
                 let result = body(&store)
@@ -266,34 +394,67 @@ public final class DemoTransport: HTTPTransport {
     public func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         if isOffline { throw URLError(.notConnectedToInternet) }
         let url = request.url!
-        let body: Data
-        var contentType = "application/json"
-        if url.path().hasSuffix("/session") {
-            body = Data(DemoData.session.utf8)
-        } else if url.path().contains("/download/") {
-            // Path: /jmap/download/{accountId}/{blobId}/{name}
-            let blobId = url.pathComponents.dropFirst(4).first ?? ""
-            guard store.withLock({ $0.knows(blobId: blobId) }) else {
-                return (Data(), HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil)!)
-            }
-            store.withLock { $0.downloadCount += 1 }
-            body = Data(DemoData.logo.utf8)
-            contentType = "image/svg+xml"
-        } else {
-            let call = try JSONDecoder().decode(JSONValue.self, from: request.httpBody ?? Data())
-            body = try JSONEncoder().encode(respond(to: call))
+        let path = url.path()
+        // Clients ask Fastmail's session URL; the session sends everything else to the demo host.
+        if path.hasSuffix("/session") {
+            return Self.reply(url, body: Data(DemoData.session(supportsSubmission: supportsSubmission).utf8))
         }
-        let response = HTTPURLResponse(
-            url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: ["Content-Type": contentType])!
-        return (body, response)
+        guard url.host() == Self.host else { return answerElsewhere(request) }
+        if path.contains("/download/") { return download(request) }
+        if path.contains("/upload/") { return upload(request) }
+        return try answerAPIRequest(request)
     }
 
-    private func respond(to request: JSONValue) -> JSONValue {
-        guard case .object(let envelope) = request, case .array(let calls)? = envelope["methodCalls"] else {
-            return ["sessionState": "demo", "methodResponses": []]
+    private func answerAPIRequest(_ request: URLRequest) throws -> (Data, HTTPURLResponse) {
+        let url = request.url!
+        let call = try JSONDecoder().decode(JSONValue.self, from: request.httpBody ?? Data())
+        guard case .object(let envelope) = call else { return Self.reply(url, status: 400) }
+        let using = Set(Self.strings(envelope["using"]))
+        if using.contains(Capability.submission), !supportsSubmission {
+            let problem: JSONValue = [
+                "type": "urn:ietf:params:jmap:error:unknownCapability", "status": 403,
+                "detail": "This token lacks the Email submission scope.",
+            ]
+            return Self.reply(url, status: 403, body: try JSONEncoder().encode(problem),
+                              type: "application/problem+json")
+        }
+        let fault = store.withLock { store in
+            defer { store.nextResponseFault = nil }
+            return store.nextResponseFault
+        }
+        releaseDueSubmissions()
+        let body = try JSONEncoder().encode(respond(to: envelope, using: using))
+        scheduleReleases()
+        switch fault {
+        case .lost?: throw URLError(.networkConnectionLost)
+        case .status(let status)?: return Self.reply(url, status: status)
+        case nil: return Self.reply(url, body: body)
+        }
+    }
+
+    /// The demo newsletter's one-click unsubscribe endpoint; any other host isn't found.
+    private func answerElsewhere(_ request: URLRequest) -> (Data, HTTPURLResponse) {
+        let url = request.url!
+        guard request.httpMethod == "POST", url == DemoData.oneClickURL else { return Self.reply(url, status: 404) }
+        store.withLock { $0.oneClickRequests.append(request) }
+        return Self.reply(url, body: Data(), type: "text/plain")
+    }
+
+    static func reply(_ url: URL, status: Int = 200, body: Data = Data(), type: String = "application/json",
+                      headers: [String: String] = [:]) -> (Data, HTTPURLResponse) {
+        let fields = ["Content-Type": type].merging(headers) { $1 }
+        return (body, HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: fields)!)
+    }
+
+    private func respond(to envelope: Object, using: Set<String>) -> JSONValue {
+        let sessionState = DemoData.sessionState(supportsSubmission: supportsSubmission)
+        guard case .array(let calls)? = envelope["methodCalls"] else {
+            return ["sessionState": .string(sessionState), "methodResponses": []]
         }
         var responses: [JSONValue] = []
         var results: [String: JSONValue] = [:]
+        var context = RequestContext(using: using)
+        let now = clock.now
         for call in calls {
             guard case .array(let triple) = call, triple.count == 3, case .string(let name) = triple[0],
                   case .object(var arguments) = triple[1], case .string(let id) = triple[2]
@@ -306,15 +467,13 @@ public final class DemoTransport: HTTPTransport {
                     results[source] ?? .null, path: path.split(separator: "/")[...])
                 arguments[key] = nil
             }
-            switch update({ perform(name, arguments, in: &$0) }) {
-            case .result(let result):
-                results[id] = .object(result)
-                responses.append([.string(name), .object(result), .string(id)])
-            case .error(let type):
-                responses.append(["error", ["type": .string(type)], .string(id)])
+            let answers = update { store in perform(name, arguments, in: &store, context: &context, now: now) }
+            for answer in answers {
+                if results[id] == nil, answer.name != "error" { results[id] = .object(answer.arguments) }
+                responses.append([.string(answer.name), .object(answer.arguments), .string(id)])
             }
         }
-        return ["sessionState": "demo", "methodResponses": .array(responses)]
+        return ["sessionState": .string(sessionState), "methodResponses": .array(responses)]
     }
 
     /// Evaluates a JSON Pointer with `*` wildcards (RFC 8620 §3.7).
@@ -336,7 +495,8 @@ public final class DemoTransport: HTTPTransport {
 
     // MARK: Push
 
-    /// Opens the event source (RFC 8620 §7.3); any other URL streams its `send(_:)` response as one chunk.
+    /// Opens the event source (RFC 8620 §7.3); any other URL streams its `send(_:)` response, a download in
+    /// chunks of 64 KiB.
     ///
     /// Nothing is pushed on connecting: the RFC asks for that only when the client's `Last-Event-ID` shows it
     /// missed changes.
@@ -344,7 +504,15 @@ public final class DemoTransport: HTTPTransport {
         let url = request.url!
         guard url.path().hasSuffix("/event/") else {
             let (body, response) = try await send(request)
-            return (response, AsyncThrowingStream { $0.yield(body); $0.finish() })
+            return (response, AsyncThrowingStream { continuation in
+                var offset = body.startIndex
+                while offset < body.endIndex {
+                    let end = body.index(offset, offsetBy: 65_536, limitedBy: body.endIndex) ?? body.endIndex
+                    continuation.yield(Data(body[offset..<end]))
+                    offset = end
+                }
+                continuation.finish()
+            })
         }
         let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
         func parameter(_ name: String) -> String? { query.first { $0.name == name }?.value }
@@ -383,73 +551,56 @@ public final class DemoTransport: HTTPTransport {
         store.withLock { $0.eventStreams.removeValue(forKey: id) }?.pinger?.cancel()
     }
 
-    private static func event(_ name: String, id: String? = nil, data: JSONValue) -> Data {
+    static func event(_ name: String, id: String? = nil, data: JSONValue) -> Data {
         let json = String(decoding: try! JSONEncoder().encode(data), as: UTF8.self)
         return Data("event: \(name)\n\(id.map { "id: \($0)\n" } ?? "")data: \(json)\n\n".utf8)
     }
 
     // MARK: Methods
 
-    private func perform(_ name: String, _ arguments: Object, in store: inout Store) -> Outcome {
-        let base: Object = ["accountId": .string(Self.accountId), "state": .string(String(store.state)), "notFound": []]
+    private func perform(
+        _ name: String, _ arguments: Object, in store: inout Store, context: inout RequestContext, now: Date
+    ) -> [Answer] {
+        let base: Object = ["accountId": .string(Self.accountId), "state": .string(String(store.state))]
         switch name {
         case "Mailbox/get":
-            return .result(base.merging(["list": .array(mailboxes(store))]) { $1 })
+            let list: Object = ["list": .array(mailboxes(store)), "notFound": []]
+            return [Answer(name: name, arguments: base.merging(list) { $1 })]
         case "Email/query":
-            return .result(query(arguments, store))
+            return [Answer(name: name, arguments: query(arguments, store))]
         case "Email/get":
-            let properties = Self.strings(arguments["properties"])
-            let list = Self.strings(arguments["ids"]).compactMap { id in
-                store.emails.first { $0["id"] == .string(id) }
-            }.map { email in
-                properties.isEmpty ? email : email.filter { $0.key == "id" || properties.contains($0.key) }
-            }
-            return .result(base.merging(["list": .array(list.map(JSONValue.object))]) { $1 })
+            return [Answer(name: name, arguments: base.merging(getEmails(arguments, store)) { $1 })]
         case "Email/changes":
-            return changes(arguments, store)
+            return [changes(arguments, store)]
         case "Thread/get":
             let list = Self.strings(arguments["ids"]).uniqued().map { id -> JSONValue in
                 let members = store.emails.filter { $0["threadId"] == .string(id) }
                     .sorted { Self.string($0["receivedAt"]) < Self.string($1["receivedAt"]) }
                 return ["id": .string(id), "emailIds": .array(members.compactMap { $0["id"] })]
             }
-            return .result(base.merging(["list": .array(list)]) { $1 })
+            return [Answer(name: name, arguments: base.merging(["list": .array(list), "notFound": []]) { $1 })]
         case "Email/set":
             store.updateRequestCount += 1
-            guard case .object(let updates)? = arguments["update"] else { return .error("invalidArguments") }
-            let oldState = store.state
-            var updated: Object = [:]
-            var notUpdated: Object = [:]
-            for (id, patch) in updates {
-                guard let index = store.emails.firstIndex(where: { $0["id"] == .string(id) }) else {
-                    notUpdated[id] = ["type": "notFound"]
-                    continue
-                }
-                guard case .object(let patch) = patch else {
-                    notUpdated[id] = ["type": "invalidPatch"]
-                    continue
-                }
-                guard !store.rejectedEmailIDs.contains(id) else {
-                    notUpdated[id] = ["type": "forbidden", "description": "Rejected by the demo server"]
-                    continue
-                }
-                Self.apply(patch, to: &store.emails[index])
-                store.record(id, .updated)
-                updated[id] = .null
-            }
-            var result: Object = [
-                "accountId": .string(Self.accountId), "oldState": .string(String(oldState)),
-                "newState": .string(String(store.state)), "updated": .object(updated),
-            ]
-            if !notUpdated.isEmpty { result["notUpdated"] = .object(notUpdated) }
-            return .result(result)
+            return [Answer(name: name, arguments: store.setEmails(arguments, context: &context, now: now))]
         case "MaskedEmail/get":
             let list = JSONValue.array(store.maskedEmails.map(JSONValue.object))
-            return .result(base.merging(["state": .string(String(store.maskedEmailState)), "list": list]) { $1 })
+            return [Answer(name: name, arguments: base.merging([
+                "state": .string(String(store.maskedEmailState)), "list": list, "notFound": [],
+            ]) { $1 })]
         case "MaskedEmail/set":
-            return .result(setMaskedEmails(arguments, &store))
+            return [Answer(name: name, arguments: setMaskedEmails(arguments, &store, now: now))]
+        case "Identity/get":
+            return [Answer(name: name, arguments: store.getIdentities(arguments))]
+        case "Identity/set":
+            return [Answer(name: name, arguments: store.setIdentities(arguments, context: &context))]
+        case "EmailSubmission/get":
+            return [Answer(name: name, arguments: store.getSubmissions(arguments))]
+        case "EmailSubmission/query":
+            return [Answer(name: name, arguments: store.querySubmissions(arguments))]
+        case "EmailSubmission/set":
+            return store.setSubmissions(arguments, context: &context, now: now)
         default:
-            return .error("unknownMethod")
+            return [.error("unknownMethod")]
         }
     }
 
@@ -469,9 +620,33 @@ public final class DemoTransport: HTTPTransport {
         }
     }
 
+    /// Asked-for `header:` properties are made from the email's header fields (RFC 8621 §4.1.3).
+    private func getEmails(_ arguments: Object, _ store: Store) -> Object {
+        let properties = Self.strings(arguments["properties"])
+        var list: [JSONValue] = []
+        var notFound: [JSONValue] = []
+        for id in Self.strings(arguments["ids"]) {
+            guard let email = store.email(id) else {
+                notFound.append(.string(id))
+                continue
+            }
+            guard !properties.isEmpty else {
+                list.append(.object(email))
+                continue
+            }
+            var result = email.filter { $0.key == "id" || properties.contains($0.key) }
+            let headers = store.allHeaders(of: email)
+            for property in properties where property.hasPrefix("header:") {
+                result[property] = DemoMessages.headerProperty(property, of: headers)
+            }
+            list.append(.object(result))
+        }
+        return ["list": .array(list), "notFound": .array(notFound)]
+    }
+
     private func query(_ arguments: Object, _ store: Store) -> Object {
         var matches = store.emails
-            .filter { Self.matches($0, arguments["filter"] ?? .null) }
+            .filter { Self.matches($0, arguments["filter"] ?? .null, store) }
             .sorted { Self.string($0["receivedAt"]) > Self.string($1["receivedAt"]) }
         if arguments["collapseThreads"] == true {
             var seen = Set<String>()
@@ -487,7 +662,7 @@ public final class DemoTransport: HTTPTransport {
         ]
     }
 
-    private func changes(_ arguments: Object, _ store: Store) -> Outcome {
+    private func changes(_ arguments: Object, _ store: Store) -> Answer {
         guard let since = Int(Self.string(arguments["sinceState"])), since >= store.oldestKnownState,
               since <= store.state
         else { return .error("cannotCalculateChanges") }
@@ -505,7 +680,7 @@ public final class DemoTransport: HTTPTransport {
             case (false, false): updated.append(id)
             }
         }
-        return .result([
+        return Answer(name: "Email/changes", arguments: [
             "accountId": .string(Self.accountId), "oldState": .string(String(since)),
             "newState": .string(String(store.state)), "hasMoreChanges": false,
             "created": .array(created.map(JSONValue.string)), "updated": .array(updated.map(JSONValue.string)),
@@ -513,13 +688,13 @@ public final class DemoTransport: HTTPTransport {
         ])
     }
 
-    private static func matches(_ email: Object, _ filter: JSONValue) -> Bool {
+    private static func matches(_ email: Object, _ filter: JSONValue, _ store: Store) -> Bool {
         guard case .object(let filter) = filter else { return true }
         if case .string(let op)? = filter["operator"], case .array(let conditions)? = filter["conditions"] {
             switch op {
-            case "AND": return conditions.allSatisfy { matches(email, $0) }
-            case "OR": return conditions.contains { matches(email, $0) }
-            default: return !conditions.contains { matches(email, $0) }
+            case "AND": return conditions.allSatisfy { matches(email, $0, store) }
+            case "OR": return conditions.contains { matches(email, $0, store) }
+            default: return !conditions.contains { matches(email, $0, store) }
             }
         }
         let mailboxes = flags(email["mailboxIds"])
@@ -537,9 +712,18 @@ public final class DemoTransport: HTTPTransport {
             // Both sides are ISO 8601 in UTC, which sorts as text.
             case "before": string(email["receivedAt"]) < string(value)
             case "after": string(email["receivedAt"]) >= string(value)
+            case "header": store.ignoresHeaderFilter || hasHeader(strings(value), in: store.allHeaders(of: email))
             default: true
             }
         }
+    }
+
+    /// `[name]` matches when the field is present, `[name, text]` when a field of that name contains the text.
+    private static func hasHeader(_ condition: [String], in headers: [DemoHeader]) -> Bool {
+        guard let name = condition.first?.lowercased() else { return true }
+        let fields = headers.filter { $0.name.lowercased() == name }
+        guard condition.count > 1 else { return !fields.isEmpty }
+        return fields.contains { $0.value.localizedCaseInsensitiveContains(condition[1]) }
     }
 
     private static func searchableText(_ email: Object) -> String {
@@ -556,14 +740,10 @@ public final class DemoTransport: HTTPTransport {
     }
 
     private static func bodyText(_ email: Object) -> String {
-        var text = [string(email["preview"])]
-        if case .object(let values)? = email["bodyValues"] {
-            for case .object(let value) in values.values { text.append(string(value["value"])) }
-        }
-        return text.joined(separator: "\n")
+        ([string(email["preview"])] + DemoMessages.bodyValues(email).values).joined(separator: "\n")
     }
 
-    private static func apply(_ patch: Object, to email: inout Object) {
+    static func apply(_ patch: Object, to email: inout Object) {
         for (path, value) in patch {
             let components = path.split(separator: "/", maxSplits: 1).map(String.init)
             guard components.count == 2 else {
@@ -582,7 +762,7 @@ public final class DemoTransport: HTTPTransport {
         }
     }
 
-    private func setMaskedEmails(_ arguments: Object, _ store: inout Store) -> Object {
+    private func setMaskedEmails(_ arguments: Object, _ store: inout Store, now: Date) -> Object {
         let before = store.maskedEmails
         var result: Object = ["accountId": .string(Self.accountId), "oldState": .string(String(store.maskedEmailState))]
         if case .object(let creates)? = arguments["create"] {
@@ -594,7 +774,7 @@ public final class DemoTransport: HTTPTransport {
                 let server: Object = [
                     "id": .string("masked-\(store.maskedEmails.count + 1)"),
                     "email": .string("\(prefix).\(Int.random(in: 1000...9999))@fastmail.com"),
-                    "createdAt": .string(DemoData.date(hoursAgo: 0)), "createdBy": "GoodMail",
+                    "createdAt": .string(DemoData.date(hoursAgo: 0, before: now)), "createdBy": "GoodMail",
                     "lastMessageAt": .null,
                 ]
                 masked.merge(server) { $1 }
@@ -619,27 +799,33 @@ public final class DemoTransport: HTTPTransport {
 
     // MARK: JSON helpers
 
-    private static func string(_ value: JSONValue?) -> String {
-        if case .string(let string)? = value { string } else { "" }
+    static func string(_ value: JSONValue?) -> String {
+        DemoMessages.string(value)
     }
 
-    private static func strings(_ value: JSONValue?) -> [String] {
-        guard case .array(let items)? = value else { return [] }
-        return items.map { string($0) }
+    static func strings(_ value: JSONValue?) -> [String] {
+        DemoMessages.strings(value)
     }
 
-    private static func int(_ value: JSONValue?) -> Int? {
+    static func int(_ value: JSONValue?) -> Int? {
         if case .number(let number)? = value { Int(number) } else { nil }
     }
 
     /// The keys of a JMAP `Id[Boolean]` set such as `mailboxIds` or `keywords`.
-    private static func flags(_ value: JSONValue?) -> Set<String> {
+    static func flags(_ value: JSONValue?) -> Set<String> {
         guard case .object(let object)? = value else { return [] }
         return Set(object.keys)
     }
+
+    static func setError(_ type: String, description: String? = nil, properties: [String]? = nil) -> JSONValue {
+        var error: Object = ["type": .string(type)]
+        if let description { error["description"] = .string(description) }
+        if let properties { error["properties"] = .array(properties.map(JSONValue.string)) }
+        return .object(error)
+    }
 }
 
-private extension Array where Element: Hashable {
+extension Array where Element: Hashable {
     func uniqued() -> [Element] {
         var seen = Set<Element>()
         return filter { seen.insert($0).inserted }
