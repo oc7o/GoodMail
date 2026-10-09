@@ -48,12 +48,23 @@ struct DemoContentTests {
         ]])
         #expect(headers.listUnsubscribePost == ["List-Unsubscribe=One-Click"])
         #expect(headers.listId == "Fjord Outdoor News <news.fjord-outdoor.example>")
-        #expect(headers.authenticationResults.count == 1)
         #expect(headers.dkimSignatures.count == 1)
 
-        // The topmost result is Fastmail's, and its dkim=pass pairs with a signature covering both fields.
-        let results = try #require(headers.authenticationResults.first)
-        #expect(results.hasPrefix("mx.messagingengine.com;"))
+        // Fastmail's layout: three verdicts of its MX above the Received field with which the MX accepted the
+        // message, the DKIM one not on top, and a Fastmail-looking verdict below, which came with the message.
+        let names = headers.headers.map(\.name)
+        let arrival = try #require(headers.headers.firstIndex { $0.value.contains("by phl-mx-03.messagingengine.com (Postfix)") })
+        #expect(names[..<arrival].filter { $0 == "Authentication-Results" }.count == 3)
+        #expect(names[arrival...].filter { $0 == "Authentication-Results" }.count == 1)
+        #expect(headers.headers.allSatisfy { $0.value.hasPrefix(" ") })
+        #expect(headers.headers.last?.name == "Message-ID")
+        #expect(headers.authenticationResults.count == 4)
+        #expect(headers.authenticationResults.allSatisfy { $0.contains("messagingengine.com;") })
+        #expect(headers.authenticationResults.first?.contains("dkim=") == false)
+
+        // Its dkim=pass pairs with a signature covering both fields.
+        let results = headers.authenticationResults[2]
+        #expect(results.hasPrefix("phl-mx-03.messagingengine.com;"))
         #expect(results.contains("dkim=pass"))
         #expect(results.contains("header.d=fjord-outdoor.example"))
         let headerB = String(try #require(results.firstMatch(of: /header\.b=([^\s;]+)/)).output.1)
@@ -124,7 +135,9 @@ struct DemoContentTests {
         let invoice = String(decoding: try await client.download(blobId: "e5-blob", type: "message/rfc822", name: "e5.eml"),
                              as: UTF8.self)
 
-        #expect(newsletter.hasPrefix("X-Delivered-To: fjord.k3x9@fastmail.com\r\nAuthentication-Results: mx.messagingengine.com;"))
+        #expect(newsletter.hasPrefix("Received: from phl-compute-04.internal (phl-compute-04.internal [10.202.2.44])\r\n"))
+        #expect(newsletter.contains("\r\nX-Delivered-To: fjord.k3x9@fastmail.com\r\n"))
+        #expect(newsletter.contains("\r\nAuthentication-Results: phl-mx-03.messagingengine.com;\r\n"))
         #expect(newsletter.contains("\r\nList-Unsubscribe-Post: List-Unsubscribe=One-Click\r\n"))
         #expect(newsletter.contains("\r\nFrom: Fjord Outdoor <news@fjord-outdoor.example>\r\n"))
         #expect(newsletter.contains("\r\nSubject: Autumn layers are here\r\n"))

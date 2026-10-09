@@ -622,7 +622,8 @@ public final class DemoTransport: HTTPTransport {
         }
     }
 
-    /// Asked-for `header:` properties are made from the email's header fields (RFC 8621 §4.1.3).
+    /// Asked-for `header:` properties are made from the email's header fields, and `headers` lists them all in
+    /// raw form, as its message has them apart from the MIME fields of the body (RFC 8621 §4.1.3).
     private func getEmails(_ arguments: Object, _ store: Store) -> Object {
         let properties = Self.strings(arguments["properties"])
         var list: [JSONValue] = []
@@ -640,6 +641,10 @@ public final class DemoTransport: HTTPTransport {
             let headers = store.allHeaders(of: email)
             for property in properties where property.hasPrefix("header:") {
                 result[property] = DemoMessages.headerProperty(property, of: headers)
+            }
+            if properties.contains("headers") {
+                let fields = (store.headers[id] ?? []) + DemoMessages.standardHeaders(email, encoded: true)
+                result["headers"] = .array(fields.map { ["name": .string($0.name), "value": .string(" " + $0.value)] })
             }
             list.append(.object(result))
         }

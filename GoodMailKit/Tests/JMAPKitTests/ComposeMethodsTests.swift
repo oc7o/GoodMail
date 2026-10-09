@@ -702,7 +702,12 @@ struct ComposeMethodsTests {
               "header:List-Unsubscribe-Post:asText:all": ["List-Unsubscribe=One-Click"],
               "header:DKIM-Signature:all": [" v=1; d=x.example;\r\n\th=list-unsubscribe; b=AbCdEfGh123"],
               "header:Authentication-Results:asText:all": ["mx.messagingengine.com; dkim=pass header.b=AbCdEfGh"],
-              "header:List-Id:asText": "X <x.example>"}]}, "c0"]]
+              "header:List-Id:asText": "X <x.example>",
+              "headers": [
+                {"name": "Received", "value": " from mail.x.example (mail.x.example [93.184.216.34])\r\n\tby mx.messagingengine.com"},
+                {"name": "Authentication-Results", "value": " mx.messagingengine.com; dkim=pass header.b=AbCdEfGh"},
+                {"name": "DKIM-Signature", "value": " v=1; d=x.example;\r\n\th=list-unsubscribe; b=AbCdEfGh123"},
+                {"name": "list-unsubscribe", "value": " <https://x.example/u>, <mailto:u@x.example>"}]}]}, "c0"]]
             """#)
 
         let headers = try await makeClient().unsubscribeHeaders(emailID: "e4")
@@ -711,10 +716,16 @@ struct ComposeMethodsTests {
             listUnsubscribe: [["https://x.example/u", "mailto:u@x.example"], []],
             listUnsubscribePost: ["List-Unsubscribe=One-Click"],
             dkimSignatures: [" v=1; d=x.example;\r\n\th=list-unsubscribe; b=AbCdEfGh123"],
-            authenticationResults: ["mx.messagingengine.com; dkim=pass header.b=AbCdEfGh"], listId: "X <x.example>"))
+            authenticationResults: ["mx.messagingengine.com; dkim=pass header.b=AbCdEfGh"], listId: "X <x.example>",
+            headers: [
+                .init(name: "Received", value: " from mail.x.example (mail.x.example [93.184.216.34])\r\n\tby mx.messagingengine.com"),
+                .init(name: "Authentication-Results", value: " mx.messagingengine.com; dkim=pass header.b=AbCdEfGh"),
+                .init(name: "DKIM-Signature", value: " v=1; d=x.example;\r\n\th=list-unsubscribe; b=AbCdEfGh123"),
+                .init(name: "list-unsubscribe", value: " <https://x.example/u>, <mailto:u@x.example>"),
+            ]))
         #expect(lastCall() == ["Email/get", ["accountId": "u1234", "ids": ["e4"], "properties": [
             "id", "header:List-Unsubscribe:asURLs:all", "header:List-Unsubscribe-Post:asText:all",
-            "header:DKIM-Signature:all", "header:Authentication-Results:asText:all", "header:List-Id:asText",
+            "header:DKIM-Signature:all", "header:Authentication-Results:asText:all", "header:List-Id:asText", "headers",
         ]], "c0"])
     }
 
