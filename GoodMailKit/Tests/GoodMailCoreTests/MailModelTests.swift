@@ -369,6 +369,28 @@ struct MailModelTests {
         #expect(model.selectedThreadID == "t2")
     }
 
+    // MARK: Background work
+
+    @Test func lowDataModeLeavesAttachmentsForLater() async throws {
+        let account = try OutboxTestAccount()
+        await account.start()
+        account.network.set(NetworkPath(isSatisfied: true, isExpensive: true, isConstrained: true))
+        for _ in 0..<1000 where account.model.networkPath?.isConstrained != true { await Task.yield() }
+
+        while await account.model.performBackgroundWork() {}
+
+        #expect(try await !account.store.isAttachmentCached(blobId: "e5-file0"))
+        #expect(try await account.store.inlineImageData(blobId: "e5-logo") != nil)
+
+        // Cellular without Low Data Mode is fine (D24).
+        account.network.set(NetworkPath(isSatisfied: true, isExpensive: true))
+        for _ in 0..<1000 where account.model.networkPath?.isConstrained != false { await Task.yield() }
+        while await account.model.performBackgroundWork() {}
+
+        #expect(try await account.store.isAttachmentCached(blobId: "e5-file0"))
+        #expect(try await account.store.isAttachmentCached(blobId: "e3-file0"))
+    }
+
     // MARK: Outbox
 
     private func serverEmail(_ id: String) async throws -> Email? {

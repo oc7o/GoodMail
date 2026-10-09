@@ -295,17 +295,21 @@ public final class Composer: Identifiable {
         origin?.movesToTrash = true
     }
 
-    /// A draft that another device sent meanwhile becomes a new message of its own (§2.3).
-    public func keepAsNewMessage() {
-        guard notices.contains(.sentElsewhere) else { return }
+    /// A draft that another device sent meanwhile becomes a new message of its own (§2.3); until then, or
+    /// until it is closed, nothing of it is saved.
+    public func keepAsNewMessage() async {
+        guard notices.contains(.sentElsewhere), let model else { return }
         keptAsNew = true
         notices.removeAll { $0 == .sentElsewhere }
         messageID = MessageDraft.newMessageID(domain: from.flatMap { AddressParser.domain(of: $0.email) } ?? "invalid")
+        await model.outbox.clearNotice(id)
         edited()
-        Task { await model?.outbox.clearNotice(id) }
     }
 
+    /// Removes a notice once read. "Sent from another device" needs a decision instead: Close, or
+    /// `keepAsNewMessage()`.
     public func dismiss(_ notice: ComposerNotice) {
+        guard notice != .sentElsewhere else { return }
         notices.removeAll { $0 == notice }
         Task { await model?.outbox.clearNotice(id) }
     }

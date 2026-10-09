@@ -138,6 +138,46 @@ struct MailSyncTests {
         #expect(server.downloadCount == 0)
     }
 
+    @Test func prefetchKeepsSmallAttachmentsOfRecentMailWithinTheCachesFreeRoom() async throws {
+        _ = try await inbox(position: 0, limit: 50)
+        while try await sync.prefetchBodies() > 0 {}
+
+        // The invoice (61,440 bytes) fits into 100,000; the flight confirmation (184,320) doesn't.
+        #expect(try await sync.prefetchAttachments(cacheLimit: 100_000) == 1)
+        #expect(try await store.isAttachmentCached(blobId: "e5-file0"))
+        #expect(try await !store.isAttachmentCached(blobId: "e3-file0"))
+        // Nothing is evicted to make room, and nothing is larger than asked for.
+        #expect(try await sync.prefetchAttachments(cacheLimit: 100_000) == 0)
+        #expect(try await sync.prefetchAttachments(maxSize: 100_000) == 0)
+
+        #expect(try await sync.prefetchAttachments() == 1)
+        #expect(try await store.isAttachmentCached(blobId: "e3-file0"))
+        #expect(try await sync.prefetchAttachments() == 0)
+        #expect(server.downloadCount == 2)
+    }
+
+    @Test func prefetchSkipsMailThatIsOnlyInJunkOrTrash() async throws {
+        _ = try await inbox(position: 0, limit: 50)
+        while try await sync.prefetchBodies() > 0 {}
+        try await client.updateEmails(["e5": .moveExclusively(to: "trash")])
+        _ = try await sync.syncChanges()
+
+        #expect(try await sync.prefetchAttachments(skipping: ["junk", "trash"]) == 1)
+
+        #expect(try await store.isAttachmentCached(blobId: "e3-file0"))
+        #expect(try await !store.isAttachmentCached(blobId: "e5-file0"))
+    }
+
+    @Test func attachmentsTheServerNoLongerHasAreNotAskedForAgain() async throws {
+        _ = try await inbox(position: 0, limit: 50)
+        while try await sync.prefetchBodies() > 0 {}
+        server.destroyEmail(id: "e5")
+
+        #expect(try await sync.prefetchAttachments() == 1)
+        #expect(try await store.missingAttachments(
+            amongNewest: 200, maxSize: .max, limit: 10, skippingEmailsOnlyIn: []).isEmpty)
+    }
+
     private func storedMailboxes(of id: String) async throws -> [String: Bool]? {
         try await store.emails(ids: [id]).first?.mailboxIds
     }

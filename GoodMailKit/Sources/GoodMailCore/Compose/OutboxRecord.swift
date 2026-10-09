@@ -5,12 +5,30 @@ import MailStore
 /// Everything the outbox has to remember about one composition between steps, kept with its `draft` row
 /// (`StoredDraft.outbox`), so that a crash or quit at any point leaves enough to carry on safely (§2.2).
 struct OutboxRecord: Codable, Sendable, Equatable {
-    /// A request whose outcome isn't known yet. Copies of the message received after it started (with a minute
-    /// of slack for the server's clock) count as made by this composition.
+    /// Requests whose outcome isn't known yet.
     struct Attempt: Codable, Sendable, Equatable {
         enum Kind: String, Codable, Sendable { case save, send, identity, cancel }
         var kind: Kind
+        /// When the earliest of them started.
         var startedAt: Date
+        /// The `sentAt` of each email they asked to create: every copy such a request made carries it, which
+        /// tells it apart from another device's version saved at about the same time.
+        var stamps: [Date] = []
+
+        init(kind: Kind, startedAt: Date, stamps: [Date] = []) {
+            self.kind = kind
+            self.startedAt = startedAt
+            self.stamps = stamps
+        }
+
+        private enum CodingKeys: String, CodingKey { case kind, startedAt, stamps }
+
+        init(from decoder: any Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            kind = try container.decode(Kind.self, forKey: .kind)
+            startedAt = try container.decode(Date.self, forKey: .startedAt)
+            stamps = try container.decodeIfPresent([Date].self, forKey: .stamps) ?? []
+        }
     }
 
     /// A submission Fastmail accepted.
@@ -86,17 +104,26 @@ struct OutboxRecord: Codable, Sendable, Equatable {
         (try? JSONEncoder().encode(self)) ?? Data()
     }
 
-    /// Notes a request about to go out whose outcome may stay unknown, keeping the start of an earlier one
-    /// still unresolved, whose copies may yet turn up.
-    mutating func begin(_ kind: Attempt.Kind, at date: Date) {
-        lastAttempt = Attempt(kind: kind, startedAt: min(lastAttempt?.startedAt ?? date, date))
+    /// Notes a request about to go out whose outcome may stay unknown, keeping what is known of earlier ones
+    /// still unresolved, whose copies may yet turn up. `stamp` is the `sentAt` of the email it creates.
+    mutating func begin(_ kind: Attempt.Kind, at date: Date, stamp: Date? = nil) {
+        lastAttempt = Attempt(
+            kind: kind, startedAt: min(lastAttempt?.startedAt ?? date, date),
+            stamps: (lastAttempt?.stamps ?? []) + [stamp].compactMap { $0 })
     }
 
-    /// Whether this composition made `copy`: it says so, or the copy arrived while an attempt was unresolved.
-    func isOwn(_ copy: EmailCopy) -> Bool {
+    /// Whether this composition made `copy`: it says so, or the copy carries the `sentAt` of one of its requests
+    /// whose outcome is unknown, as copies made by a request whose answer was lost, or by an automatic retry, do.
+    func isOwn(_ copy: MessageCopy) -> Bool {
         if ownEmailIDs.contains(copy.id) { return true }
-        guard let attempt = lastAttempt, let received = copy.receivedAt else { return false }
-        return received >= attempt.startedAt.addingTimeInterval(-60)
+        guard let sentAt = copy.sentAt, let attempt = lastAttempt else { return false }
+        return attempt.stamps.contains(sentAt)
+    }
+
+    /// The `sentAt` an email created at `date` gets: whole seconds, as JMAP dates are written, so that the copy
+    /// carries exactly this value.
+    static func stamp(_ date: Date) -> Date {
+        Date(timeIntervalSince1970: (date.timeIntervalSince1970).rounded(.down))
     }
 
     mutating func addOwn(_ id: String) {

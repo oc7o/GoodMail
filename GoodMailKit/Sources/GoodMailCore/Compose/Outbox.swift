@@ -3,6 +3,7 @@ import JMAPKit
 import MailCompose
 import MailStore
 import Observation
+import Synchronization
 
 /// Why a message couldn't be sent and won't be retried without the user (§3.10).
 public enum OutboxFailure: Error, Codable, Equatable, Sendable, LocalizedError {
@@ -190,6 +191,9 @@ public final class Outbox {
     @ObservationIgnored private var wakeUp: Task<Void, Never>?
     /// Drafts whose open composer asked for a server save that hasn't happened yet.
     @ObservationIgnored private var serverSaveRequests: Set<String> = []
+    /// Drafts whose server save waits for their uploads.
+    @ObservationIgnored private(set) var draftsWaitingForUploads: Set<String> = []
+    @ObservationIgnored private var uploadWaiters: [String: [FirstOf]] = [:]
     @ObservationIgnored private var isRunning = false
 
     init(client: JMAPClient, store: MailStore, clock: any OutboxClock, activity: any BackgroundActivity) {
@@ -217,6 +221,8 @@ public final class Outbox {
         channels.cancelAll()
         for task in uploadTasks.values { task.cancel() }
         uploadTasks = [:]
+        for waiter in uploadWaiters.values.joined() { waiter.resume() }
+        uploadWaiters = [:]
     }
 
     /// Has a flush run soon; one under way goes once more.
@@ -364,6 +370,11 @@ public final class Outbox {
     /// then sorts out conflicts with other devices.
     private func saveToServer(_ id: String, context: SendContext) async {
         serverSaveRequests.remove(id)
+        guard let row = try? await store.draft(id: id) else { return }
+        // A copy moved to Trash elsewhere must not be destroyed by replacing it.
+        if await checkServerCopy(row, context: context) { return }
+        // Sent from another device: nothing is saved under its Message-ID until the user keeps it as new.
+        if row.record.notice == .sentElsewhere { return }
         startUploads(id)
         await waitForUploads(id, timeout: 60)
         let blobIDs = await uploadedBlobIDs(id)
@@ -1150,6 +1161,7 @@ public final class Outbox {
         uploadTasks[id] = Task { [weak self] in
             await self?.runUploads(id)
             self?.uploadTasks[id] = nil
+            for waiter in self?.uploadWaiters.removeValue(forKey: id) ?? [] { waiter.resume() }
             self?.rebuildItems()
         }
         rebuildItems()
@@ -1193,15 +1205,21 @@ public final class Outbox {
 
     /// Waits for the draft's running uploads, at most `timeout` seconds (C28).
     private func waitForUploads(_ id: String, timeout: TimeInterval) async {
-        guard let task = uploadTasks[id] else { return }
+        guard uploadTasks[id] != nil else { return }
+        draftsWaitingForUploads.insert(id)
+        defer { draftsWaitingForUploads.remove(id) }
         let clock = clock
         let deadline = clock.now.addingTimeInterval(timeout)
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { await task.value }
-            group.addTask { try? await clock.sleep(until: deadline) }
-            await group.next()
-            group.cancelAll()
+        var timer: Task<Void, Never>?
+        await withCheckedContinuation { continuation in
+            let waiter = FirstOf(continuation)
+            uploadWaiters[id, default: []].append(waiter)
+            timer = Task {
+                try? await clock.sleep(until: deadline)
+                waiter.resume()
+            }
         }
+        timer?.cancel()
     }
 
     /// The uploads of the draft the server still has, by attachment.
@@ -1422,5 +1440,22 @@ enum SendCheck {
         let invalid = recipients.map(\.email).filter { !AddressParser.isValid($0) }
         if !invalid.isEmpty { return .recipientsRejected(invalid) }
         return nil
+    }
+}
+
+/// Resumes a continuation once, on whichever of several events comes first.
+private final class FirstOf: Sendable {
+    private let continuation: Mutex<CheckedContinuation<Void, Never>?>
+
+    init(_ continuation: CheckedContinuation<Void, Never>) {
+        self.continuation = Mutex(continuation)
+    }
+
+    func resume() {
+        let continuation = self.continuation.withLock { stored in
+            defer { stored = nil }
+            return stored
+        }
+        continuation?.resume()
     }
 }

@@ -105,13 +105,13 @@ struct MailSend: Sendable {
         else { return .notNeeded }
         let previousAttempt = row.record.lastAttempt
         let now = clock.now
-        guard (try? await store.updateOutbox(id: id, { _, record in record.begin(.save, at: now) })) != nil else {
-            return .notNeeded
-        }
+        let stamp = OutboxRecord.stamp(now)
+        guard (try? await store.updateOutbox(id: id, { _, record in record.begin(.save, at: now, stamp: stamp) })) != nil
+        else { return .notNeeded }
         let attachments = Self.attachmentParts(draft, blobIDs: blobIDs)
         let body = await body(for: draft, context: context)
         let email = MessageBuilder.email(
-            for: draft, body: body, attachments: attachments, draftsMailbox: context.mailboxes.drafts, sentAt: now)
+            for: draft, body: body, attachments: attachments, draftsMailbox: context.mailboxes.drafts, sentAt: stamp)
 
         let result: DraftSaveResult
         do {
@@ -171,14 +171,30 @@ struct MailSend: Sendable {
     // MARK: Copies by Message-ID
 
     /// Copies of the message in Drafts or Sent: by the `header` filter, or, where the server ignores it, among
-    /// the mail of those mailboxes received since `since` (§2.2, fallback scan).
-    func copies(of messageID: String, since: Date, mailboxes: SendMailboxes) async throws -> [EmailCopy] {
-        let lookup = try await client.emails(withMessageID: messageID)
-        var copies = lookup.matches
-        if !lookup.filterWorked {
-            let recent = try await client.recentEmails(
-                inMailboxes: [mailboxes.drafts, mailboxes.sent], after: since, limit: 200)
-            copies += recent.filter { copy in
+    /// the mail of those mailboxes received since `since` (§2.2, fallback scan). Every result is checked here
+    /// rather than trusting the filter.
+    func copies(of messageID: String, since: Date, mailboxes: SendMailboxes) async throws -> [MessageCopy] {
+        let accountId = try await client.accountId(for: Capability.mail)
+        var batch = Batch()
+        let query = batch.add(EmailQuery(
+            accountId: accountId, filter: .condition(.init(header: ["Message-ID", messageID])), limit: 50))
+        let get = batch.add(EmailGet(
+            accountId: accountId, ids: .reference(query.reference("/ids")), properties: MessageCopy.properties))
+        let found = try await client.send(batch).get(get).list.map(MessageCopy.init)
+        var copies = found.filter { $0.messageId.contains(messageID) }
+        if copies.count != found.count {
+            var scan = Batch()
+            let recent = scan.add(EmailQuery(
+                accountId: accountId,
+                filter: .and([
+                    .or([mailboxes.drafts, mailboxes.sent].map { .condition(.init(inMailbox: $0)) }),
+                    .condition(.init(after: since)),
+                ]),
+                sort: [Comparator(property: "receivedAt", isAscending: false)], limit: 200))
+            let recentGet = scan.add(EmailGet(
+                accountId: accountId, ids: .reference(recent.reference("/ids")), properties: MessageCopy.properties))
+            let scanned = try await client.send(scan).get(recentGet).list.map(MessageCopy.init)
+            copies += scanned.filter { copy in
                 copy.messageId.contains(messageID) && !copies.contains { $0.id == copy.id }
             }
         }
@@ -282,9 +298,10 @@ struct MailSend: Sendable {
         let envelope = try MessageBuilder.envelope(for: draft, holdFor: holdFor)
         let body = await body(for: draft, context: context)
         let start = clock.now
+        let stamp = OutboxRecord.stamp(start)
         let email = MessageBuilder.email(
             for: draft, body: body, attachments: Self.attachmentParts(draft, blobIDs: blobIDs),
-            draftsMailbox: context.mailboxes.drafts, sentAt: start)
+            draftsMailbox: context.mailboxes.drafts, sentAt: stamp)
         if let limit = context.account?.maxSizeRequest,
            let size = try? JMAPCoding.makeEncoder().encode(email).count, size > limit {
             return .failed(.tooLarge(limit: limit))
@@ -292,7 +309,7 @@ struct MailSend: Sendable {
         let claimed = try await store.updateOutbox(id: id) { row, record in
             guard row.state == .queued else { return }
             row.state = .submitting
-            record.begin(.send, at: start)
+            record.begin(.send, at: start, stamp: stamp)
             record.wait = nil
         }
         guard claimed?.state == .submitting else { return nil }
@@ -495,4 +512,30 @@ extension OutboxFailure {
         default: self = .refused(type: error.type, description: error.description)
         }
     }
+}
+
+/// What tells copies of one message apart, with the `sentAt` each create of this device sets (see
+/// `OutboxRecord.isOwn(_:)`).
+struct MessageCopy: Sendable, Equatable {
+    let id: String
+    let mailboxIds: [String: Bool]
+    let keywords: [String: Bool]
+    let messageId: [String]
+    let receivedAt: Date?
+    let sentAt: Date?
+
+    init(_ email: Email) {
+        id = email.id
+        mailboxIds = email.mailboxIds ?? [:]
+        keywords = email.keywords ?? [:]
+        messageId = email.messageId ?? []
+        receivedAt = email.receivedAt
+        sentAt = email.sentAt
+    }
+
+    var isDraft: Bool {
+        keywords[Email.Keyword.draft.rawValue] == true
+    }
+
+    static let properties = ["id", "mailboxIds", "keywords", "messageId", "receivedAt", "sentAt"]
 }

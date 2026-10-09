@@ -291,7 +291,7 @@ struct OutboxFailureTests {
         let row = try #require(try await account.row(id))
         #expect(row.state == .editing && row.serverEmailID == submission.emailID)
         #expect(outbox.notices == [.canceledElsewhere("Lunch")])
-        #expect(try await model.composer(id: id)?.subject == "Lunch")
+        #expect(await model.composer(id: id)?.subject == "Lunch")
     }
 
     // MARK: Other devices (C29)
