@@ -60,6 +60,7 @@ final class OutboxTestTransport: HTTPTransport {
         var calls: [String: Int] = [:]
         var bodies: [Data] = []
         var beforeNext: [(name: String, action: @Sendable () -> Void)] = []
+        var failures: [(name: String, code: URLError.Code)] = []
         var eventSourceURLs: [URL] = []
     }
 
@@ -99,6 +100,11 @@ final class OutboxTestTransport: HTTPTransport {
         state.withLock { $0.beforeNext.append((name, action)) }
     }
 
+    /// The next request calling `name` fails with `code` without reaching the server.
+    func failNext(_ name: String, with code: URLError.Code) {
+        state.withLock { $0.failures.append((name, code)) }
+    }
+
     func calls(to name: String) -> Int {
         state.withLock { $0.calls[name, default: 0] }
     }
@@ -123,17 +129,22 @@ final class OutboxTestTransport: HTTPTransport {
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let names = Self.names(of: request)
-        let (held, actions) = state.withLock { state -> (String?, [@Sendable () -> Void]) in
+        let (held, actions, failure) = state.withLock { state -> (String?, [@Sendable () -> Void], URLError.Code?) in
             for name in names { state.calls[name, default: 0] += 1 }
             if names != [Self.upload], let body = request.httpBody { state.bodies.append(body) }
             var actions: [@Sendable () -> Void] = []
+            var failure: URLError.Code?
             for name in names {
                 if let index = state.beforeNext.firstIndex(where: { $0.name == name }) {
                     actions.append(state.beforeNext.remove(at: index).action)
                 }
+                if failure == nil, let index = state.failures.firstIndex(where: { $0.name == name }) {
+                    failure = state.failures.remove(at: index).code
+                }
             }
-            return (names.first(where: state.held.contains), actions)
+            return (names.first(where: state.held.contains), actions, failure)
         }
+        if let failure { throw URLError(failure) }
         if let held {
             await withCheckedContinuation { continuation in
                 let isHeld = state.withLock { state in
@@ -234,8 +245,14 @@ final class OutboxTestAccount {
 
     /// Waits until nothing runs in the outbox any more, then makes one full pass and waits again.
     func settle() async {
-        await outbox.waitUntilIdle()
+        await flushed()
         _ = await outbox.flushNow()
+        await outbox.waitUntilIdle()
+    }
+
+    /// Waits for the outbox's flush under way and its uploads, without a pass more.
+    func flushed() async {
+        await outbox.waitForCurrentFlush()
         await outbox.waitUntilIdle()
     }
 

@@ -254,13 +254,14 @@ public final class Composer: Identifiable {
             if masked.state == .disabled { return "\(from.email) is disabled, so replies to it go to Trash." }
             if masked.state == .deleted { return "\(from.email) is deleted, so replies to it are rejected." }
         }
+        // The attachment would reveal another address of the user's whatever From says (C19).
+        if kind == .forwardAsAttachment, directory.isMasked(from.email) {
+            return "The attached message shows the address it was delivered to."
+        }
         if let receivedAt, receivedAt.reason != .defaultIdentity, receivedAt.reason != .loginName,
            receivedAt.address.email.lowercased() != from.email.lowercased() {
             let received = receivedAt.address.email
             return "You received this at \(received). Sending from \(from.email) shows \(from.email) to the recipients."
-        }
-        if kind == .forwardAsAttachment, directory.isMasked(from.email) {
-            return "The attached message shows the address it was delivered to."
         }
         return nil
     }

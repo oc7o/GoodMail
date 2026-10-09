@@ -31,6 +31,11 @@ final class SingleFlight {
         return task
     }
 
+    /// The run under way, if any, to wait for without asking for another pass.
+    var current: Task<Void, Never>? {
+        task
+    }
+
     /// Cancels the run under way, if any. Its callers are let go once it has wound down, and the next request
     /// starts a new run.
     func cancel() {

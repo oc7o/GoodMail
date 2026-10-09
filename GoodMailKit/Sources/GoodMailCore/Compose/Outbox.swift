@@ -231,6 +231,33 @@ public final class Outbox {
         return hasPendingWork
     }
 
+    /// The network is back: messages that waited for a connection go out now rather than after their backoff
+    /// (§2.8).
+    func connectionReturned() {
+        guard isRunning else { return }
+        Task {
+            await retryWaitingForConnection()
+            requestFlush()
+        }
+    }
+
+    /// Makes messages that waited for a connection due right away.
+    func retryWaitingForConnection() async {
+        let waiting = ((try? await store.drafts(in: [.queued])) ?? []).filter { $0.record.wait == .connection }
+        for row in waiting {
+            _ = try? await store.updateOutbox(id: row.id) { row, record in
+                guard row.state == .queued, record.wait == .connection, !record.localDelay else { return }
+                record.notBefore = nil
+                record.wait = nil
+            }
+        }
+    }
+
+    /// Waits for the flush under way, if any, without asking for another pass.
+    func waitForCurrentFlush() async {
+        await flushes.current?.value
+    }
+
     /// Waits until nothing runs on any draft's channel, for tests and before the app is suspended.
     func waitUntilIdle() async {
         await channels.idle()
@@ -567,9 +594,19 @@ public final class Outbox {
             }
         }
         guard online, let context = host?.outboxContext else { return }
-        if !record.pendingDestroy.isEmpty, row.state != .submitting {
+        if !record.pendingDestroy.isEmpty {
             _ = try? await steps.cleanup(id)
         }
+        await stepByState(row, context: context, now: now)
+        // Strays the step itself left, such as the email of a refused submission (D33).
+        if let left = try? await store.draft(id: id)?.record.pendingDestroy, !left.isEmpty {
+            _ = try? await steps.cleanup(id)
+        }
+    }
+
+    private func stepByState(_ row: StoredDraft, context: SendContext, now: Date) async {
+        let id = row.id
+        let record = row.record
         switch row.state {
         case .editing, .failed:
             if await checkServerCopy(row, context: context) { return }
@@ -619,6 +656,11 @@ public final class Outbox {
             case .clear:
                 break
             case .sentElsewhere:
+                // Its draft here is obsolete too; nothing is sent (C29).
+                _ = try? await store.updateOutbox(id: id) { row, record in
+                    record.destroyLater([row.serverEmailID].compactMap { $0 })
+                    row.serverEmailID = nil
+                }
                 return await finalize(id, context: context, notice: .sentElsewhere(draft.subject))
             case .otherVersion:
                 draft = await fork(id, draft: draft, droppingServerCopy: false) ?? draft

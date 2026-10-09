@@ -988,7 +988,7 @@ public final class MailModel {
         if path.isSatisfied, !wasOnline {
             resumePush()
             requestRefresh()
-            outbox.requestFlush()
+            outbox.connectionReturned()
         } else if wasOnline != path.isSatisfied {
             outbox.rebuildItems()
         }
@@ -1017,6 +1017,8 @@ public final class MailModel {
         await outbox.start()
         await refreshAccount()
         if mailboxes.isEmpty { await loadMailboxes() }
+        // The system runs these tasks when there is a network, so a wait for a connection is over.
+        await outbox.retryWaitingForConnection()
         return await outbox.flushNow()
     }
 
