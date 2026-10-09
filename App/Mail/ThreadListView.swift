@@ -90,14 +90,15 @@ struct ThreadListView: View {
             }
             #endif
         }
-        .safeAreaInset(edge: .bottom) {
+        .safeAreaBar(edge: .bottom) {
             if let problem = model.connectionProblem {
                 Label(offlineNotice, systemImage: "wifi.slash")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 6)
-                    .background(.bar)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .glassEffect()
+                    .padding(.bottom, 8)
                     .help(problem)
             }
         }

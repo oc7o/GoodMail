@@ -63,7 +63,7 @@ struct SidebarView: View {
         #if os(macOS)
         .navigationSplitViewColumnWidth(min: 190, ideal: 220)
         #endif
-        .safeAreaInset(edge: .bottom) {
+        .safeAreaBar(edge: .bottom) {
             Menu {
                 Button("Sign Out", systemImage: "rectangle.portrait.and.arrow.right", action: appModel.signOut)
             } label: {

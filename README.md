@@ -60,7 +60,7 @@ as the prebuilt framework published by its maintainers, pinned to an exact versi
 
 ## Development
 
-Requires Xcode 16.3+ (Swift 6.1). Minimum deployment targets are iOS 18 and macOS 15.
+Requires Xcode 27 (Swift 6.4). Minimum deployment targets are iOS 27 and macOS 27.
 
 ```sh
 git clone --recurse-submodules https://github.com/oc7o/GoodMail.git   # or: git submodule update --init
