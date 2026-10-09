@@ -70,8 +70,12 @@ public enum OutgoingHTMLSanitizer {
         "script", "style", "textarea", "title", "xmp", "noscript", "noembed", "noframes", "iframe", "plaintext",
     ]
     package static let voidElements: Set<String> = [
-        "br", "hr", "img", "wbr", "col", "input", "meta", "link", "base", "source", "area", "param", "track",
+        "br", "hr", "img", "wbr", "col", "input", "meta", "link", "base", "source", "area", "param", "track", "embed",
+        "frame",
     ]
+    /// Elements nested deeper are unwrapped, which bounds the work per tag and the nesting of what we send.
+    static let maximumDepth = 256
+
     static let blockElements: Set<String> = [
         "address", "blockquote", "center", "div", "dl", "dd", "dt", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "li",
         "ol", "p", "pre", "table", "tr", "ul", "caption",
@@ -124,6 +128,10 @@ public enum OutgoingHTMLSanitizer {
         var text = ""
         var preDepth = 0
         var linkStack: [String?] = []
+        /// Elements unwrapped below `maximumDepth`, so their end tags are skipped too.
+        var unwrapped: [String] = []
+        /// Dropped elements whose end tag the rest of the document lacks; their next start tags need no search.
+        var unclosed: Set<String> = []
 
         init(source: [UInt8], options: Options) {
             self.source = source
@@ -205,8 +213,13 @@ public enum OutgoingHTMLSanitizer {
             let selfClosing = cursor > 0 && cursor < source.count && source[cursor - 1] == UInt8(ascii: "/")
             let after = min(cursor + 1, source.count)
             if isEnd {
-                // Browsers treat </br> as <br>.
-                if name == "br" { startTag(name, []) } else { endTag(name) }
+                if unwrapped.last == name {
+                    unwrapped.removeLast()
+                } else if name == "br" {
+                    startTag(name, []) // browsers treat </br> as <br>
+                } else {
+                    endTag(name)
+                }
                 return after
             }
             if OutgoingHTMLSanitizer.rawText.contains(name) {
@@ -214,7 +227,12 @@ public enum OutgoingHTMLSanitizer {
                 return find(">", from: end).map { $0 + 1 } ?? source.count
             }
             if OutgoingHTMLSanitizer.droppedWithContent.contains(name) {
-                return selfClosing ? after : (matchingEnd(of: name, from: after) ?? after)
+                if selfClosing || unclosed.contains(name) || OutgoingHTMLSanitizer.voidElements.contains(name) {
+                    return after
+                }
+                if let end = matchingEnd(of: name, from: after) { return end }
+                unclosed.insert(name)
+                return after
             }
             startTag(name, attributes)
             return after
@@ -225,6 +243,11 @@ public enum OutgoingHTMLSanitizer {
         mutating func startTag(_ name: String, _ attributes: [(String, String)]) {
             guard OutgoingHTMLSanitizer.allowedElements.contains(name) else { return } // unwrap unknown elements
             implicitlyClose(before: name)
+            let isVoid = OutgoingHTMLSanitizer.voidElements.contains(name)
+            if !isVoid, stack.count >= OutgoingHTMLSanitizer.maximumDepth || !unwrapped.isEmpty {
+                unwrapped.append(name)
+                return
+            }
             var kept: [(String, String)] = []
             for (attribute, value) in attributes where !kept.contains(where: { $0.0 == attribute }) {
                 if attribute == "class" {
@@ -268,7 +291,7 @@ public enum OutgoingHTMLSanitizer {
             case "a": linkStack.append(kept.first { $0.0 == "href" }?.1)
             default: if OutgoingHTMLSanitizer.blockElements.contains(name) { newline() }
             }
-            if !OutgoingHTMLSanitizer.voidElements.contains(name) { stack.append(name) }
+            if !isVoid { stack.append(name) }
         }
 
         mutating func endTag(_ name: String) {

@@ -140,6 +140,23 @@ struct OutgoingHTMLSanitizerTests {
         #expect(result == "<a title=\"a &quot;quote&quot; &amp; &lt;tag&gt;\" href=\"mailto:a@b.example\">x &lt;y&gt; \"z\"</a>")
     }
 
+    /// Hostile nesting must neither hang the app nor produce output nested without bound.
+    @Test func pathologicalMarkupStaysCheap() {
+        let deep = String(repeating: "<b><span>", count: 20_000) + String(repeating: "<a href=\"https://x.example\">x", count: 5_000)
+            + String(repeating: "<li>y", count: 5_000) + String(repeating: "</i>", count: 5_000)
+        let clock = ContinuousClock()
+        var result = OutgoingHTMLSanitizer.Result(html: "", contentIDs: [], removedTrackers: 0, removedRemoteImages: 0, text: "")
+        let elapsed = clock.measure { result = OutgoingHTMLSanitizer.sanitize(deep) }
+        #expect(elapsed < .seconds(5))
+        #expect(result.html.components(separatedBy: "<span>").count - 1 <= OutgoingHTMLSanitizer.maximumDepth)
+        #expect(result.html.components(separatedBy: "<b>").count == result.html.components(separatedBy: "</b>").count)
+
+        let unclosed = String(repeating: "<svg>a<embed src=\"https://x.example\">", count: 20_000) + "<p>visible</p>"
+        let unclosedElapsed = clock.measure { result = OutgoingHTMLSanitizer.sanitize(unclosed) }
+        #expect(unclosedElapsed < .seconds(5))
+        #expect(!result.html.contains("svg") && !result.html.contains("embed"))
+    }
+
     @Test func implicitClosingFollowsHTMLParsingRules() {
         let html = "<p>one<p>two<div>three</div><a href=\"https://a.example\">a<a href=\"https://b.example\">b</a>"
         #expect(OutgoingHTMLSanitizer.sanitize(html).html
