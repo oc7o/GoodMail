@@ -21,43 +21,42 @@ public struct SavedSearch: Sendable, Hashable, Identifiable {
 
 /// The local, encrypted copy of an account's mail: mailboxes, emails, and a full-text index.
 ///
-/// It is a cache. Everything in it can be fetched again, so an unreadable database is simply replaced.
-/// Stored emails are kept truthful by applying `Email/changes`; `coverage` records how far back the
-/// copy of a mailbox is also complete, so lists never show a recent message while missing a newer one.
+/// Mostly a cache: every stored email can be fetched again, and is kept truthful by applying
+/// `Email/changes`; `coverage` records how far back the copy of a mailbox is also complete, so lists never
+/// show a recent message while missing a newer one.
 ///
-/// The one exception is the outbox: changes the user made that the server hasn't confirmed yet. They
-/// are applied to the stored emails right away and reapplied to every copy fetched until they are sent.
+/// What the server doesn't have yet is the exception: changes the user made that the server hasn't
+/// confirmed (applied to the stored emails right away and reapplied to every copy fetched until they are
+/// sent), drafts and messages waiting to be sent, and the bytes of attachments added to them.
+///
+/// Attachment bytes live in a second encrypted file, the blob file (see `MailStore+Files.swift`), so that
+/// large files never bloat the mail database.
 public final class MailStore: Sendable {
-    private let writer: any DatabaseWriter
+    let writer: any DatabaseWriter
+    let blobs: BlobStore
+    /// Whether the blob file couldn't be read when the store opened, so it was moved aside and started
+    /// afresh (or, if even that failed, kept in memory for this session). Outgoing attachments then have
+    /// no bytes (``OutgoingAttachment/hasBytes``) and have to be attached again.
+    public let blobStoreWasReset: Bool
+    /// The current time. Tests inject their own clock.
+    let now: @Sendable () -> Date
 
-    /// Opens the database at `url`, creating it if needed. `key` supplies 32 random bytes.
-    public init(url: URL, key: @escaping @Sendable () throws -> Data) throws {
-        var configuration = Configuration()
-        configuration.prepareDatabase { db in
-            let key = try key()
-            // A raw key skips SQLCipher's passphrase stretching, which a random key doesn't need.
-            try db.usePassphrase("x'" + key.map { String(format: "%02x", $0) }.joined() + "'")
-        }
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        writer = try DatabasePool(path: url.path, configuration: configuration)
-        try Self.migrator.migrate(writer)
+    /// A store that lives only as long as the object, for tests and the demo account. Its blob file is in
+    /// memory too. `now` replaces the system clock, e.g. to test the outbox against a manual clock.
+    public convenience init(now: @escaping @Sendable () -> Date = { Date() }) throws {
+        try self.init(writer: DatabaseQueue(), now: now)
     }
 
-    /// A store that lives only as long as the object, for tests and the demo account.
-    public convenience init() throws {
-        try self.init(writer: DatabaseQueue())
-    }
-
-    init(writer: any DatabaseWriter) throws {
+    /// `blobs` defaults to a blob file in memory.
+    init(
+        writer: any DatabaseWriter, blobs: BlobStore? = nil, blobStoreWasReset: Bool = false,
+        now: @escaping @Sendable () -> Date = { Date() }
+    ) throws {
         self.writer = writer
+        self.blobs = try blobs ?? BlobStore.inMemory(now: now)
+        self.blobStoreWasReset = blobStoreWasReset
+        self.now = now
         try Self.migrator.migrate(writer)
-    }
-
-    /// Removes the database at `url` along with its journal files.
-    public static func destroy(at url: URL) {
-        for suffix in ["", "-wal", "-shm"] {
-            try? FileManager.default.removeItem(atPath: url.path + suffix)
-        }
     }
 
     static var migrator: DatabaseMigrator {
@@ -160,6 +159,66 @@ public final class MailStore: Sendable {
                 try recordInlineImages(of: decoder.decode(Email.self, from: body), db)
             }
         }
+        // Schema only, so upgrading stays instant however much mail is stored: stored bodies and senders are
+        // indexed afterwards, a slice at a time, by performMaintenance(). New tables can't break a foreign
+        // key, so the check of the whole database that deferred checks run is skipped.
+        migrator.registerMigration("v5", foreignKeyChecks: .immediate) { db in
+            try db.execute(sql: """
+                CREATE TABLE emailAttachment (
+                    emailId TEXT NOT NULL REFERENCES email(id) ON DELETE CASCADE,
+                    blobId TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    name TEXT,
+                    size INTEGER,
+                    PRIMARY KEY (emailId, blobId)
+                ) WITHOUT ROWID;
+                CREATE INDEX emailAttachment_blobId ON emailAttachment(blobId);
+                CREATE TABLE draft (
+                    id TEXT PRIMARY KEY,
+                    revision INTEGER NOT NULL,
+                    content BLOB NOT NULL,
+                    messageId TEXT NOT NULL,
+                    serverEmailId TEXT,
+                    serverRevision INTEGER,
+                    state INTEGER NOT NULL DEFAULT 0,
+                    queuedAt DOUBLE,
+                    outbox BLOB,
+                    updatedAt DOUBLE NOT NULL
+                );
+                CREATE INDEX draft_state ON draft(state, queuedAt);
+                CREATE INDEX draft_serverEmailId ON draft(serverEmailId);
+                CREATE TABLE outgoingAttachment (
+                    id TEXT PRIMARY KEY,
+                    draftId TEXT NOT NULL REFERENCES draft(id) ON DELETE CASCADE,
+                    position INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    blobId TEXT,
+                    uploadedAt DOUBLE,
+                    expiresAt DOUBLE
+                );
+                CREATE INDEX outgoingAttachment_draftId ON outgoingAttachment(draftId);
+                CREATE TABLE correspondent (
+                    address TEXT PRIMARY KEY,
+                    name TEXT,
+                    sentScore DOUBLE NOT NULL DEFAULT 0,
+                    sentAt DOUBLE,
+                    receivedScore DOUBLE NOT NULL DEFAULT 0,
+                    receivedAt DOUBLE
+                ) WITHOUT ROWID;
+                CREATE TABLE unsubscription (
+                    listKey TEXT PRIMARY KEY,
+                    method TEXT NOT NULL,
+                    requestedAt DOUBLE NOT NULL,
+                    outcome TEXT NOT NULL
+                ) WITHOUT ROWID;
+                CREATE TABLE keyedData (
+                    key TEXT PRIMARY KEY,
+                    value BLOB NOT NULL
+                ) WITHOUT ROWID;
+                """)
+        }
         return migrator
     }
 
@@ -192,11 +251,16 @@ public final class MailStore: Sendable {
     ///
     /// Changes still waiting in the outbox are applied on top, so a copy fetched before the server got
     /// them doesn't undo what the user did.
+    ///
+    /// Bodies record their attachments, and emails new to the store count their people as
+    /// correspondents: once per email, so refreshed flags or a later body never count again.
     public func upsert(_ emails: [Email]) async throws {
         guard !emails.isEmpty else { return }
         try await writer.write { db in
             let encoder = JMAPCoding.makeEncoder()
             let hasPendingChanges = try Bool.fetchOne(db, sql: "SELECT EXISTS (SELECT 1 FROM pendingChange)")!
+            let backfill = try Self.backfillProgress(db)
+            var roles: [String: Mailbox.Role]?
             for email in emails {
                 guard let threadId = email.threadId, let receivedAt = email.receivedAt else { continue }
                 var email = email
@@ -217,11 +281,18 @@ public final class MailStore: Sendable {
                         email.hasBody ? try encoder.encode(email) : nil,
                     ])
                 try Self.storeMailboxes(of: email, db)
-                if email.hasBody { try Self.recordInlineImages(of: email, db) }
+                if email.hasBody {
+                    try Self.recordInlineImages(of: email, db)
+                    try Self.recordAttachments(email.attachments ?? [], ofEmail: email.id, db)
+                }
 
                 if isNew || email.hasBody {
                     let rowid = try Int64.fetchOne(db, sql: "SELECT rowid FROM email WHERE id = ?", arguments: [email.id])!
                     try Self.index(email, rowid: rowid, db)
+                    if isNew, !backfill.willIndexCorrespondents(ofRow: rowid) {
+                        if roles == nil { roles = try Self.mailboxRoles(db) }
+                        try Self.countCorrespondents(of: email, roles: roles ?? [:], db)
+                    }
                 }
             }
         }
@@ -252,17 +323,27 @@ public final class MailStore: Sendable {
             ])
     }
 
+    /// Removes emails, along with the downloaded images and cached attachments no other email refers to.
     public func deleteEmails(ids: [String]) async throws {
         guard !ids.isEmpty else { return }
-        try await writer.write { db in
+        let orphanedAttachments = try await writer.write { db in
+            var attachments = Set<String>()
             for id in ids {
+                attachments.formUnion(try String.fetchAll(
+                    db, sql: "SELECT blobId FROM emailAttachment WHERE emailId = ?", arguments: [id]))
                 try db.execute(
                     sql: "DELETE FROM emailText WHERE rowid = (SELECT rowid FROM email WHERE id = ?)", arguments: [id])
                 try db.execute(sql: "DELETE FROM email WHERE id = ?", arguments: [id])
                 try db.execute(sql: "DELETE FROM pendingChange WHERE emailId = ?", arguments: [id])
             }
             try Self.dropUnreferencedImageData(db)
+            return try attachments.filter { blobId in
+                try !Bool.fetchOne(
+                    db, sql: "SELECT EXISTS (SELECT 1 FROM emailAttachment WHERE blobId = ?)", arguments: [blobId])!
+            }
         }
+        // The cache is best effort: what is missed here, maintenance drops after a few days.
+        try? await blobs.delete(keys: orphanedAttachments.sorted(), kind: .receivedAttachment)
     }
 
     /// The stored emails with these ids, without bodies.
@@ -305,9 +386,14 @@ public final class MailStore: Sendable {
 
     /// Forgets all emails and sync progress, keeping mailboxes and the outbox. Used when the server can
     /// no longer tell what changed since our last sync.
+    ///
+    /// Correspondents go too, since every email counts again when it is fetched again. Drafts, keyed
+    /// data and cached attachments stay; maintenance drops cached attachments that no email refers to
+    /// any more after a few days.
     public func resetEmails() async throws {
         try await writer.write { db in
-            try db.execute(sql: "DELETE FROM emailText; DELETE FROM email; DELETE FROM meta")
+            try db.execute(sql: "DELETE FROM emailText; DELETE FROM email; DELETE FROM meta; DELETE FROM correspondent")
+            try Self.resetBackfill(db)
             try Self.dropUnreferencedImageData(db)
         }
     }
