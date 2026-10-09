@@ -10,11 +10,14 @@ struct DemoAccountTests {
     let clock = DemoClock(manualStart: DemoAccountTests.start)
     let server: DemoTransport
     let client: JMAPClient
+    /// Retries busy answers on its own, as the app's client does.
+    let retryingClient: JMAPClient
     let mailboxes = MailboxRoles(drafts: "drafts", sent: "sent")
 
     init() {
         server = DemoTransport(clock: clock)
         client = JMAPClient(token: "demo", transport: server, maxRetries: 0)
+        retryingClient = JMAPClient(token: "demo", transport: server, retryDelay: { _ in .zero })
     }
 
     func draft(
@@ -192,6 +195,27 @@ struct DemoAccountTests {
         #expect(email.mailboxIds == ["drafts": true])
         #expect(email.has(.draft))
         #expect(server.pendingSubmissionIDs.isEmpty)
+        server.advanceClock(by: 60)
+        #expect(server.sentMessages.isEmpty)
+    }
+
+    /// The server may have cancelled before it answered 503. Asking again would find the submission gone,
+    /// which looks exactly like a message that went out.
+    @Test func busyAnswerToAnUndoIsNotTakenForTooLate() async throws {
+        let result = try await submit()
+        let submission = try #require(result.submission)
+        let emailID = try #require(result.emailID)
+        server.advanceClock(by: 5)
+        server.answerNext(withStatus: 503)
+
+        let error = await #expect(throws: JMAPError.self) {
+            try await retryingClient.cancelSubmission(submission.id, mailboxes: mailboxes)
+        }
+
+        #expect(error == .http(status: 503, problemType: nil))
+        #expect(error?.mayHaveReachedServer == true)
+        #expect(try await flags(emailID)?.mailboxIds == ["drafts": true])
+        #expect(try await flags(emailID)?.has(.draft) == true)
         server.advanceClock(by: 60)
         #expect(server.sentMessages.isEmpty)
     }
@@ -383,6 +407,20 @@ struct DemoAccountTests {
         #expect(Set(ids).count == ids.count)
         #expect(sent.submissionError == nil)
         #expect(server.sentMessages.map(\.identityId) == [identity.id])
+    }
+
+    /// The server may have made the identity before it answered 503; asking again would make a second one.
+    @Test func identityMadeBeforeABusyAnswerIsMadeOnce() async throws {
+        server.answerNext(withStatus: 503)
+
+        let error = await #expect(throws: JMAPError.self) {
+            try await retryingClient.createIdentity(.init(email: "fjord.k3x9@fastmail.com"))
+        }
+
+        #expect(error == .http(status: 503, problemType: nil))
+        #expect(error?.mayHaveReachedServer == true)
+        #expect(try await client.identities().map(\.email)
+            == ["alex@fastmail.com", "*@berg.example", "fjord.k3x9@fastmail.com"])
     }
 
     @Test(arguments: ["win.a7b2@fastmail.com", "someone@elsewhere.example", "alex@fastmail.com", "shop@berg.example"])

@@ -225,6 +225,66 @@ struct ComposeMethodsTests {
         #expect(transport.requests.count == 2)
     }
 
+    @Test(arguments: [(503, JMAPError.http(status: 503, problemType: nil)), (429, .rateLimited)])
+    func undoAndNewIdentitiesAreNeverRepeatedAutomatically(status: Int, expected: JMAPError) async throws {
+        let client = makeClient()
+        transport.enqueue(fixture: "session")
+        transport.enqueue(.init(status: status, body: Data(), headers: ["Retry-After": "0"]))
+        await #expect(throws: expected) { try await client.cancelSubmission("S4", mailboxes: mailboxes) }
+
+        transport.enqueue(.init(status: status, body: Data(), headers: ["Retry-After": "0"]))
+        await #expect(throws: expected) { try await client.createIdentity(.init(email: "fjord.k3x9@fastmail.com")) }
+
+        #expect(transport.requests.count == 3)
+    }
+
+    /// The error of a call whose session request is answered with `sessionReply`.
+    func errorFetchingTheSession(
+        _ sessionReply: StubTransport.Reply, _ operation: (JMAPClient) async throws -> Void
+    ) async -> JMAPError? {
+        transport.enqueue(sessionReply)
+        do {
+            try await operation(makeClient())
+            return nil
+        } catch {
+            return error as? JMAPError
+        }
+    }
+
+    /// Requests that must not run twice need the session first. When it can't be fetched, the request itself
+    /// was certainly never sent, whatever the failure says about the session request.
+    @Test(arguments: [
+        (StubTransport.Reply.failing(.timedOut), JMAPError.connection(.timedOut, URLError(.timedOut).localizedDescription)),
+        (.init(status: 500, body: Data()), .http(status: 500, problemType: nil)),
+    ])
+    func requestsThatMustNotRunTwiceAreUnsentWithoutASession(
+        sessionReply: StubTransport.Reply, sessionError: JMAPError
+    ) async throws {
+        let errors = [
+            await errorFetchingTheSession(sessionReply) {
+                _ = try await $0.submit(draft(), identityID: "I1", envelope: envelope, mailboxes: mailboxes)
+            },
+            await errorFetchingTheSession(sessionReply) { _ = try await $0.cancelSubmission("S4", mailboxes: mailboxes) },
+            await errorFetchingTheSession(sessionReply) {
+                _ = try await $0.createIdentity(.init(email: "fjord.k3x9@fastmail.com"))
+            },
+        ]
+
+        #expect(errors == Array(repeating: .sessionUnavailable(sessionError), count: 3))
+        #expect(errors.allSatisfy { $0?.mayHaveReachedServer == false && $0?.isTemporary == true })
+        #expect(errors.first??.localizedDescription == sessionError.localizedDescription)
+        #expect(transport.requests.count == 3)
+    }
+
+    @Test func otherCallsAndRefusedTokensGetTheSessionErrorAsItIs() async throws {
+        let timeout = JMAPError.connection(.timedOut, URLError(.timedOut).localizedDescription)
+
+        #expect(await errorFetchingTheSession(.failing(.timedOut)) { _ = try await $0.identities() } == timeout)
+        #expect(await errorFetchingTheSession(.init(status: 401, body: Data())) {
+            _ = try await $0.submit(draft(), identityID: "I1", envelope: envelope, mailboxes: mailboxes)
+        } == .unauthorized)
+    }
+
     @Test func refusedSubmissionStillReportsTheCreatedEmail() async throws {
         respond(#"""
             [["Email/set", {"accountId": "u1234", "newState": "2", "created": {"m": {"id": "M9", "threadId": "T1"}}}, "c0"],

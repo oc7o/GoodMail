@@ -69,7 +69,7 @@ public enum JMAPError: Error, Sendable, Equatable {
     case unauthorized
     /// The server rejected the request (4xx/5xx) with an optional RFC 7807 problem type.
     case http(status: Int, problemType: String?)
-    /// Server asked us to slow down and retries were exhausted.
+    /// The server asked to slow down (HTTP 429), and the request wasn't sent again or retries ran out.
     case rateLimited
     case missingCapability(String)
     case method(MethodError)
@@ -79,6 +79,9 @@ public enum JMAPError: Error, Sendable, Equatable {
     case transport(String)
     /// The request failed below HTTP: no connection, a timeout, a dropped connection, a failed TLS handshake.
     case connection(URLError.Code, String)
+    /// A request that must not run twice (`RetryPolicy.never`) was never sent, because fetching the session it
+    /// needs failed with this error, one that on its own would leave open whether the request ran.
+    indirect case sessionUnavailable(JMAPError)
 
     /// The request-level problem type for exceeding a server limit (RFC 8620 §3.6.1).
     public static let limitProblemType = "urn:ietf:params:jmap:error:limit"
@@ -93,6 +96,7 @@ public enum JMAPError: Error, Sendable, Equatable {
         case .http(let status, let problemType):
             status == 408 || status == 429 || status >= 500 || problemType == Self.limitProblemType
         case .method(let error): error.type == MethodError.serverUnavailable
+        case .sessionUnavailable(let error): error.isTemporary
         default: false
         }
     }
@@ -101,13 +105,14 @@ public enum JMAPError: Error, Sendable, Equatable {
     ///
     /// Requests that must not run twice, such as sending mail, are only repeated when this is false. It is
     /// false only when the server certainly didn't run the request: it never got there (no connection, no
-    /// host, a failed TLS handshake), or the server answered that it refused it (a 4xx other than 408, a
-    /// rejected token). A method error means that method changed nothing, unless it is `serverPartialFail`.
+    /// host, a failed TLS handshake, no session to send it with), or the server answered that it refused it
+    /// (a 429, a 4xx other than 408, a rejected token). A 503 may come after the work, so it counts as reached.
+    /// A method error means that method changed nothing, unless it is `serverPartialFail`.
     public var mayHaveReachedServer: Bool {
         switch self {
         case .connection(let code, _): !Self.codesOfRequestsNeverSent.contains(code)
         case .http(let status, _): status == 408 || !(400..<500).contains(status)
-        case .rateLimited, .unauthorized, .missingCapability: false
+        case .rateLimited, .unauthorized, .missingCapability, .sessionUnavailable: false
         case .method(let error): error.type == MethodError.serverPartialFail
         case .transport, .decoding, .unexpectedResponse: true
         }
@@ -142,6 +147,8 @@ extension JMAPError: LocalizedError {
             "Couldn't read Fastmail's response (\(details))."
         case .transport(let message), .connection(_, let message):
             message
+        case .sessionUnavailable(let error):
+            error.errorDescription
         }
     }
 }

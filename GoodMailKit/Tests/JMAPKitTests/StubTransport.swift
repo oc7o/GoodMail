@@ -8,6 +8,12 @@ final class StubTransport: HTTPTransport {
         var status: Int = 200
         var body: Data
         var headers: [String: String] = [:]
+        /// Fails the request with this code instead of answering, as URLSession does.
+        var failure: URLError.Code?
+
+        static func failing(_ code: URLError.Code) -> Reply {
+            Reply(body: Data(), failure: code)
+        }
     }
 
     private let state = Mutex<(replies: [Reply], streams: [StubStream], requests: [URLRequest])>(([], [], []))
@@ -32,6 +38,7 @@ final class StubTransport: HTTPTransport {
             return state.replies.isEmpty ? nil : state.replies.removeFirst()
         }
         guard let reply else { throw URLError(.notConnectedToInternet) }
+        if let failure = reply.failure { throw URLError(failure) }
         let response = HTTPURLResponse(
             url: request.url!, statusCode: reply.status, httpVersion: "HTTP/1.1", headerFields: reply.headers)!
         return (reply.body, response)

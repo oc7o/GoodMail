@@ -94,6 +94,27 @@ struct ErrorClassificationTests {
         #expect(JMAPError.method(MethodError(type: MethodError.serverPartialFail)).mayHaveReachedServer)
     }
 
+    /// The session request failing ambiguously says nothing about the request after it, which was never sent.
+    @Test func requestThatMustNotRunTwiceWasUnsentWhenItsSessionFailed() async {
+        var batch = Batch()
+        batch.add(MailboxGet(accountId: "u1234"))
+        let timeout = JMAPError.connection(.timedOut, URLError(.timedOut).localizedDescription)
+        let offline = JMAPError.connection(.notConnectedToInternet, URLError(.notConnectedToInternet).localizedDescription)
+
+        transport.enqueue(.failing(.timedOut))
+        await #expect(throws: JMAPError.sessionUnavailable(timeout)) { try await makeClient().send(batch, retry: .never) }
+        transport.enqueue(.failing(.timedOut))
+        await #expect(throws: timeout) { try await makeClient().send(batch) }
+        // Already certain: kept as it is, so that being offline still reads as such.
+        transport.enqueue(.failing(.notConnectedToInternet))
+        await #expect(throws: offline) { try await makeClient().send(batch, retry: .never) }
+
+        #expect(transport.requests.count == 3)
+        #expect(!JMAPError.sessionUnavailable(timeout).mayHaveReachedServer)
+        #expect(JMAPError.sessionUnavailable(timeout).isTemporary)
+        #expect(!JMAPError.sessionUnavailable(.decoding("Session: truncated")).isTemporary)
+    }
+
     @Test func connectionErrorsReadLikeTheSystemsMessage() {
         let message = URLError(.timedOut).localizedDescription
         #expect(JMAPError.connection(.timedOut, message).localizedDescription == message)
@@ -129,9 +150,23 @@ struct ErrorClassificationTests {
 
     @Test func automaticRetriesStillGiveUp() async {
         transport.enqueue(fixture: "session")
-        for _ in 0...3 { transport.enqueue(.init(status: 503, body: Data())) }
+        for _ in 0...3 { transport.enqueue(.init(status: 429, body: Data(), headers: ["Retry-After": "0"])) }
 
         await #expect(throws: JMAPError.rateLimited) { try await makeClient().call(MailboxGet(accountId: "u1234")) }
+        #expect(transport.requests.count == 5)
+    }
+
+    /// A 503 may come after the server did the work, so retries that run out after one don't count as refused.
+    @Test(arguments: [[503, 503, 503, 503], [503, 429, 429, 429], [429, 429, 429, 503]])
+    func retriesRunningOutAfterABusyAnswerMayHaveReachedTheServer(statuses: [Int]) async {
+        transport.enqueue(fixture: "session")
+        for status in statuses { transport.enqueue(.init(status: status, body: Data(), headers: ["Retry-After": "0"])) }
+
+        let error = await #expect(throws: JMAPError.self) { try await makeClient().call(MailboxGet(accountId: "u1234")) }
+
+        #expect(error == .http(status: 503, problemType: nil))
+        #expect(error?.mayHaveReachedServer == true)
+        #expect(error?.isTemporary == true)
         #expect(transport.requests.count == 5)
     }
 }

@@ -6,7 +6,7 @@ public enum RetryPolicy: Sendable {
     /// Waits and sends it again, a few times.
     case automatic
     /// Never sends it again, for requests that must not run twice, such as sending mail: a 503 may come after
-    /// the server did the work.
+    /// the server did the work. When the session can't be fetched first, the error is `sessionUnavailable`.
     case never
 }
 
@@ -61,6 +61,18 @@ public actor JMAPClient {
         try await session().primaryAccountId(for: capability)
     }
 
+    /// The session for a request about to be sent with `retry`.
+    ///
+    /// A timeout or 5xx while fetching the session would read as if the request itself may have run; for
+    /// one that must not run twice, it is reported as `sessionUnavailable` instead.
+    func session(for retry: RetryPolicy) async throws -> Session {
+        do {
+            return try await session()
+        } catch let error as JMAPError where retry == .never && error.mayHaveReachedServer {
+            throw JMAPError.sessionUnavailable(error)
+        }
+    }
+
     /// Uses `token` for every request and push connection from now on, and fetches the session again, as the
     /// new token may come with other capabilities.
     public func setToken(_ token: String) {
@@ -71,7 +83,7 @@ public actor JMAPClient {
     // MARK: API requests
 
     public func send(_ batch: Batch, retry: RetryPolicy = .automatic) async throws -> BatchResponse {
-        let session = try await session()
+        let session = try await session(for: retry)
         var request = URLRequest(url: session.apiUrl)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -204,6 +216,8 @@ public actor JMAPClient {
     func perform(_ request: URLRequest, retry: RetryPolicy = .automatic) async throws -> Data {
         let request = authorized(request)
         var attempt = 0
+        // Once a 503 came, the request may have run, however the retries end (see `mayHaveReachedServer`).
+        var unavailable: JMAPError?
         while true {
             let data: Data
             let response: HTTPURLResponse
@@ -219,11 +233,10 @@ public actor JMAPClient {
             case 401:
                 throw JMAPError.unauthorized
             case 429, 503:
-                guard retry == .automatic else {
-                    if response.statusCode == 429 { throw JMAPError.rateLimited }
-                    throw JMAPError.http(status: 503, problemType: Self.problemType(in: data))
+                if response.statusCode == 503 {
+                    unavailable = .http(status: 503, problemType: Self.problemType(in: data))
                 }
-                guard attempt < maxRetries else { throw JMAPError.rateLimited }
+                guard retry == .automatic, attempt < maxRetries else { throw unavailable ?? JMAPError.rateLimited }
                 let delay = Self.retryAfter(response) ?? retryDelay(attempt)
                 attempt += 1
                 try? await Task.sleep(for: delay)

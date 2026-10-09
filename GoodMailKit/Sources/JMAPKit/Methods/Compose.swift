@@ -139,9 +139,12 @@ extension JMAPClient {
 
     /// Creates an identity to send from `create.email`. Throws the server's `SetError` when it refuses, such as
     /// `forbiddenFrom` for an address the account may not send from.
+    ///
+    /// The request is never repeated automatically, as a repeat would make a second identity. After an error
+    /// whose `mayHaveReachedServer` is true, the identity may exist.
     public func createIdentity(_ create: Identity.Create) async throws -> Identity {
-        let accountId = try await accountId(for: Capability.submission)
-        let response = try await call(IdentitySet(accountId: accountId, create: ["i": create]))
+        let accountId = try await session(for: .never).primaryAccountId(for: Capability.submission)
+        let response = try await call(IdentitySet(accountId: accountId, create: ["i": create]), retry: .never)
         if let error = response.notCreated?["i"] { throw error }
         guard let created = try response.created("i", as: CreatedIdentity.self) else {
             throw JMAPError.unexpectedResponse(callId: "i")
@@ -172,8 +175,9 @@ extension JMAPClient {
     public func submit(
         _ email: EmailCreate, identityID: String, envelope: EmailSubmission.Envelope, mailboxes: MailboxRoles
     ) async throws -> SubmissionResult {
-        let mailAccountId = try await accountId(for: Capability.mail)
-        let submissionAccountId = try await accountId(for: Capability.submission)
+        let session = try await session(for: .never)
+        let mailAccountId = try session.primaryAccountId(for: Capability.mail)
+        let submissionAccountId = try session.primaryAccountId(for: Capability.submission)
         var batch = Batch()
         let creation = batch.add(EmailSet(accountId: mailAccountId, create: ["m": email]))
         let submission = batch.add(EmailSubmissionSet(
@@ -217,12 +221,16 @@ extension JMAPClient {
     }
 
     /// Cancels a held submission (Undo Send) and moves its email back to Drafts.
+    ///
+    /// The request is never repeated automatically: a cancelled submission is deleted, so a repeat would find
+    /// it gone and report `alreadySent` for a message that is back in Drafts. After an error whose
+    /// `mayHaveReachedServer` is true, the submission may have been cancelled.
     public func cancelSubmission(_ id: String, mailboxes: MailboxRoles) async throws -> SubmissionCancellation {
-        let accountId = try await accountId(for: Capability.submission)
+        let accountId = try await session(for: .never).primaryAccountId(for: Capability.submission)
         let response = try await call(EmailSubmissionSet(
             accountId: accountId, update: [id: ["undoStatus": .string(EmailSubmission.UndoStatus.canceled.rawValue)]],
             onSuccessUpdateEmail: [id: PatchObject.move(from: mailboxes.sent, to: mailboxes.drafts)
-                .merging(.setKeyword(.draft, true))]))
+                .merging(.setKeyword(.draft, true))]), retry: .never)
         if response.updated?.keys.contains(id) == true { return .canceled }
         guard let error = response.notUpdated?[id] else { throw JMAPError.unexpectedResponse(callId: id) }
         // Fastmail deletes a submission once it is released, so a late cancel finds nothing.
