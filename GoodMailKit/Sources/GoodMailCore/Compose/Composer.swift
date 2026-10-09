@@ -697,8 +697,13 @@ extension MailModel {
         let lost = Set(await outbox.lostAttachments(of: draft).map(\.id))
         if let open = openComposers[id] { return open }
         let record = row.record
-        let status: SaveStatus = row.hasUnsyncedChanges
-            ? .savedLocally : .savedToServer(record.serverSavedAt ?? row.updatedAt)
+        let status: SaveStatus = if !row.hasUnsyncedChanges {
+            .savedToServer(record.serverSavedAt ?? row.updatedAt)
+        } else if let failure = record.saveFailure {
+            .failed(failure)
+        } else {
+            .savedLocally
+        }
         return opened(Composer(
             model: self, draft: draft, notices: [record.notice].compactMap { $0 }, restoredRevision: row.revision,
             saveStatus: status, lostAttachments: lost))

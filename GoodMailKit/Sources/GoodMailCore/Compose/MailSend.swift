@@ -117,11 +117,12 @@ struct MailSend: Sendable {
         do {
             result = try await client.saveDraft(email, replacing: row.serverEmailID)
         } catch {
-            let error = JMAPError.wrapping(error)
-            let message = error.localizedDescription
+            let error = SendError.jmap(error)
+            // Waiting for a connection or a busy server is no failure to show.
+            let failure = SendError.isNoConnection(error) || error.isTemporary ? nil : error.localizedDescription
             _ = try? await store.updateOutbox(id: id) { _, record in
                 if !error.mayHaveReachedServer { record.lastAttempt = previousAttempt }
-                record.saveFailure = message
+                record.saveFailure = failure
             }
             return .unreachable(error)
         }
@@ -320,7 +321,7 @@ struct MailSend: Sendable {
             result = try await client.submit(
                 email, identityID: identity.id, envelope: envelope, mailboxes: context.mailboxes.roles)
         } catch {
-            let error = JMAPError.wrapping(error)
+            let error = SendError.jmap(error)
             guard !error.mayHaveReachedServer else { return .unknown }
             _ = try await store.updateOutbox(id: id) { row, record in
                 row.state = .queued
@@ -476,26 +477,28 @@ struct MailSend: Sendable {
     }
 }
 
-extension JMAPError {
+/// How the outbox reads the errors of its requests. A namespace rather than members of `JMAPError`, which other
+/// parts of the app extend too.
+enum SendError {
     /// Every error the client throws is a `JMAPError`; anything else is treated as a transport failure.
-    static func wrapping(_ error: any Error) -> JMAPError {
+    static func jmap(_ error: any Error) -> JMAPError {
         error as? JMAPError ?? .transport(error.localizedDescription)
     }
 
     /// The token lacks the "Email submission" scope (HTTP 403 `unknownCapability`).
-    var isMissingSubmissionScope: Bool {
-        if case .http(403, let type) = self { return type == "urn:ietf:params:jmap:error:unknownCapability" }
-        if case .missingCapability(let capability) = self { return capability == Capability.submission }
+    static func lacksSubmissionScope(_ error: JMAPError) -> Bool {
+        if case .http(403, let type) = error { return type == "urn:ietf:params:jmap:error:unknownCapability" }
+        if case .missingCapability(let capability) = error { return capability == Capability.submission }
         return false
     }
 
     /// The device has no connection, as opposed to the server being busy.
-    var isOffline: Bool {
-        switch self {
+    static func isNoConnection(_ error: JMAPError) -> Bool {
+        switch error {
         case .connection(let code, _):
             [.notConnectedToInternet, .networkConnectionLost, .cannotFindHost, .cannotConnectToHost,
              .dnsLookupFailed, .dataNotAllowed, .internationalRoamingOff, .callIsActive, .timedOut].contains(code)
-        case .sessionUnavailable(let error): error.isOffline
+        case .sessionUnavailable(let error): isNoConnection(error)
         default: false
         }
     }

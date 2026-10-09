@@ -403,7 +403,7 @@ public final class Outbox {
             composer?.serverSaveFailed(message)
         case .unreachable(let error):
             if error == .unauthorized { host?.outboxTokenRejected() }
-            if error.isOffline || error.isTemporary {
+            if SendError.isNoConnection(error) || error.isTemporary {
                 composer?.serverSaveDeferred()
             } else {
                 composer?.serverSaveFailed(error.localizedDescription)
@@ -678,7 +678,7 @@ public final class Outbox {
                 record = (try? await store.draft(id: id))?.record ?? record
             }
         } catch {
-            return await notSent(id, JMAPError.wrapping(error))
+            return await notSent(id, SendError.jmap(error))
         }
 
         let holdFor = record.localDelay ? nil : Self.holdSeconds
@@ -798,7 +798,7 @@ public final class Outbox {
             } catch is SetError {
                 await fail(id, .identityRefused(address))
             } catch {
-                await notSent(id, JMAPError.wrapping(error))
+                await notSent(id, SendError.jmap(error))
             }
         }
         return nil
@@ -850,7 +850,7 @@ public final class Outbox {
         do {
             release = try await steps.checkRelease(submission, mailboxes: context.mailboxes)
         } catch {
-            let at = clock.now.addingTimeInterval(JMAPError.wrapping(error).isOffline ? 60 : 5)
+            let at = clock.now.addingTimeInterval(SendError.isNoConnection(SendError.jmap(error)) ? 60 : 5)
             _ = try? await store.updateOutbox(id: id) { _, record in record.submission?.nextCheckAt = at }
             return
         }
@@ -911,7 +911,7 @@ public final class Outbox {
             }
         } catch {
             // Possibly cancelled after all: the intent stays, and the release check completes it (C3).
-            let mayHaveRun = JMAPError.wrapping(error).mayHaveReachedServer
+            let mayHaveRun = SendError.jmap(error).mayHaveReachedServer
             _ = try? await store.updateOutbox(id: id) { _, record in
                 record.lastAttempt = nil
                 if mayHaveRun {
@@ -1126,14 +1126,14 @@ public final class Outbox {
 
     /// A request that certainly didn't run (C2): the message keeps waiting, or fails for good.
     private func notSent(_ id: String, _ error: JMAPError) async {
-        if error.isMissingSubmissionScope {
+        if SendError.lacksSubmissionScope(error) {
             await host?.outboxLostSubmissionScope()
             return await fail(id, .tokenLacksSubmission)
         }
         switch error {
         case .unauthorized:
             host?.outboxTokenRejected()
-        case _ where error.isOffline:
+        case _ where SendError.isNoConnection(error):
             await backOff(id, .connection)
         case _ where error.isTemporary:
             await backOff(id, .busy)
@@ -1191,7 +1191,7 @@ public final class Outbox {
                 let blob = try await client.upload(data, type: next.type)
                 try await store.markOutgoingAttachmentUploaded(id: next.id, blobID: blob.blobId, expiresAt: blob.expires)
                 uploadStates[key] = .uploaded
-            } catch let error as JMAPError where error.isOffline || error.isTemporary {
+            } catch let error as JMAPError where SendError.isNoConnection(error) || error.isTemporary {
                 uploadStates[key] = .waiting
                 return
             } catch {
