@@ -140,6 +140,37 @@ public struct MailSync: Sendable {
         return stored
     }
 
+    /// Downloads small attachments of recent mail into the attachment cache, as far as they fit into its free
+    /// room: prefetching never evicts anything (U4, D24). Mail that is only in `mailboxIDs` (Junk and Trash) is
+    /// skipped, and so is a network in Low Data Mode, by the request itself. Returns how many were stored.
+    public func prefetchAttachments(
+        amongNewest window: Int = 200, maxSize: Int = 1 << 20, limit: Int = 10,
+        cacheLimit: Int = MailStore.attachmentCacheLimit, skipping mailboxIDs: [String] = []
+    ) async throws -> Int {
+        let room = cacheLimit - (try await store.attachmentCacheBytes())
+        guard room > 0 else { return 0 }
+        let attachments = try await store.missingAttachments(
+            amongNewest: window, maxSize: min(room, maxSize), limit: limit, skippingEmailsOnlyIn: mailboxIDs)
+        var stored = 0
+        var used = 0
+        for attachment in attachments where used + (attachment.size ?? 0) <= room {
+            let data: Data
+            do {
+                data = try await client.download(
+                    blobId: attachment.blobId, type: attachment.type, name: attachment.name ?? "attachment",
+                    allowsConstrainedNetworkAccess: false)
+            } catch let error as JMAPError where !error.isTemporary && error != .unauthorized {
+                try await store.forgetAttachment(blobId: attachment.blobId)
+                continue
+            }
+            guard used + data.count <= room else { break }
+            try await store.storeAttachment(data, blobId: attachment.blobId, type: attachment.type, evictingBeyond: nil)
+            used += data.count
+            stored += 1
+        }
+        return stored
+    }
+
     // MARK: Outbox
 
     public struct FlushResult: Sendable, Equatable {

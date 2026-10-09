@@ -1,9 +1,11 @@
 import Foundation
 import JMAPKit
+import MailCompose
 import MailStore
 import Observation
 
-/// State behind the mail screens of one account: mailboxes, the visible thread list, and masked emails.
+/// State behind the mail screens of one account: mailboxes, the visible thread list, masked emails, and the
+/// outbox with the composers writing into it.
 ///
 /// Lists are read from the local store, so they appear at once and work offline; the server is asked
 /// in parallel and whatever it returns lands in the store first.
@@ -14,6 +16,7 @@ public final class MailModel {
         case mailbox(String)
         case savedSearch(String)
         case maskedEmail
+        case outbox
 
         var isSavedSearch: Bool {
             if case .savedSearch = self { true } else { false }
@@ -50,9 +53,28 @@ public final class MailModel {
 
     public let client: JMAPClient
     private let sync: MailSync
-    private var store: MailStore { sync.store }
+    var store: MailStore { sync.store }
     private let syncsInBackground: Bool
     private let onUnauthorized: () -> Void
+    let clock: any OutboxClock
+    private let network: any NetworkPathSource
+    let backgroundActivity: any BackgroundActivity
+
+    /// Messages being sent and drafts written on this device.
+    public let outbox: Outbox
+    /// What is known about the account, kept for starting offline (D34).
+    public private(set) var account: AccountSnapshot? {
+        didSet { sendAvailability = account?.sendAvailability ?? .unknown }
+    }
+    public private(set) var sendAvailability = SendAvailability.unknown
+    /// Whether the device has a network connection, as far as the system can tell.
+    public private(set) var isOnline = true
+    /// The composers open in windows and sheets, by draft id.
+    @ObservationIgnored var openComposers: [UUID: Composer] = [:]
+    /// When the last successful sync of stored mail started; the outbox's server-copy check needs it (§2.3).
+    @ObservationIgnored private(set) var lastSyncStartedAt: Date?
+    @ObservationIgnored private var networkTask: Task<Void, Never>?
+    @ObservationIgnored private(set) var networkPath: NetworkPath?
 
     public private(set) var username: String?
     public private(set) var mailboxes: [Mailbox] = []
@@ -97,6 +119,7 @@ public final class MailModel {
     private let refreshes = SingleFlight()
     private let flushes = SingleFlight()
     private let maskedEmailLoads = SingleFlight()
+    private let identityLoads = SingleFlight()
 
     public private(set) var maskedEmails: [MaskedEmail] = [] {
         didSet {
@@ -104,7 +127,7 @@ public final class MailModel {
                 maskedEmails.map { ($0.email.lowercased(), $0) }, uniquingKeysWith: { first, _ in first })
         }
     }
-    @ObservationIgnored private var maskedEmailsByAddress: [String: MaskedEmail] = [:]
+    @ObservationIgnored private(set) var maskedEmailsByAddress: [String: MaskedEmail] = [:]
     public var selectedMaskedEmailID: String?
 
     /// A failed action the user should hear about.
@@ -116,27 +139,41 @@ public final class MailModel {
     /// Whether the server pushes its changes as they happen, so that polling can slow down.
     public private(set) var isPushConnected = false
 
-    /// - Parameter syncsInBackground: Until `stop()`, take in changes as the server pushes them (polling
-    ///   as a fallback), backfill older mail and prefetch bodies.
+    /// - Parameters:
+    ///   - syncsInBackground: Until `stop()`, take in changes as the server pushes them (polling as a fallback),
+    ///     backfill older mail and prefetch bodies.
+    ///   - clock: The time every outbox and autosave deadline goes by.
+    ///   - network: The network path; mail waiting to be sent goes out as soon as it is back.
+    ///   - backgroundActivity: Keeps the app running while mail is sent (iOS: `beginBackgroundTask`).
     public init(
-        client: JMAPClient, store: MailStore, syncsInBackground: Bool = true, onUnauthorized: @escaping () -> Void
+        client: JMAPClient, store: MailStore, syncsInBackground: Bool = true,
+        clock: any OutboxClock = SystemOutboxClock(), network: any NetworkPathSource = SystemNetworkPath(),
+        backgroundActivity: any BackgroundActivity = NoBackgroundActivity(), onUnauthorized: @escaping () -> Void
     ) {
         self.client = client
         self.sync = MailSync(client: client, store: store)
         self.syncsInBackground = syncsInBackground
         self.onUnauthorized = onUnauthorized
+        self.clock = clock
+        self.network = network
+        self.backgroundActivity = backgroundActivity
+        outbox = Outbox(client: client, store: store, clock: clock, activity: backgroundActivity)
+        outbox.host = self
     }
 
     public func start() async {
         let stops = self.stops
         // stop() cancels what it finds under way, but this mustn't go on to start more.
         var isStopped: Bool { self.stops != stops }
+        await loadStoredAccount()
         mailboxes = (try? await store.mailboxes()) ?? []
         savedSearches = (try? await store.savedSearches()) ?? []
         maskedEmails = (try? await store.maskedEmails()) ?? []
         selectInboxIfNeeded()
         await updatePendingChangeCount()
-        username = try? await client.session().username
+        await outbox.start()
+        startWatchingNetwork()
+        await refreshAccount()
         guard !isStopped else { return }
         await refresh()
         selectInboxIfNeeded()
@@ -147,7 +184,8 @@ public final class MailModel {
         startPush()
     }
 
-    /// Ends background syncing and push, and cancels refreshes and Masked Email loads under way.
+    /// Ends background syncing, push and the outbox's timers and uploads, and cancels refreshes and loads
+    /// under way. What was cut short is picked up from the persisted states on the next start.
     public func stop() {
         stops += 1
         backgroundTask?.cancel()
@@ -155,6 +193,10 @@ public final class MailModel {
         stopPush()
         refreshes.cancel()
         maskedEmailLoads.cancel()
+        identityLoads.cancel()
+        networkTask?.cancel()
+        networkTask = nil
+        outbox.stop()
     }
 
     /// Sends queued changes, then brings mailboxes and stored mail up to date with the server.
@@ -172,9 +214,14 @@ public final class MailModel {
 
     private func refreshOnce() async {
         await flushPendingChanges()
+        // Not awaited: uploads can take minutes and must never hold up mail sync.
+        if !Task.isCancelled { outbox.requestFlush() }
         await loadMailboxes()
         do {
+            let started = clock.now
+            let hasState = (try? await store.emailState()) != nil
             let outcome = try await sync.syncChanges()
+            if hasState { lastSyncStartedAt = started }
             connectionProblem = nil
             // Also covers a list that so far only shows stored mail, e.g. after starting offline.
             if outcome == .reset || (serverTotal == nil && !isLoadingThreads) {
@@ -218,12 +265,19 @@ public final class MailModel {
     }
 
     /// One slice of low-priority work. Returns whether more is waiting.
-    private func performBackgroundWork() async -> Bool {
+    func performBackgroundWork() async -> Bool {
         if pendingChangeCount > 0 { await flushPendingChanges() }
+        if outbox.hasPendingWork { outbox.requestFlush() }
         do {
             if try await sync.backfillNextPage() { return true }
             if try await sync.prefetchBodies() > 0 { return true }
-            return try await sync.prefetchInlineImages() > 0
+            if try await sync.prefetchInlineImages() > 0 { return true }
+            // Not in Low Data Mode, but on any other network, cellular included (D24).
+            if networkPath?.isConstrained != true,
+               try await sync.prefetchAttachments(skipping: hiddenFromSearchMailboxIDs) > 0 {
+                return true
+            }
+            return try await store.performMaintenance()
         } catch {
             return false
         }
@@ -241,7 +295,8 @@ public final class MailModel {
                 var connectedAt: ContinuousClock.Instant?
                 do {
                     let accounts = try await client.session().primaryAccounts
-                    for try await event in client.pushEvents(types: Self.pushedMailTypes + ["MaskedEmail"]) {
+                    guard let types = self?.pushedTypes else { return }
+                    for try await event in client.pushEvents(types: types) {
                         // Events already buffered still arrive after cancelling.
                         guard !Task.isCancelled, let self else { return }
                         if event == .connected { connectedAt = .now }
@@ -259,6 +314,12 @@ public final class MailModel {
         }
     }
 
+    /// The types to hear about. Submissions and identities only with a token that may send: asking for them
+    /// otherwise fails the connection (§2.8).
+    private var pushedTypes: [String] {
+        Self.pushedMailTypes + ["MaskedEmail"] + (account?.canSubmit == true ? ["EmailSubmission", "Identity"] : [])
+    }
+
     private func receive(_ event: PushEvent, accounts: [String: String]) {
         switch event {
         case .connected:
@@ -271,6 +332,9 @@ public final class MailModel {
             if let account = accounts[Capability.maskedEmail], change.changed[account]?["MaskedEmail"] != nil {
                 requestMaskedEmailLoad()
             }
+            let submissionTypes = accounts[Capability.submission].flatMap { change.changed[$0] } ?? [:]
+            if submissionTypes["EmailSubmission"] != nil { outbox.requestFlush() }
+            if submissionTypes["Identity"] != nil { requestIdentityLoad() }
         }
     }
 
@@ -383,7 +447,7 @@ public final class MailModel {
             query = ThreadQuery(
                 destination: destination, mailboxID: saved.mailboxID,
                 search: SearchQuery(parsing: saved.query + " " + searchText), unreadOnly: showsUnreadOnly)
-        case .maskedEmail:
+        case .maskedEmail, .outbox:
             return nil
         }
         if let name = query.search.mailbox {
@@ -547,7 +611,7 @@ public final class MailModel {
         return conditions.count == 1 ? .condition(conditions[0]) : .and(conditions.map { .condition($0) })
     }
 
-    private var hiddenFromSearchMailboxIDs: [String] {
+    var hiddenFromSearchMailboxIDs: [String] {
         [Mailbox.Role.trash, .junk].compactMap { mailbox($0)?.id }
     }
 
@@ -662,7 +726,7 @@ public final class MailModel {
         await flushPendingChanges()
     }
 
-    /// Sends everything in the outbox.
+    /// Sends every queued change to emails (the triage outbox).
     ///
     /// Only one flush runs at a time; callers arriving meanwhile wait for it, and it then makes one
     /// more pass so that a change queued after its last look at the outbox isn't left behind.
@@ -723,9 +787,10 @@ public final class MailModel {
         }
     }
 
-    /// The masked address this email was delivered to, if any.
+    /// The masked address this email was delivered to, if any: where Fastmail says it delivered it
+    /// (X-Delivered-To), which also knows a mask reached through Bcc or a list, then the recipients.
     public func maskedEmail(for email: Email) -> MaskedEmail? {
-        let recipients = (email.to ?? []) + (email.cc ?? []) + (email.bcc ?? [])
+        let recipients = email.deliveredToAddresses + (email.to ?? []) + (email.cc ?? []) + (email.bcc ?? [])
         return recipients.lazy.compactMap { self.maskedEmailsByAddress[$0.email.lowercased()] }.first
     }
 
@@ -829,5 +894,215 @@ public final class MailModel {
         } catch {
             report(error, userInitiated: true)
         }
+    }
+
+    // MARK: Account
+
+    /// The identities, as last read from the server.
+    public var identities: [Identity] {
+        account?.identities ?? []
+    }
+
+    /// The account as it was last known, before anything is asked of the server (D34).
+    private func loadStoredAccount() async {
+        guard account == nil, let data = try? await store.keyedData(AccountSnapshot.storeKey),
+              let snapshot = try? JSONDecoder().decode(AccountSnapshot.self, from: data)
+        else { return }
+        account = snapshot
+        if username == nil { username = snapshot.username }
+    }
+
+    /// Reads the session, and the identities if the token may send, into the account snapshot.
+    private func refreshAccount() async {
+        guard let session = try? await client.session() else { return }
+        username = session.username
+        guard let snapshot = AccountSnapshot(session: session, previous: account, at: clock.now) else { return }
+        account = snapshot
+        await saveAccount()
+        if snapshot.canSubmit { await loadIdentities() }
+    }
+
+    /// One load at a time, like `refresh()`.
+    private func loadIdentities() async {
+        await requestIdentityLoad().value
+    }
+
+    @discardableResult
+    private func requestIdentityLoad() -> Task<Void, Never> {
+        identityLoads.start { _ = await self.loadIdentitiesOnce() }
+    }
+
+    @discardableResult
+    private func loadIdentitiesOnce() async -> Bool {
+        guard account?.canSubmit == true, let listed = try? await client.listedIdentities() else { return false }
+        await updateAccount { account in
+            account.identities = listed.map(\.identity)
+            account.hiddenIdentityIDs = listed.filter { !$0.showInCompose }.map(\.id)
+        }
+        return true
+    }
+
+    private func updateAccount(_ change: (inout AccountSnapshot) -> Void) async {
+        guard var snapshot = account else { return }
+        change(&snapshot)
+        snapshot.updatedAt = clock.now
+        account = snapshot
+        await saveAccount()
+    }
+
+    private func saveAccount() async {
+        guard let account, let data = try? JSONEncoder().encode(account) else { return }
+        try? await store.setKeyedData(data, for: AccountSnapshot.storeKey)
+    }
+
+    /// After Replace Token (D18): the client already has the new token. Reads the session, identities and
+    /// account again, reconnects push and sends what waits; the store, drafts and outbox stay.
+    public func tokenChanged() async {
+        let wasPushing = pushTask != nil
+        stopPush()
+        await refreshAccount()
+        if wasPushing { startPush() }
+        outbox.requestFlush()
+        await refresh()
+    }
+
+    // MARK: Network
+
+    /// Follows the network path: when it comes back, push reconnects and waiting mail goes out within
+    /// seconds rather than at the next poll (§2.8).
+    private func startWatchingNetwork() {
+        networkTask?.cancel()
+        let paths = network.paths()
+        networkTask = Task { [weak self] in
+            for await path in paths {
+                guard !Task.isCancelled, let self else { return }
+                self.networkChanged(to: path)
+            }
+        }
+    }
+
+    private func networkChanged(to path: NetworkPath) {
+        let wasOnline = isOnline
+        networkPath = path
+        isOnline = path.isSatisfied
+        if path.isSatisfied, !wasOnline {
+            resumePush()
+            requestRefresh()
+            outbox.requestFlush()
+        } else if wasOnline != path.isSatisfied {
+            outbox.rebuildItems()
+        }
+    }
+
+    // MARK: Background and sign-out
+
+    /// Before the app goes to the background: open composers save on the device and to the server, and the
+    /// outbox gets one quick pass (D8, D35).
+    public func prepareForBackground() async {
+        let end = backgroundActivity.begin("Saving drafts")
+        defer { end() }
+        for composer in openComposers.values { await composer.saveNow() }
+        _ = await outbox.flushNow()
+    }
+
+    /// For background tasks (D35): brings the account up to date, makes one outbox pass and checks due holds,
+    /// whether or not the app's views ever started this model. Returns whether work remains.
+    public func sendPendingMail() async -> Bool {
+        let end = backgroundActivity.begin("Sending mail")
+        defer { end() }
+        await loadStoredAccount()
+        if mailboxes.isEmpty { mailboxes = (try? await store.mailboxes()) ?? [] }
+        if maskedEmails.isEmpty { maskedEmails = (try? await store.maskedEmails()) ?? [] }
+        if networkTask == nil { startWatchingNetwork() }
+        await outbox.start()
+        await refreshAccount()
+        if mailboxes.isEmpty { await loadMailboxes() }
+        return await outbox.flushNow()
+    }
+
+    /// What signing out would delete (D36): messages not sent yet and drafts that exist only here.
+    public func unsentSummary() async -> UnsentSummary {
+        var summary = UnsentSummary(waiting: 0, sending: 0, failed: 0, localOnlyDrafts: 0)
+        for row in (try? await store.drafts()) ?? [] {
+            switch row.state {
+            case .queued: summary.waiting += 1
+            case .submitting, .held: summary.sending += 1
+            case .failed: summary.failed += 1
+            case .editing: if row.hasUnsyncedChanges { summary.localOnlyDrafts += 1 }
+            }
+        }
+        return summary
+    }
+}
+
+/// What signing out would delete (D36).
+public struct UnsentSummary: Sendable, Equatable {
+    public var waiting: Int
+    /// Being sent or held for Undo.
+    public var sending: Int
+    public var failed: Int
+    /// Drafts with changes Fastmail doesn't have.
+    public var localOnlyDrafts: Int
+
+    public init(waiting: Int, sending: Int, failed: Int, localOnlyDrafts: Int) {
+        self.waiting = waiting
+        self.sending = sending
+        self.failed = failed
+        self.localOnlyDrafts = localOnlyDrafts
+    }
+
+    public var isEmpty: Bool {
+        waiting + sending + failed + localOnlyDrafts == 0
+    }
+}
+
+extension MailModel: OutboxHost {
+    var outboxContext: SendContext? {
+        guard let drafts = mailbox(.drafts)?.id, let sent = mailbox(.sent)?.id else { return nil }
+        return SendContext(
+            account: account, directory: senderDirectory,
+            mailboxes: SendMailboxes(drafts: drafts, sent: sent, trash: mailbox(.trash)?.id),
+            policy: outbox.maskedSending)
+    }
+
+    func openComposer(_ id: UUID) -> Composer? {
+        openComposers[id]
+    }
+
+    func outboxReloadIdentities() async -> SenderDirectory? {
+        await loadIdentitiesOnce() ? senderDirectory : nil
+    }
+
+    func outboxCreatedIdentity(_ identity: Identity) async {
+        await updateAccount { account in
+            if !account.identities.contains(where: { $0.id == identity.id }) { account.identities.append(identity) }
+        }
+    }
+
+    func outboxRefusedHold() async {
+        await updateAccount { $0.serverHoldUnsupported = true }
+    }
+
+    func outboxLostSubmissionScope() async {
+        await updateAccount { $0.canSubmit = false }
+    }
+
+    func enqueueTriage(_ updates: [String: PatchObject]) async {
+        guard !updates.isEmpty else { return }
+        do {
+            try await sync.enqueue(updates)
+        } catch {
+            return
+        }
+        await updatePendingChangeCount()
+        await flushPendingChanges()
+    }
+
+    func outboxChangedServer() {
+        requestRefresh()
+    }
+
+    func outboxTokenRejected() {
+        report(JMAPError.unauthorized)
     }
 }
