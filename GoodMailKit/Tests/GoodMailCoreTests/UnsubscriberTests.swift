@@ -116,6 +116,17 @@ struct UnsubscriberTests {
         #expect(record.outcome == "requested")
     }
 
+    @Test func theDemoAccountTakesOneClickRequestsItself() async throws {
+        // The app's demo mode: the demo server answers the newsletter's one-click URL, whose host doesn't resolve.
+        let unsubscriber = Unsubscriber(
+            client: client, store: store, oneClick: server, resolver: FixedHostResolver(["93.184.216.34"]))
+        let offer = try await offer(unsubscriber)
+
+        #expect(await unsubscriber.unsubscribe(offer, using: .oneClick(Self.oneClickURL), from: nil) { _ in } == .requested)
+        #expect(server.oneClickRequests.map(\.url) == [Self.oneClickURL])
+        #expect(server.oneClickRequests.first?.httpBody == Data(ListUnsubscribe.oneClickBody.utf8))
+    }
+
     @Test(arguments: [["192.168.1.10"], ["93.184.216.34", "10.0.0.1"], ["::1"], ["fe80::1%en0"], []])
     func aHostThatResolvesIntoAPrivateNetworkIsRefused(addresses: [String]) async throws {
         resolver.answer = addresses
@@ -127,6 +138,17 @@ struct UnsubscriberTests {
         #expect(outcome == .refusedTarget)
         #expect(oneClick.requests.isEmpty)
         #expect(try await store.unsubscription(listKey: offer.listKey)?.outcome.hasPrefix("failed:") == true)
+    }
+
+    @Test func theSystemResolverAnswersWithNumericAddresses() async throws {
+        let addresses = try await SystemHostResolver().addresses(of: "localhost")
+
+        #expect(!addresses.isEmpty)
+        #expect(Set(addresses).isSubset(of: ["127.0.0.1", "::1"]))
+        #expect(!addresses.contains { UnsubscribeTarget.isPublic(address: $0) })
+        await #expect(throws: HostResolutionError.self) {
+            try await SystemHostResolver().addresses(of: "no-such-host.invalid")
+        }
     }
 
     @Test func aTargetThatIsNoPublicNameIsNeitherResolvedNorAsked() async throws {
