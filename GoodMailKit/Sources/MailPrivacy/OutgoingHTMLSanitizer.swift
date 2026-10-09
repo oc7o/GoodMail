@@ -5,7 +5,8 @@ import Foundation
 ///
 /// It parses loosely and emits strictly: input is tokenised forgivingly, but the output contains only allowlisted
 /// elements and attributes, every text node and attribute value is re-escaped, and tags are balanced by our own
-/// stack. A mis-parse therefore costs fidelity, never safety.
+/// stack. A mis-parse therefore costs fidelity, never safety. Every step is linear in the input, so a hostile
+/// original of several megabytes can't stall a send.
 public enum OutgoingHTMLSanitizer {
     public enum RemoteImages: Sendable {
         case keep
@@ -41,14 +42,31 @@ public enum OutgoingHTMLSanitizer {
         public var removedRemoteImages: Int
         /// A plain-text rendering, for the text/plain alternative of HTML-only content.
         public var text: String
+        /// Where `html` first lacks something the original showed, for each kind of loss, as a UTF-8 offset into
+        /// `html`: inside the start tag of the element that lost a link target or a style, or where removed content
+        /// was. A caller that only cares about part of the document compares offsets.
+        package var firstLoss: [Loss: Int] = [:]
+
+        /// The kinds of loss at or before `offset`.
+        package func losses(through offset: Int) -> Set<Loss> {
+            Set(firstLoss.filter { $0.value <= offset }.keys)
+        }
+    }
+
+    /// What the sanitizer can take away beyond what a reader of its output can see: an image, or anything else
+    /// that changes how the text looks (removed elements, link targets, styles and style sheets).
+    package enum Loss: Sendable, Hashable {
+        case image
+        case content
     }
 
     public static func sanitize(_ html: String, options: Options = Options()) -> Result {
         var state = State(source: Array(html.utf8), options: options)
         state.run()
         return Result(
-            html: state.output, contentIDs: state.contentIDs, removedTrackers: state.trackers,
-            removedRemoteImages: state.remoteImagesRemoved, text: state.plainText())
+            html: String(decoding: state.output, as: UTF8.self), contentIDs: state.contentIDs,
+            removedTrackers: state.trackers, removedRemoteImages: state.remoteImagesRemoved, text: state.plainText(),
+            firstLoss: state.firstLoss)
     }
 
     // MARK: Allowlists
@@ -59,12 +77,21 @@ public enum OutgoingHTMLSanitizer {
         "hr", "i", "img", "ins", "kbd", "li", "mark", "ol", "p", "pre", "q", "s", "samp", "small", "span", "strike",
         "strong", "sub", "sup", "table", "tbody", "td", "tfoot", "th", "thead", "tr", "tt", "u", "ul", "var", "wbr",
     ]
+    /// Elements outside the allowlist that browsers lay out as blocks. They are written as the allowed element
+    /// that looks the same, so their text doesn't run into its neighbours.
+    static let blockSubstitutes: [String: String] = [
+        "article": "div", "aside": "div", "details": "div", "fieldset": "div", "figcaption": "div", "figure": "div",
+        "footer": "div", "form": "div", "header": "div", "hgroup": "div", "legend": "div", "main": "div",
+        "nav": "div", "search": "div", "section": "div", "summary": "div", "dir": "ul", "menu": "ul",
+    ]
     /// Dropped together with everything inside them.
     static let droppedWithContent: Set<String> = [
         "script", "style", "title", "textarea", "iframe", "object", "embed", "applet", "frame", "frameset",
         "noscript", "noembed", "noframes", "template", "svg", "math", "canvas", "audio", "video", "select",
         "button", "xmp", "plaintext",
     ]
+    /// Dropped elements whose content a browser doesn't show anyway; dropping any other one loses something.
+    static let unrendered: Set<String> = ["script", "style", "title", "template", "noembed", "noframes"]
     /// Their content is never markup, so it is skipped up to the matching end tag without tokenising it.
     static let rawText: Set<String> = [
         "script", "style", "textarea", "title", "xmp", "noscript", "noembed", "noframes", "iframe", "plaintext",
@@ -73,8 +100,10 @@ public enum OutgoingHTMLSanitizer {
         "br", "hr", "img", "wbr", "col", "input", "meta", "link", "base", "source", "area", "param", "track", "embed",
         "frame",
     ]
-    /// Elements nested deeper are unwrapped, which bounds the work per tag and the nesting of what we send.
+    /// Elements nested deeper are unwrapped, which bounds the nesting of what we send.
     static let maximumDepth = 256
+    /// Style sheets beyond this size aren't examined; they count as changing everything.
+    static let maximumStyleSheetBytes = 256 * 1024
 
     static let blockElements: Set<String> = [
         "address", "blockquote", "center", "div", "dl", "dd", "dt", "h1", "h2", "h3", "h4", "h5", "h6", "hr", "li",
@@ -92,7 +121,7 @@ public enum OutgoingHTMLSanitizer {
         "td": ["colspan", "rowspan", "nowrap"],
         "th": ["colspan", "rowspan", "nowrap", "scope"],
         "col": ["span"], "colgroup": ["span"],
-        "ol": ["start", "type"], "ul": ["type"], "li": ["value"],
+        "ol": ["start", "type", "reversed"], "ul": ["type"], "li": ["value"],
         "blockquote": ["type"],
     ]
     static let cssProperties: Set<String> = [
@@ -103,16 +132,31 @@ public enum OutgoingHTMLSanitizer {
         "padding-top", "padding-right", "padding-bottom", "padding-left", "border", "border-top", "border-right",
         "border-bottom", "border-left", "border-color", "border-style", "border-width", "border-radius",
         "border-collapse", "border-spacing", "width", "height", "min-width", "max-width", "min-height",
-        "max-height", "display", "list-style-type", "table-layout", "overflow-wrap", "word-break", "word-wrap",
-        "float", "clear",
+        "max-height", "display", "list-style", "list-style-type", "list-style-position", "table-layout",
+        "overflow-wrap", "word-break", "word-wrap", "float", "clear", "visibility", "opacity", "overflow",
+        "overflow-x", "overflow-y",
     ]
     static let displayValues: Set<String> = [
         "block", "inline", "inline-block", "none", "table", "table-row", "table-cell", "list-item",
+    ]
+    /// Declarations whose loss doesn't change how text looks: interaction, printing, rendering hints. Vendor
+    /// (`-webkit-`) and Outlook (`mso-`) extensions count too.
+    static let neutralCSSProperties: Set<String> = [
+        "cursor", "pointer-events", "user-select", "caret-color", "outline", "outline-color", "outline-style",
+        "outline-width", "outline-offset", "resize", "touch-action", "scroll-behavior", "will-change", "transition",
+        "transition-property", "transition-duration", "transition-delay", "transition-timing-function", "orphans",
+        "widows", "page-break-before", "page-break-after", "page-break-inside", "break-before", "break-after",
+        "break-inside", "line-break", "text-size-adjust", "text-rendering", "font-kerning", "font-smoothing",
+        "speak", "color-scheme", "print-color-adjust", "forced-color-adjust", "image-rendering",
     ]
     static let linkSchemes: Set<String> = ["http", "https", "mailto", "tel"]
     static let dataImageTypes = [
         "data:image/png", "data:image/gif", "data:image/jpeg", "data:image/jpg", "data:image/webp",
     ]
+
+    static func isNeutral(property: String) -> Bool {
+        property.hasPrefix("-") || property.hasPrefix("mso-") || neutralCSSProperties.contains(property)
+    }
 
     // MARK: Tokeniser and emitter
 
@@ -120,113 +164,137 @@ public enum OutgoingHTMLSanitizer {
         let source: [UInt8]
         let options: Options
         var position = 0
-        var output = ""
+        var output: [UInt8] = []
         var stack: [String] = []
+        /// Where each open element is in `stack`, so closing or finding one never searches the stack.
+        var openIndices: [String: [Int]] = [:]
         var contentIDs: [String] = []
+        var knownContentIDs: Set<String> = []
         var trackers = 0
         var remoteImagesRemoved = 0
-        var text = ""
+        var text: [UInt8] = []
         var preDepth = 0
         var linkStack: [String?] = []
         /// Elements unwrapped below `maximumDepth`, so their end tags are skipped too.
         var unwrapped: [String] = []
         /// Dropped elements whose end tag the rest of the document lacks; their next start tags need no search.
         var unclosed: Set<String> = []
+        var firstLoss: [Loss: Int] = [:]
+        var styleSheets = ""
+        var reach = StyleSheetReach()
 
         init(source: [UInt8], options: Options) {
             self.source = source
             self.options = options
+            output.reserveCapacity(source.count)
         }
 
         mutating func run() {
+            var textStart = 0
             while position < source.count {
-                if source[position] == UInt8(ascii: "<"), let consumed = tag() {
-                    position = consumed
-                } else {
-                    let start = position
+                guard source[position] == Byte.lessThan, isMarkup(at: position) else {
                     position += 1
-                    while position < source.count, source[position] != UInt8(ascii: "<") { position += 1 }
-                    emitText(source[start..<position])
+                    continue
                 }
+                if textStart < position { emitText(source[textStart..<position]) }
+                position = consumeMarkup()
+                textStart = position
             }
-            while let open = stack.popLast() {
-                output += "</\(open)>"
-                closedForText(open)
+            if textStart < source.count { emitText(source[textStart...]) }
+            close(downTo: 0)
+            if !styleSheets.isEmpty, let offset = reach.firstAffected(by: styleSheets) { lose(.content, at: offset) }
+        }
+
+        /// Whether the "<" at `index` starts a tag, comment or declaration; otherwise it is text.
+        func isMarkup(at index: Int) -> Bool {
+            let next = index + 1
+            guard next < source.count else { return false }
+            switch source[next] {
+            case Byte.exclamationMark, Byte.questionMark: return true
+            case Byte.slash: return next + 1 < source.count && isLetter(source[next + 1])
+            default: return isLetter(source[next])
             }
         }
 
-        /// Consumes the markup construct at `position`; returns the index after it, or nil if "<" is just text.
-        mutating func tag() -> Int? {
+        /// Consumes the markup construct at `position`; returns the index after it.
+        mutating func consumeMarkup() -> Int {
             let next = position + 1
-            guard next < source.count else { return nil }
-            if starts(with: "<!--") {
-                return find("-->", from: position + 4).map { $0 + 3 } ?? source.count
+            if matches(Byte.commentOpen, at: position) {
+                return find(Byte.commentClose, from: position + 4).map { $0 + 3 } ?? source.count
             }
-            if source[next] == UInt8(ascii: "!") || source[next] == UInt8(ascii: "?") {
-                return find(">", from: next).map { $0 + 1 } ?? source.count
+            if source[next] == Byte.exclamationMark || source[next] == Byte.questionMark {
+                return source[next...].firstIndex(of: Byte.greaterThan).map { $0 + 1 } ?? source.count
             }
-            let isEnd = source[next] == UInt8(ascii: "/")
+            let isEnd = source[next] == Byte.slash
             var cursor = isEnd ? next + 1 : next
-            guard cursor < source.count, isLetter(source[cursor]) else { return nil }
             let nameStart = cursor
-            while cursor < source.count, !isSpace(source[cursor]), source[cursor] != UInt8(ascii: ">"),
-                  source[cursor] != UInt8(ascii: "/") {
+            while cursor < source.count, !isSpace(source[cursor]), source[cursor] != Byte.greaterThan,
+                  source[cursor] != Byte.slash {
                 cursor += 1
             }
             let name = String(decoding: source[nameStart..<cursor], as: UTF8.self).lowercased()
             var attributes: [(String, String)] = []
-            while cursor < source.count, source[cursor] != UInt8(ascii: ">") {
-                if isSpace(source[cursor]) || source[cursor] == UInt8(ascii: "/") {
+            while cursor < source.count, source[cursor] != Byte.greaterThan {
+                if isSpace(source[cursor]) || source[cursor] == Byte.slash {
                     cursor += 1
                     continue
                 }
                 let attributeStart = cursor
-                while cursor < source.count, !isSpace(source[cursor]), source[cursor] != UInt8(ascii: "="),
-                      source[cursor] != UInt8(ascii: ">"),
-                      !(source[cursor] == UInt8(ascii: "/") && cursor > attributeStart) {
+                while cursor < source.count, !isSpace(source[cursor]), source[cursor] != Byte.equals,
+                      source[cursor] != Byte.greaterThan,
+                      !(source[cursor] == Byte.slash && cursor > attributeStart) {
                     cursor += 1
                 }
                 let attributeName = String(decoding: source[attributeStart..<cursor], as: UTF8.self).lowercased()
                 while cursor < source.count, isSpace(source[cursor]) { cursor += 1 }
-                var value = ""
-                if cursor < source.count, source[cursor] == UInt8(ascii: "=") {
+                var value: ArraySlice<UInt8> = []
+                if cursor < source.count, source[cursor] == Byte.equals {
                     cursor += 1
                     while cursor < source.count, isSpace(source[cursor]) { cursor += 1 }
-                    if cursor < source.count,
-                       source[cursor] == UInt8(ascii: "\"") || source[cursor] == UInt8(ascii: "'") {
+                    if cursor < source.count, source[cursor] == Byte.quote || source[cursor] == Byte.apostrophe {
                         let quote = source[cursor]
                         let valueStart = cursor + 1
-                        cursor = valueStart
-                        while cursor < source.count, source[cursor] != quote { cursor += 1 }
-                        value = String(decoding: source[valueStart..<min(cursor, source.count)], as: UTF8.self)
+                        cursor = source[valueStart...].firstIndex(of: quote) ?? source.count
+                        value = source[valueStart..<cursor]
                         cursor += 1
                     } else {
                         let valueStart = cursor
-                        while cursor < source.count, !isSpace(source[cursor]), source[cursor] != UInt8(ascii: ">") {
+                        while cursor < source.count, !isSpace(source[cursor]), source[cursor] != Byte.greaterThan {
                             cursor += 1
                         }
-                        value = String(decoding: source[valueStart..<cursor], as: UTF8.self)
+                        value = source[valueStart..<cursor]
                     }
                 }
-                if !attributeName.isEmpty { attributes.append((attributeName, Entities.decode(value))) }
+                if !attributeName.isEmpty {
+                    var decoded: [UInt8] = []
+                    Entities.decode(value, inAttribute: true, into: &decoded)
+                    attributes.append((attributeName, String(decoding: decoded, as: UTF8.self)))
+                }
             }
-            let selfClosing = cursor > 0 && cursor < source.count && source[cursor - 1] == UInt8(ascii: "/")
+            let selfClosing = cursor > 0 && cursor < source.count && source[cursor - 1] == Byte.slash
             let after = min(cursor + 1, source.count)
             if isEnd {
-                if unwrapped.last == name {
+                let element = OutgoingHTMLSanitizer.blockSubstitutes[name] ?? name
+                if unwrapped.last == element {
                     unwrapped.removeLast()
-                } else if name == "br" {
-                    startTag(name, []) // browsers treat </br> as <br>
+                } else if element == "br" {
+                    startTag(element, []) // browsers treat </br> as <br>
                 } else {
-                    endTag(name)
+                    endTag(element)
                 }
                 return after
             }
             if OutgoingHTMLSanitizer.rawText.contains(name) {
                 let end = findCaseInsensitive("</\(name)", from: after) ?? source.count
-                return find(">", from: end).map { $0 + 1 } ?? source.count
+                if name == "style" {
+                    noteStyleSheet(source[after..<end])
+                } else if !OutgoingHTMLSanitizer.unrendered.contains(name) {
+                    lose(.content, at: output.count)
+                }
+                return source[end...].firstIndex(of: Byte.greaterThan).map { $0 + 1 } ?? source.count
             }
             if OutgoingHTMLSanitizer.droppedWithContent.contains(name) {
+                if !OutgoingHTMLSanitizer.unrendered.contains(name) { lose(.content, at: output.count) }
                 if selfClosing || unclosed.contains(name) || OutgoingHTMLSanitizer.voidElements.contains(name) {
                     return after
                 }
@@ -241,73 +309,123 @@ public enum OutgoingHTMLSanitizer {
         // MARK: Elements
 
         mutating func startTag(_ name: String, _ attributes: [(String, String)]) {
-            guard OutgoingHTMLSanitizer.allowedElements.contains(name) else { return } // unwrap unknown elements
-            implicitlyClose(before: name)
-            let isVoid = OutgoingHTMLSanitizer.voidElements.contains(name)
-            if !isVoid, stack.count >= OutgoingHTMLSanitizer.maximumDepth || !unwrapped.isEmpty {
-                unwrapped.append(name)
+            let start = output.count
+            let element = OutgoingHTMLSanitizer.blockSubstitutes[name] ?? name
+            let isAllowed = OutgoingHTMLSanitizer.allowedElements.contains(element)
+            let isVoid = OutgoingHTMLSanitizer.voidElements.contains(element)
+            // Checked before anything else, so an element past the depth limit costs constant time.
+            let isUnwrapped = !isAllowed
+                || (!isVoid && (stack.count >= OutgoingHTMLSanitizer.maximumDepth || !unwrapped.isEmpty))
+            noteForStyleSheets(name, attributes, at: isUnwrapped ? start : start + 1)
+            if isUnwrapped {
+                if isAllowed {
+                    unwrapped.append(element)
+                    lose(.content, at: start)
+                } else if name == "html" || name == "body" {
+                    noteDocumentAttributes(attributes, at: start)
+                } else if Self.rendersSomething(name, attributes) {
+                    lose(.content, at: start)
+                }
                 return
             }
+            implicitlyClose(before: element)
+
             var kept: [(String, String)] = []
-            for (attribute, value) in attributes where !kept.contains(where: { $0.0 == attribute }) {
+            var lost: Set<Loss> = []
+            var seen: Set<String> = [] // a browser uses the first of repeated attributes
+            for (attribute, value) in attributes where seen.insert(attribute).inserted {
                 if attribute == "class" {
                     let classes = value.split(whereSeparator: \.isWhitespace).map(String.init)
                         .filter(options.allowedClasses.contains)
                     if !classes.isEmpty { kept.append((attribute, classes.joined(separator: " "))) }
                     continue
                 }
+                if attribute == "background" { lost.insert(.image) }
                 guard OutgoingHTMLSanitizer.globalAttributes.contains(attribute)
-                        || OutgoingHTMLSanitizer.elementAttributes[name]?.contains(attribute) == true
+                        || OutgoingHTMLSanitizer.elementAttributes[element]?.contains(attribute) == true
                 else { continue }
                 switch attribute {
                 case "href":
-                    if let href = safeLink(value) { kept.append((attribute, href)) }
+                    if let href = safeLink(value) {
+                        kept.append((attribute, href))
+                    } else if !value.allSatisfy(\.isWhitespace) {
+                        lost.insert(.content)
+                    }
                 case "src":
-                    guard let src = imageSource(value, attributes: attributes) else { return } // drops the img
+                    guard let src = imageSource(value, attributes: attributes) else {
+                        lose(.image, at: start)
+                        return // drops the img
+                    }
                     kept.append((attribute, src))
                 case "style":
                     let style = filterStyle(value)
-                    if !style.isEmpty { kept.append((attribute, style)) }
+                    if !style.kept.isEmpty { kept.append((attribute, style.kept)) }
+                    if !style.isComplete { lost.insert(.content) }
                 case "bgcolor", "color":
-                    if value.range(of: #"^#?[0-9a-zA-Z]{1,20}$"#, options: .regularExpression) != nil {
-                        kept.append((attribute, value))
-                    }
+                    if Self.isSimpleColor(value) { kept.append((attribute, value)) } else { lost.insert(.content) }
                 default:
                     if value.count <= 200 { kept.append((attribute, value)) }
                 }
             }
-            if name == "img", !kept.contains(where: { $0.0 == "src" }) { return }
-            output += "<\(name)"
-            for (attribute, value) in kept { output += " \(attribute)=\"\(HTMLEscaping.attribute(value))\"" }
-            output += ">"
-
-            switch name {
-            case "br": text += "\n"
-            case "li": newline(); text += "• "
-            case "img":
-                if let alt = attributes.first(where: { $0.0 == "alt" })?.1, !alt.isEmpty { text += "[\(alt)]" }
-            case "td", "th": text += "\t"
-            case "pre": newline(); preDepth += 1
-            case "a": linkStack.append(kept.first { $0.0 == "href" }?.1)
-            default: if OutgoingHTMLSanitizer.blockElements.contains(name) { newline() }
+            if attributes.contains(where: { $0.0 == "hidden" }) {
+                // The attribute isn't allowlisted, but what it does is: keep the element hidden.
+                if let index = kept.firstIndex(where: { $0.0 == "style" }) {
+                    kept[index].1 += "; display: none"
+                } else {
+                    kept.append(("style", "display: none"))
+                }
             }
-            if !isVoid { stack.append(name) }
+            if element == "img", !kept.contains(where: { $0.0 == "src" }) {
+                lose(.image, at: start)
+                return
+            }
+            emit("<\(element)")
+            for (attribute, value) in kept { emit(" \(attribute)=\"\(HTMLEscaping.attribute(value))\"") }
+            emit(">")
+            for loss in lost { lose(loss, at: start + 1) }
+
+            switch element {
+            case "br": text.append(Byte.lineFeed)
+            case "li":
+                newline()
+                text.append(contentsOf: "• ".utf8)
+            case "img":
+                if let alt = attributes.first(where: { $0.0 == "alt" })?.1, !alt.isEmpty {
+                    text.append(contentsOf: "[\(alt)]".utf8)
+                }
+            case "td", "th": text.append(Byte.tab)
+            case "pre":
+                newline()
+                preDepth += 1
+            case "a": linkStack.append(kept.first { $0.0 == "href" }?.1)
+            default: if OutgoingHTMLSanitizer.blockElements.contains(element) { newline() }
+            }
+            if !isVoid {
+                openIndices[element, default: []].append(stack.count)
+                stack.append(element)
+            }
         }
 
         mutating func endTag(_ name: String) {
-            guard let index = stack.lastIndex(of: name) else { return }
-            for open in stack[index...].reversed() {
-                output += "</\(open)>"
+            guard let index = openIndices[name]?.last else { return }
+            close(downTo: index)
+        }
+
+        /// Closes every open element from the top of the stack down to `index`.
+        mutating func close(downTo index: Int) {
+            while stack.count > index {
+                let open = stack.removeLast()
+                openIndices[open]?.removeLast()
+                emit("</\(open)>")
                 closedForText(open)
             }
-            stack.removeSubrange(index...)
         }
 
         mutating func closedForText(_ name: String) {
             if name == "pre" { preDepth = max(0, preDepth - 1) }
             if name == "a", let href = linkStack.popLast() ?? nil {
                 let shown = href.hasPrefix("mailto:") ? String(href.dropFirst(7)) : href
-                if !text.hasSuffix(shown) { text += " <\(href)>" }
+                if !text.ends(with: shown.utf8) { text.append(contentsOf: " <\(href)>".utf8) }
             }
             if OutgoingHTMLSanitizer.blockElements.contains(name) { newline() }
         }
@@ -316,15 +434,6 @@ public enum OutgoingHTMLSanitizer {
         /// previous <li>, table cells and rows close their siblings, and links don't nest. Without them our output
         /// would nest what the original parser treated as siblings.
         mutating func implicitlyClose(before name: String) {
-            func closeIfOpen(_ target: Set<String>, stoppingAt boundaries: Set<String>) {
-                for open in stack.reversed() {
-                    if boundaries.contains(open) { return }
-                    if target.contains(open) {
-                        endTag(open)
-                        return
-                    }
-                }
-            }
             if OutgoingHTMLSanitizer.blockElements.contains(name) {
                 closeIfOpen(["p"], stoppingAt: ["td", "th", "li", "blockquote", "div", "table"])
             }
@@ -338,26 +447,94 @@ public enum OutgoingHTMLSanitizer {
             }
         }
 
+        /// Closes the innermost open element of `targets` unless one of `boundaries` is open inside it.
+        mutating func closeIfOpen(_ targets: [String], stoppingAt boundaries: [String]) {
+            var target = -1
+            for name in targets { target = max(target, openIndices[name]?.last ?? -1) }
+            guard target >= 0 else { return }
+            for name in boundaries where openIndices[name]?.last ?? -1 > target { return }
+            close(downTo: target)
+        }
+
         /// The index after the end tag that closes `name`, counting nested elements of the same name.
         func matchingEnd(of name: String, from start: Int) -> Int? {
             var depth = 1
             var cursor = start
-            while let lessThan = find("<", from: cursor) {
+            while let lessThan = source[min(cursor, source.count)...].firstIndex(of: Byte.lessThan) {
                 var index = lessThan + 1
-                let isEnd = index < source.count && source[index] == UInt8(ascii: "/")
+                let isEnd = index < source.count && source[index] == Byte.slash
                 if isEnd { index += 1 }
                 let nameStart = index
                 while index < source.count, isLetter(source[index]) || isDigit(source[index]) { index += 1 }
-                let tagName = String(decoding: source[nameStart..<index], as: UTF8.self).lowercased()
-                guard let greaterThan = find(">", from: index) else { return nil }
-                if tagName == name {
-                    let selfClosing = source[greaterThan - 1] == UInt8(ascii: "/")
+                guard let greaterThan = source[index...].firstIndex(of: Byte.greaterThan) else { return nil }
+                if index - nameStart == name.utf8.count,
+                   String(decoding: source[nameStart..<index], as: UTF8.self).lowercased() == name {
+                    let selfClosing = source[greaterThan - 1] == Byte.slash
                     if isEnd { depth -= 1 } else if !selfClosing { depth += 1 }
                     if depth == 0 { return greaterThan + 1 }
                 }
                 cursor = greaterThan + 1
             }
             return nil
+        }
+
+        // MARK: Losses
+
+        mutating func lose(_ loss: Loss, at offset: Int) {
+            firstLoss[loss] = min(firstLoss[loss] ?? offset, offset)
+        }
+
+        mutating func noteForStyleSheets(_ name: String, _ attributes: [(String, String)], at offset: Int) {
+            let classes = attributes.first { $0.0 == "class" }?.1.split(whereSeparator: \.isWhitespace) ?? []
+            reach.record(element: name, classes: classes, id: attributes.first { $0.0 == "id" }?.1, at: offset)
+        }
+
+        mutating func noteStyleSheet(_ bytes: ArraySlice<UInt8>) {
+            guard styleSheets.utf8.count + bytes.count <= OutgoingHTMLSanitizer.maximumStyleSheetBytes else {
+                lose(.content, at: 0)
+                return
+            }
+            styleSheets += String(decoding: bytes, as: UTF8.self) + "\n"
+        }
+
+        /// <html> and <body> are unwrapped; colours, fonts and backgrounds they set for the whole document go with
+        /// them. Margins and wrapping rules don't change the text.
+        mutating func noteDocumentAttributes(_ attributes: [(String, String)], at offset: Int) {
+            for (name, value) in attributes {
+                let squashed = value.lowercased().filter { !$0.isWhitespace }
+                switch name {
+                case "background": lose(.image, at: offset)
+                case "bgcolor": if !Self.white.contains(squashed) { lose(.content, at: offset) }
+                case "text": if !Self.black.contains(squashed) { lose(.content, at: offset) }
+                case "link", "vlink", "alink": lose(.content, at: offset)
+                case "style":
+                    for (property, value) in Self.declarations(value) where !Self.isNeutralForDocument(property, value) {
+                        lose(.content, at: offset)
+                    }
+                default: break
+                }
+            }
+        }
+
+        /// Whether an element we unwrap showed something of its own: a form field, hidden content (now shown), or
+        /// a style (now gone).
+        static func rendersSomething(_ name: String, _ attributes: [(String, String)]) -> Bool {
+            if name == "input" { return attributes.first { $0.0 == "type" }?.1.lowercased() != "hidden" }
+            return attributes.contains { attribute, value in
+                attribute == "hidden"
+                    || (attribute == "style" && declarations(value).contains { !OutgoingHTMLSanitizer.isNeutral(property: $0.property) })
+            }
+        }
+
+        static let white: Set<String> = ["#fff", "#ffffff", "white", "rgb(255,255,255)", "transparent"]
+        static let black: Set<String> = ["#000", "#000000", "black", "rgb(0,0,0)", "windowtext"]
+
+        static func isNeutralForDocument(_ property: String, _ value: String) -> Bool {
+            let squashed = value.lowercased().filter { !$0.isWhitespace }
+            return OutgoingHTMLSanitizer.isNeutral(property: property) || property.hasPrefix("margin")
+                || property.hasPrefix("padding") || ["overflow-wrap", "word-wrap", "word-break"].contains(property)
+                || (["background", "background-color"].contains(property) && white.contains(squashed))
+                || (property == "color" && black.contains(squashed))
         }
 
         // MARK: Attribute values
@@ -383,7 +560,7 @@ public enum OutgoingHTMLSanitizer {
                 let id = String(trimmed.dropFirst(4))
                 let cid = id.removingPercentEncoding ?? id
                 guard !cid.isEmpty else { return nil }
-                if !contentIDs.contains(cid) { contentIDs.append(cid) }
+                if knownContentIDs.insert(cid).inserted { contentIDs.append(cid) }
                 return trimmed
             }
             if lower.hasPrefix("data:") {
@@ -417,66 +594,99 @@ public enum OutgoingHTMLSanitizer {
             return isBase64 ? payload.utf8.count / 4 * 3 : payload.utf8.count
         }
 
-        func filterStyle(_ style: String) -> String {
-            var kept: [String] = []
-            for declaration in style.split(separator: ";") {
+        /// A colour name or hex value: "#336699", "red".
+        static func isSimpleColor(_ value: String) -> Bool {
+            let digits = value.hasPrefix("#") ? value.dropFirst() : Substring(value)
+            return (1...20).contains(digits.count) && digits.allSatisfy { $0.isASCII && ($0.isLetter || $0.isNumber) }
+        }
+
+        static func declarations(_ style: String) -> [(property: String, value: String)] {
+            style.split(separator: ";").compactMap { declaration in
                 let pair = declaration.split(separator: ":", maxSplits: 1)
-                guard pair.count == 2 else { continue }
+                guard pair.count == 2 else { return nil }
                 let property = pair[0].trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
                 let value = pair[1].trimmingCharacters(in: .whitespacesAndNewlines)
+                return value.isEmpty ? nil : (property, value)
+            }
+        }
+
+        /// The declarations we keep, and whether those are all that changed how the element looks.
+        func filterStyle(_ style: String) -> (kept: String, isComplete: Bool) {
+            var kept: [String] = []
+            var isComplete = true
+            for (property, value) in Self.declarations(style) {
                 let squashed = value.lowercased().filter { !$0.isWhitespace }
-                guard OutgoingHTMLSanitizer.cssProperties.contains(property), !value.isEmpty,
+                guard OutgoingHTMLSanitizer.cssProperties.contains(property),
                       !squashed.contains("url("), !squashed.contains("expression("),
                       !squashed.contains("javascript:"), !squashed.contains("image-set("),
                       !squashed.contains("@import"), !value.contains("\\"), !value.contains("<"),
-                      !value.contains("/*"), value.count <= 300
-                else { continue }
-                if property == "display", !OutgoingHTMLSanitizer.displayValues.contains(squashed) { continue }
+                      !value.contains("/*"), value.count <= 300,
+                      property != "display" || OutgoingHTMLSanitizer.displayValues.contains(squashed)
+                else {
+                    if !OutgoingHTMLSanitizer.isNeutral(property: property) { isComplete = false }
+                    continue
+                }
                 kept.append("\(property): \(value)")
             }
-            return kept.joined(separator: "; ")
+            return (kept.joined(separator: "; "), isComplete)
         }
 
         // MARK: Text
 
         mutating func emitText(_ bytes: ArraySlice<UInt8>) {
-            let decoded = Entities.decode(String(decoding: bytes, as: UTF8.self))
-            output += HTMLEscaping.text(decoded)
+            var decoded: [UInt8] = []
+            decoded.reserveCapacity(bytes.count)
+            Entities.decode(bytes, inAttribute: false, into: &decoded)
+            HTMLEscaping.appendText(decoded, to: &output)
             if preDepth > 0 {
-                text += decoded
-            } else {
-                let collapsed = decoded.replacingOccurrences(
-                    of: #"[ \t\r\n\f]+"#, with: " ", options: .regularExpression)
-                if collapsed == " " && (text.isEmpty || text.hasSuffix("\n") || text.hasSuffix(" ")) { return }
-                text += (text.isEmpty || text.hasSuffix("\n")) ? String(collapsed.drop { $0 == " " }) : collapsed
+                text.append(contentsOf: decoded)
+                return
             }
+            // HTML's whitespace collapses to one space, and to nothing at the start of a line.
+            var pendingSpace = false
+            for byte in decoded {
+                if isSpace(byte) {
+                    pendingSpace = true
+                    continue
+                }
+                if pendingSpace { appendSpace() }
+                pendingSpace = false
+                text.append(byte)
+            }
+            if pendingSpace { appendSpace() }
+        }
+
+        mutating func appendSpace() {
+            if let last = text.last, last != Byte.space, last != Byte.lineFeed { text.append(Byte.space) }
         }
 
         mutating func newline() {
-            while text.hasSuffix(" ") { text.removeLast() }
-            if !text.isEmpty && !text.hasSuffix("\n") { text += "\n" }
+            while text.last == Byte.space { text.removeLast() }
+            if let last = text.last, last != Byte.lineFeed { text.append(Byte.lineFeed) }
         }
 
         func plainText() -> String {
-            text.replacingOccurrences(of: "\u{00A0}", with: " ")
+            String(decoding: text, as: UTF8.self).replacingOccurrences(of: "\u{00A0}", with: " ")
                 .replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
                 .trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
-        // MARK: Scanning helpers
-
-        func starts(with string: String) -> Bool {
-            let bytes = Array(string.utf8)
-            guard position + bytes.count <= source.count else { return false }
-            return Array(source[position..<position + bytes.count]) == bytes
+        mutating func emit(_ string: String) {
+            output.append(contentsOf: string.utf8)
         }
 
-        func find(_ string: String, from start: Int) -> Int? {
-            let bytes = Array(string.utf8)
-            guard !bytes.isEmpty, start < source.count else { return nil }
+        // MARK: Scanning helpers
+
+        func matches(_ bytes: [UInt8], at index: Int) -> Bool {
+            guard index + bytes.count <= source.count else { return false }
+            for offset in bytes.indices where source[index + offset] != bytes[offset] { return false }
+            return true
+        }
+
+        func find(_ bytes: [UInt8], from start: Int) -> Int? {
             var index = start
             while index + bytes.count <= source.count {
-                if source[index] == bytes[0], Array(source[index..<index + bytes.count]) == bytes { return index }
+                if source[index] == bytes[0], matches(bytes, at: index) { return index }
                 index += 1
             }
             return nil
@@ -504,62 +714,57 @@ public enum OutgoingHTMLSanitizer {
             byte == 0x20 || byte == 0x09 || byte == 0x0A || byte == 0x0C || byte == 0x0D
         }
     }
+
+    enum Byte {
+        static let lessThan = UInt8(ascii: "<")
+        static let greaterThan = UInt8(ascii: ">")
+        static let slash = UInt8(ascii: "/")
+        static let exclamationMark = UInt8(ascii: "!")
+        static let questionMark = UInt8(ascii: "?")
+        static let equals = UInt8(ascii: "=")
+        static let quote = UInt8(ascii: "\"")
+        static let apostrophe = UInt8(ascii: "'")
+        static let space = UInt8(ascii: " ")
+        static let tab = UInt8(ascii: "\t")
+        static let lineFeed = UInt8(ascii: "\n")
+        static let commentOpen = Array("<!--".utf8)
+        static let commentClose = Array("-->".utf8)
+    }
+}
+
+extension Array where Element == UInt8 {
+    func ends(with suffix: String.UTF8View) -> Bool {
+        count >= suffix.count && self[(count - suffix.count)...].elementsEqual(suffix)
+    }
 }
 
 /// Escaping for HTML this package writes itself.
 package enum HTMLEscaping {
     package static func text(_ value: String) -> String {
-        guard value.contains(where: { $0 == "&" || $0 == "<" || $0 == ">" }) else { return value }
-        return value.replacingOccurrences(of: "&", with: "&amp;")
-            .replacingOccurrences(of: "<", with: "&lt;")
-            .replacingOccurrences(of: ">", with: "&gt;")
+        guard value.utf8.contains(where: { $0 == 0x26 || $0 == 0x3C || $0 == 0x3E }) else { return value }
+        var output: [UInt8] = []
+        appendText(value.utf8, to: &output)
+        return String(decoding: output, as: UTF8.self)
     }
 
     package static func attribute(_ value: String) -> String {
-        text(value).replacingOccurrences(of: "\"", with: "&quot;")
+        guard value.utf8.contains(where: { $0 == 0x26 || $0 == 0x3C || $0 == 0x3E || $0 == 0x22 }) else { return value }
+        var output: [UInt8] = []
+        appendText(value.utf8, escapingQuotes: true, to: &output)
+        return String(decoding: output, as: UTF8.self)
     }
-}
 
-/// HTML character references: numeric ones and the named ones that matter in mail.
-package enum Entities {
-    static let named: [String: String] = [
-        "amp": "&", "lt": "<", "gt": ">", "quot": "\"", "apos": "'", "nbsp": "\u{00A0}", "copy": "©", "reg": "®",
-        "trade": "™", "hellip": "…", "mdash": "—", "ndash": "–", "lsquo": "‘", "rsquo": "’", "ldquo": "“",
-        "rdquo": "”", "bull": "•", "middot": "·", "euro": "€", "pound": "£", "yen": "¥", "cent": "¢", "deg": "°",
-        "times": "×", "divide": "÷", "laquo": "«", "raquo": "»", "auml": "ä", "ouml": "ö", "uuml": "ü",
-        "Auml": "Ä", "Ouml": "Ö", "Uuml": "Ü", "szlig": "ß", "eacute": "é", "egrave": "è", "aacute": "á",
-        "agrave": "à", "ccedil": "ç", "ntilde": "ñ", "oslash": "ø", "aring": "å", "aelig": "æ",
-        "zwnj": "\u{200C}", "zwj": "\u{200D}", "shy": "\u{00AD}", "tab": "\t", "newline": "\n",
-    ]
-
-    package static func decode(_ string: String) -> String {
-        guard string.contains("&") else { return string }
-        var output = ""
-        var index = string.startIndex
-        while index < string.endIndex {
-            let character = string[index]
-            guard character == "&", let semicolon = string[index...].prefix(40).firstIndex(of: ";") else {
-                output.append(character)
-                index = string.index(after: index)
-                continue
-            }
-            let name = string[string.index(after: index)..<semicolon]
-            var replacement: String?
-            if name.hasPrefix("#x") || name.hasPrefix("#X") {
-                replacement = UInt32(name.dropFirst(2), radix: 16).flatMap(Unicode.Scalar.init).map { String($0) }
-            } else if name.hasPrefix("#") {
-                replacement = UInt32(name.dropFirst(1)).flatMap(Unicode.Scalar.init).map { String($0) }
-            } else {
-                replacement = named[String(name)]
-            }
-            if let replacement {
-                output += replacement
-                index = string.index(after: semicolon)
-            } else {
-                output.append(character)
-                index = string.index(after: index)
+    static func appendText(
+        _ bytes: some Sequence<UInt8>, escapingQuotes: Bool = false, to output: inout [UInt8]
+    ) {
+        for byte in bytes {
+            switch byte {
+            case 0x26: output.append(contentsOf: "&amp;".utf8)
+            case 0x3C: output.append(contentsOf: "&lt;".utf8)
+            case 0x3E: output.append(contentsOf: "&gt;".utf8)
+            case 0x22 where escapingQuotes: output.append(contentsOf: "&quot;".utf8)
+            default: output.append(byte)
             }
         }
-        return output
     }
 }
