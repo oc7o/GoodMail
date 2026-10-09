@@ -25,6 +25,16 @@ public final class DemoTransport: HTTPTransport {
         var isOffline = false
         var rejectedEmailIDs: Set<String> = []
         var updateRequestCount = 0
+        var downloadCount = 0
+
+        func knows(blobId: String) -> Bool {
+            emails.contains { email in
+                guard case .array(let parts)? = email["attachments"] else { return false }
+                return parts.contains { part in
+                    if case .object(let part) = part { part["blobId"] == .string(blobId) } else { false }
+                }
+            }
+        }
 
         mutating func record(_ id: String, _ kind: Change.Kind) {
             state += 1
@@ -67,6 +77,11 @@ public final class DemoTransport: HTTPTransport {
         store.withLock { $0.updateRequestCount }
     }
 
+    /// How many blobs have been downloaded.
+    public var downloadCount: Int {
+        store.withLock { $0.downloadCount }
+    }
+
     /// Delivers a new plain-text message, as if someone had just sent it.
     public func deliver(id: String, threadId: String, from: String, subject: String, text: String, to mailboxId: String = "inbox") {
         store.withLock { store in
@@ -100,6 +115,12 @@ public final class DemoTransport: HTTPTransport {
         if url.path().hasSuffix("/session") {
             body = Data(DemoData.session.utf8)
         } else if url.path().contains("/download/") {
+            // Path: /jmap/download/{accountId}/{blobId}/{name}
+            let blobId = url.pathComponents.dropFirst(4).first ?? ""
+            guard store.withLock({ $0.knows(blobId: blobId) }) else {
+                return (Data(), HTTPURLResponse(url: url, statusCode: 404, httpVersion: "HTTP/1.1", headerFields: nil)!)
+            }
+            store.withLock { $0.downloadCount += 1 }
             body = Data(DemoData.logo.utf8)
             contentType = "image/svg+xml"
         } else {

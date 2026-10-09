@@ -62,6 +62,21 @@ public struct Email: QueryableObject, Equatable, Encodable {
         return email
     }
 
+    /// The images the HTML body refers to with `cid:` URLs, one per blob.
+    public var inlineImageParts: [EmailBodyPart] {
+        var seen = Set<String>()
+        return ((attachments ?? []) + (htmlBody ?? [])).filter { part in
+            guard part.cid != nil, part.type?.lowercased().hasPrefix("image/") == true, let blobId = part.blobId
+            else { return false }
+            return seen.insert(blobId).inserted
+        }
+    }
+
+    /// The image a `cid:` URL in the HTML body refers to.
+    public func inlineImagePart(cid: String) -> EmailBodyPart? {
+        inlineImageParts.first { $0.cid == cid }
+    }
+
     /// This email with the keywords and mailboxes of `other`: the only properties that ever change
     /// after delivery (RFC 8621 §4), so a stored body stays valid forever.
     public func withFlags(of other: Email) -> Email {

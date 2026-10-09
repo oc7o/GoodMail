@@ -115,6 +115,29 @@ struct MailSyncTests {
         #expect(try await store.threads(matching: .init(search: SearchQuery(parsing: "early check-in")), limit: 5).map(\.id) == ["t1"])
     }
 
+    @Test func prefetchKeepsInlineImagesOfRecentMailForOfflineReading() async throws {
+        _ = try await inbox(position: 0, limit: 50)
+        while try await sync.prefetchBodies() > 0 {}
+
+        #expect(try await sync.prefetchInlineImages(cacheLimit: 400) == 0)
+        #expect(try await sync.prefetchInlineImages() == 1)
+        #expect(try await sync.prefetchInlineImages() == 0)
+
+        #expect(server.downloadCount == 1)
+        let logo = try #require(try await store.inlineImageData(blobId: "e5-logo"))
+        #expect(String(decoding: logo, as: UTF8.self).contains("Northwind"))
+    }
+
+    @Test func imagesTheServerNoLongerHasAreNotAskedForAgain() async throws {
+        _ = try await inbox(position: 0, limit: 50)
+        while try await sync.prefetchBodies() > 0 {}
+        server.destroyEmail(id: "e5")
+
+        #expect(try await sync.prefetchInlineImages() == 0)
+        #expect(try await store.missingInlineImages(amongNewest: 200, maxSize: .max, limit: 10).isEmpty)
+        #expect(server.downloadCount == 0)
+    }
+
     private func storedMailboxes(of id: String) async throws -> [String: Bool]? {
         try await store.emails(ids: [id]).first?.mailboxIds
     }

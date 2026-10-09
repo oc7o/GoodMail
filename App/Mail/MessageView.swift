@@ -32,7 +32,7 @@ struct MessageView: View {
                     privacyBar(rendered)
                     Divider()
                     MessageWebView(html: rendered.html, policy: policy, height: $height) { cid in
-                        await inlineImage(cid)
+                        await model.inlineImage(cid: cid, in: email).map { ($0.data, $0.type) }
                     }
                     .frame(height: height)
                 }
@@ -149,15 +149,6 @@ struct MessageView: View {
                 .padding(12)
             }
         }
-    }
-
-    private func inlineImage(_ cid: String) async -> (data: Data, mimeType: String)? {
-        let parts = (email.attachments ?? []) + (email.htmlBody ?? [])
-        guard let part = parts.first(where: { $0.cid == cid }), let blobId = part.blobId,
-              let type = part.type, type.hasPrefix("image/"),
-              let data = try? await model.client.download(blobId: blobId, type: type, name: part.name ?? "image")
-        else { return nil }
-        return (data, type)
     }
 }
 

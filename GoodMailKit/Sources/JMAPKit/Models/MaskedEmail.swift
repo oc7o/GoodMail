@@ -3,7 +3,7 @@ import Foundation
 /// Fastmail's Masked Email: a unique forwarding address per site.
 ///
 /// See https://www.fastmail.com/developer/maskedemail/
-public struct MaskedEmail: SettableObject, Equatable {
+public struct MaskedEmail: SettableObject, Encodable, Equatable {
     public static let typeName = "MaskedEmail"
     public static let capability = Capability.maskedEmail
 

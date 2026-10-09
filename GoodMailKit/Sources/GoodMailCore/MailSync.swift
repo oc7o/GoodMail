@@ -112,6 +112,34 @@ public struct MailSync: Sendable {
         return emails.count
     }
 
+    /// Images larger than this are only downloaded when their message is opened.
+    public static let maxPrefetchedImageSize = 2 << 20
+
+    /// Downloads inline images of recent emails whose body is stored, as far as they fit into the
+    /// image cache without evicting anything. Returns how many were stored.
+    public func prefetchInlineImages(
+        amongNewest window: Int = 200, limit: Int = 10, cacheLimit: Int = MailStore.inlineImageCacheLimit
+    ) async throws -> Int {
+        let room = cacheLimit - (try await store.inlineImageBytes())
+        let images = try await store.missingInlineImages(
+            amongNewest: window, maxSize: min(room, Self.maxPrefetchedImageSize), limit: limit)
+        var stored = 0
+        var used = 0
+        for image in images where used + (image.size ?? 0) <= room {
+            let data: Data
+            do {
+                data = try await client.download(blobId: image.blobId, type: image.type, name: "image")
+            } catch let error as JMAPError where !error.isTemporary && error != .unauthorized {
+                try await store.forgetInlineImage(blobId: image.blobId)
+                continue
+            }
+            try await store.storeInlineImageData(data, blobId: image.blobId)
+            used += data.count
+            stored += 1
+        }
+        return stored
+    }
+
     // MARK: Outbox
 
     public struct FlushResult: Sendable, Equatable {

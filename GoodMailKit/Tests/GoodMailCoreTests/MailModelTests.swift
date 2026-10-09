@@ -185,7 +185,31 @@ struct MailModelTests {
         #expect(model.threads.map(\.id) == ["t6"])
     }
 
+    @Test func maskedEmailsShowOfflineFromTheStore() async {
+        _ = await started()
+        server.isOffline = true
+
+        let relaunched = Self.makeModel(server: server, store: store)
+        await relaunched.start()
+
+        #expect(relaunched.maskedEmails.count == 6)
+        #expect(relaunched.connectionProblem != nil)
+    }
+
     // MARK: Stored mail
+
+    @Test func inlineImagesAreDownloadedOnceAndShownOffline() async throws {
+        let model = await started()
+        let invoice = try #require(try await model.fetchEmails(inThread: "t3").first { $0.id == "e5" })
+
+        let logo = await model.inlineImage(cid: "logo@northwind.example", in: invoice)
+        #expect(logo?.type == "image/svg+xml")
+        #expect(await model.inlineImage(cid: "unknown@northwind.example", in: invoice) == nil)
+
+        server.isOffline = true
+        #expect(await model.inlineImage(cid: "logo@northwind.example", in: invoice)?.data == logo?.data)
+        #expect(server.downloadCount == 1)
+    }
 
     @Test func nextLaunchWorksOfflineFromTheStore() async throws {
         let model = await started()

@@ -132,6 +132,34 @@ public final class MailStore: Sendable {
                 CREATE INDEX pendingChange_emailId ON pendingChange(emailId);
                 """)
         }
+        migrator.registerMigration("v4") { db in
+            // inlineImage lists what stored bodies refer to; inlineImageData holds what was downloaded.
+            try db.execute(sql: """
+                CREATE TABLE inlineImage (
+                    emailId TEXT NOT NULL REFERENCES email(id) ON DELETE CASCADE,
+                    blobId TEXT NOT NULL,
+                    type TEXT NOT NULL,
+                    size INTEGER,
+                    PRIMARY KEY (emailId, blobId)
+                ) WITHOUT ROWID;
+                CREATE INDEX inlineImage_blobId ON inlineImage(blobId);
+                CREATE TABLE inlineImageData (
+                    blobId TEXT PRIMARY KEY,
+                    size INTEGER NOT NULL,
+                    lastUsed DOUBLE NOT NULL,
+                    data BLOB NOT NULL
+                );
+                CREATE TABLE maskedEmail (
+                    id TEXT PRIMARY KEY,
+                    position INTEGER NOT NULL,
+                    json BLOB NOT NULL
+                );
+                """)
+            let decoder = JMAPCoding.makeDecoder()
+            for body in try Data.fetchAll(db, sql: "SELECT body FROM email WHERE body IS NOT NULL") {
+                try recordInlineImages(of: decoder.decode(Email.self, from: body), db)
+            }
+        }
         return migrator
     }
 
@@ -189,6 +217,7 @@ public final class MailStore: Sendable {
                         email.hasBody ? try encoder.encode(email) : nil,
                     ])
                 try Self.storeMailboxes(of: email, db)
+                if email.hasBody { try Self.recordInlineImages(of: email, db) }
 
                 if isNew || email.hasBody {
                     let rowid = try Int64.fetchOne(db, sql: "SELECT rowid FROM email WHERE id = ?", arguments: [email.id])!
@@ -202,6 +231,14 @@ public final class MailStore: Sendable {
         try db.execute(sql: "DELETE FROM emailMailbox WHERE emailId = ?", arguments: [email.id])
         for mailboxId in (email.mailboxIds ?? [:]).keys {
             try db.execute(sql: "INSERT INTO emailMailbox (mailboxId, emailId) VALUES (?, ?)", arguments: [mailboxId, email.id])
+        }
+    }
+
+    private static func recordInlineImages(of email: Email, _ db: Database) throws {
+        for part in email.inlineImageParts {
+            try db.execute(
+                sql: "INSERT OR IGNORE INTO inlineImage (emailId, blobId, type, size) VALUES (?, ?, ?, ?)",
+                arguments: [email.id, part.blobId, part.type, part.size])
         }
     }
 
@@ -224,6 +261,7 @@ public final class MailStore: Sendable {
                 try db.execute(sql: "DELETE FROM email WHERE id = ?", arguments: [id])
                 try db.execute(sql: "DELETE FROM pendingChange WHERE emailId = ?", arguments: [id])
             }
+            try Self.dropUnreferencedImageData(db)
         }
     }
 
@@ -270,6 +308,7 @@ public final class MailStore: Sendable {
     public func resetEmails() async throws {
         try await writer.write { db in
             try db.execute(sql: "DELETE FROM emailText; DELETE FROM email; DELETE FROM meta")
+            try Self.dropUnreferencedImageData(db)
         }
     }
 
@@ -511,6 +550,102 @@ public final class MailStore: Sendable {
     private static func pendingPatches(for emailId: String, _ db: Database) throws -> [PatchObject] {
         try Data.fetchAll(db, sql: "SELECT patch FROM pendingChange WHERE emailId = ? ORDER BY seq", arguments: [emailId])
             .map { try JSONDecoder().decode(PatchObject.self, from: $0) }
+    }
+
+    // MARK: Inline images
+
+    /// An image that a stored message body shows, as listed in its body structure.
+    public struct InlineImage: Sendable, Hashable {
+        public let blobId: String
+        public let type: String
+        public let size: Int?
+    }
+
+    /// How many bytes of downloaded inline images to keep.
+    public static let inlineImageCacheLimit = 200 << 20
+
+    /// A downloaded image, marked as just used so that it is evicted last.
+    public func inlineImageData(blobId: String) async throws -> Data? {
+        try await writer.write { db in
+            try db.execute(
+                sql: "UPDATE inlineImageData SET lastUsed = ? WHERE blobId = ?",
+                arguments: [Date().timeIntervalSince1970, blobId])
+            return try Data.fetchOne(db, sql: "SELECT data FROM inlineImageData WHERE blobId = ?", arguments: [blobId])
+        }
+    }
+
+    /// Keeps a downloaded image. With `limit`, the least recently used images are evicted until the
+    /// rest takes at most that many bytes; an image larger than that isn't kept at all.
+    public func storeInlineImageData(_ data: Data, blobId: String, evictingBeyond limit: Int? = nil) async throws {
+        if let limit, data.count > limit { return }
+        try await writer.write { db in
+            try db.execute(
+                sql: "INSERT OR REPLACE INTO inlineImageData (blobId, size, lastUsed, data) VALUES (?, ?, ?, ?)",
+                arguments: [blobId, data.count, Date().timeIntervalSince1970, data])
+            guard let limit else { return }
+            try db.execute(sql: """
+                DELETE FROM inlineImageData WHERE blobId IN (
+                    SELECT blobId FROM (
+                        SELECT blobId, SUM(size) OVER (ORDER BY lastUsed DESC, blobId) AS kept FROM inlineImageData)
+                    WHERE kept > ?)
+                """, arguments: [limit])
+        }
+    }
+
+    /// Bytes taken by downloaded inline images.
+    public func inlineImageBytes() async throws -> Int {
+        try await writer.read { db in
+            try Int.fetchOne(db, sql: "SELECT COALESCE(SUM(size), 0) FROM inlineImageData") ?? 0
+        }
+    }
+
+    /// Images of the `window` newest emails that aren't downloaded yet, newest email first. Images of
+    /// unknown size or larger than `maxSize` bytes are left out.
+    public func missingInlineImages(amongNewest window: Int, maxSize: Int, limit: Int) async throws -> [InlineImage] {
+        try await writer.read { db in
+            try Row.fetchAll(db, sql: """
+                SELECT i.blobId, i.type, i.size, MAX(e.receivedAt) AS newest
+                FROM (SELECT id, receivedAt FROM email ORDER BY receivedAt DESC LIMIT ?) e
+                JOIN inlineImage i ON i.emailId = e.id
+                WHERE i.size <= ? AND NOT EXISTS (SELECT 1 FROM inlineImageData d WHERE d.blobId = i.blobId)
+                GROUP BY i.blobId ORDER BY newest DESC, i.blobId LIMIT ?
+                """, arguments: [window, maxSize, limit]
+            ).map { InlineImage(blobId: $0["blobId"], type: $0["type"], size: $0["size"]) }
+        }
+    }
+
+    /// Stops listing an image as missing, e.g. because the server can't provide it. It is listed again
+    /// if a body referring to it is stored again.
+    public func forgetInlineImage(blobId: String) async throws {
+        try await writer.write { db in
+            try db.execute(sql: "DELETE FROM inlineImage WHERE blobId = ?", arguments: [blobId])
+        }
+    }
+
+    private static func dropUnreferencedImageData(_ db: Database) throws {
+        try db.execute(sql: "DELETE FROM inlineImageData WHERE blobId NOT IN (SELECT blobId FROM inlineImage)")
+    }
+
+    // MARK: Masked Email
+
+    public func maskedEmails() async throws -> [MaskedEmail] {
+        try await writer.read { db in
+            let decoder = JMAPCoding.makeDecoder()
+            return try Data.fetchAll(db, sql: "SELECT json FROM maskedEmail ORDER BY position")
+                .map { try decoder.decode(MaskedEmail.self, from: $0) }
+        }
+    }
+
+    public func replaceMaskedEmails(_ maskedEmails: [MaskedEmail]) async throws {
+        try await writer.write { db in
+            let encoder = JMAPCoding.makeEncoder()
+            try db.execute(sql: "DELETE FROM maskedEmail")
+            for (position, masked) in maskedEmails.enumerated() {
+                try db.execute(
+                    sql: "INSERT INTO maskedEmail (id, position, json) VALUES (?, ?, ?)",
+                    arguments: [masked.id, position, try encoder.encode(masked)])
+            }
+        }
     }
 
     // MARK: Sync progress

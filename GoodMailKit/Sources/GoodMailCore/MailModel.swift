@@ -114,6 +114,7 @@ public final class MailModel {
     public func start() async {
         mailboxes = (try? await store.mailboxes()) ?? []
         savedSearches = (try? await store.savedSearches()) ?? []
+        maskedEmails = (try? await store.maskedEmails()) ?? []
         selectInboxIfNeeded()
         await updatePendingChangeCount()
         username = try? await client.session().username
@@ -179,7 +180,8 @@ public final class MailModel {
         if pendingChangeCount > 0 { await flushPendingChanges() }
         do {
             if try await sync.backfillNextPage() { return true }
-            return try await sync.prefetchBodies() > 0
+            if try await sync.prefetchBodies() > 0 { return true }
+            return try await sync.prefetchInlineImages() > 0
         } catch {
             return false
         }
@@ -453,6 +455,15 @@ public final class MailModel {
         return emails
     }
 
+    /// The image a message shows for a `cid:` URL: the stored copy, or else downloaded and kept.
+    public func inlineImage(cid: String, in email: Email) async -> (data: Data, type: String)? {
+        guard let part = email.inlineImagePart(cid: cid), let blobId = part.blobId, let type = part.type else { return nil }
+        if let data = try? await store.inlineImageData(blobId: blobId) { return (data, type) }
+        guard let data = try? await client.download(blobId: blobId, type: type, name: part.name ?? "image") else { return nil }
+        try? await store.storeInlineImageData(data, blobId: blobId, evictingBeyond: MailStore.inlineImageCacheLimit)
+        return (data, type)
+    }
+
     // MARK: Triage
 
     /// - Parameter userInitiated: Pass `false` when this happens as a side effect, such as opening a
@@ -589,6 +600,7 @@ public final class MailModel {
     public func loadMaskedEmails() async {
         do {
             maskedEmails = try await client.maskedEmails()
+            try? await store.replaceMaskedEmails(maskedEmails)
         } catch {
             report(error)
         }

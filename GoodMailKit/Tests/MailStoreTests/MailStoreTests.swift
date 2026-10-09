@@ -12,7 +12,8 @@ struct MailStoreTests {
     static func email(
         _ id: String, thread: String, in mailboxes: [String] = ["inbox"], day: Double, seen: Bool = true,
         flagged: Bool = false, subject: String = "Hello", from: String = "Maya Lindqvist", to: String = "Alex Berg",
-        preview: String = "", hasAttachment: Bool = false, html: String? = nil
+        preview: String = "", hasAttachment: Bool = false, html: String? = nil,
+        inlineImages: [(blobId: String, size: Int)] = []
     ) -> Email {
         func address(_ name: String) -> [[String: String]] {
             [["name": name, "email": "\(name.split(separator: " ")[0].lowercased())@example.com"]]
@@ -29,6 +30,10 @@ struct MailStoreTests {
         if let html {
             json["htmlBody"] = [["partId": "1", "type": "text/html"]]
             json["bodyValues"] = ["1": ["value": html, "isEncodingProblem": false, "isTruncated": false]]
+            json["attachments"] = inlineImages.map { image in
+                ["blobId": image.blobId, "type": "image/png", "cid": "\(image.blobId)@example", "disposition": "inline",
+                 "size": image.size] as [String: Any]
+            }
         }
         return try! JMAPCoding.makeDecoder().decode(Email.self, from: JSONSerialization.data(withJSONObject: json))
     }
