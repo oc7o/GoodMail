@@ -1,0 +1,240 @@
+import Foundation
+import JMAPKit
+import Testing
+@testable import MailCompose
+
+struct DraftParserTests {
+    static let me = EmailAddress(name: "Alex Berg", email: "alex@fastmail.com")
+    static let signature = Signature(html: "<div>Alex</div>", text: "-- \nAlex")
+
+    /// A draft as GoodMail saves it: assembled, then stored by the server.
+    static func saved(_ draft: MessageDraft, signature: Signature?, attachments: [[String: Any]] = [], truncated: Bool = false)
+        -> (email: Email, body: OutgoingBody)
+    {
+        let body = MessageAssembler.assemble(draft, options: AssemblyOptions(signature: signature))
+        let email = Fixture.email(
+            id: "d1", from: draft.from.map { [($0.name, $0.email)] } ?? [],
+            to: draft.to.map { ($0.name, $0.email) }, cc: draft.cc.map { ($0.name, $0.email) }, subject: draft.subject,
+            messageId: [draft.messageID], inReplyTo: draft.inReplyTo, references: draft.references, html: body.html,
+            text: body.text, truncated: truncated, keywords: ["$draft", "$seen"], attachments: attachments)
+        return (email, body)
+    }
+
+    static func reply() -> MessageDraft {
+        let quote = QuotedMessage(
+            fromName: "Maya Lindqvist", fromEmail: "maya@lindqvist.example", date: Fixture.date, subject: "Trip",
+            html: "<div>Booked! <img src=\"cid:map@lindqvist.example\"></div><div><a href=\"https://x.example/?utm_source=a\">link</a></div>",
+            text: "Booked!\nlink")
+        return MessageDraft(
+            kind: .reply, from: me, to: [EmailAddress(name: "Maya Lindqvist", email: "maya@lindqvist.example")],
+            subject: "Re: Trip", body: Fixture.formattedBody(), inReplyTo: ["m1@lindqvist.example"],
+            references: ["m1@lindqvist.example"], original: OriginalMessage(emailID: "e3", blobID: "e3-blob", quote: quote))
+    }
+
+    @Test func goodMailDraftsComeBackExactly() throws {
+        let draft = Self.reply()
+        let attachments = [
+            Fixture.attachment("Ticket.pdf", type: "application/pdf", blobId: "G1", size: 2048),
+            Fixture.attachment("map.png", type: "image/png", blobId: "G2", inline: "map@lindqvist.example"),
+        ]
+        let (email, body) = Self.saved(draft, signature: Self.signature, attachments: attachments)
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+
+        #expect(parsed.fidelity == .exact)
+        #expect(parsed.draft.includesSignature)
+        #expect(parsed.draft.kind == .reply)
+        #expect(parsed.draft.messageID == draft.messageID)
+        #expect(parsed.draft.from == Self.me)
+        #expect(parsed.draft.to == draft.to)
+        #expect(parsed.draft.subject == "Re: Trip")
+        #expect(parsed.draft.inReplyTo == ["m1@lindqvist.example"])
+        #expect(MailHTMLWriter.write(parsed.draft.body) == MailHTMLWriter.write(draft.body))
+        #expect(!String(parsed.draft.body.characters).contains("Alex\n"))
+        #expect(parsed.draft.attachments.map(\.source) == [.server(blobId: "G1")])
+        #expect(parsed.draft.attachments.first?.name == "Ticket.pdf")
+
+        let tail = try #require(parsed.draft.preservedTail)
+        #expect(tail.html.hasPrefix("<div>On 9 Oct 2026 at 14:03 UTC, Maya Lindqvist &lt;maya@lindqvist.example&gt; wrote:</div>"))
+        #expect(tail.html.hasSuffix("</blockquote>"))
+        #expect(tail.text.hasPrefix("On 9 Oct 2026 at 14:03 UTC, Maya Lindqvist <maya@lindqvist.example> wrote:\n> Booked!"))
+        #expect(tail.inlineParts == [.init(cid: "map@lindqvist.example", blobId: "G2", type: "image/png", name: "map.png")])
+
+        let again = MessageAssembler.assemble(parsed.draft, options: AssemblyOptions(signature: Self.signature))
+        #expect(again.html == body.html)
+        #expect(again.text == body.text)
+    }
+
+    @Test func emptyLinesAtTheEndOfTheTextSurvive() {
+        var draft = Self.reply()
+        draft.body = AttributedString("Hi\n\n")
+        let (email, body) = Self.saved(draft, signature: Self.signature)
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+        #expect(parsed.fidelity == .exact)
+        #expect(String(parsed.draft.body.characters) == "Hi\n\n")
+        #expect(MessageAssembler.assemble(parsed.draft, options: AssemblyOptions(signature: Self.signature)).html == body.html)
+    }
+
+    @Test func draftsWithoutSignatureOrQuote() {
+        var draft = MessageDraft(from: EmailAddress(email: "fjord.k3x9@fastmail.com"), subject: "Question", body: AttributedString("Hi\n\nthere\n"))
+        let (email, body) = Self.saved(draft, signature: nil)
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+        #expect(parsed.fidelity == .exact)
+        #expect(!parsed.draft.includesSignature)
+        #expect(parsed.draft.preservedTail == nil)
+        #expect(String(parsed.draft.body.characters) == "Hi\n\nthere\n")
+        #expect(MessageAssembler.assemble(parsed.draft, options: AssemblyOptions()).html == body.html)
+
+        draft.body = AttributedString()
+        let empty = DraftParser.parse(Self.saved(draft, signature: Self.signature).email, fallbackDomain: "fastmail.com")
+        #expect(empty.draft.body.characters.isEmpty)
+        #expect(empty.draft.includesSignature)
+    }
+
+    @Test func forwardsKeepTheForwardedMessage() throws {
+        var draft = Self.reply()
+        draft.kind = .forward
+        draft.subject = "Fwd: Trip"
+        draft.inReplyTo = nil
+        draft.references = nil
+        let (email, body) = Self.saved(draft, signature: Self.signature)
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+        #expect(parsed.fidelity == .exact)
+        #expect(parsed.draft.kind == .forward)
+        let tail = try #require(parsed.draft.preservedTail)
+        #expect(tail.text.hasPrefix("Begin forwarded message:\n\nFrom: Maya Lindqvist <maya@lindqvist.example>"))
+        #expect(MessageAssembler.assemble(parsed.draft, options: AssemblyOptions(signature: Self.signature)).html == body.html)
+    }
+
+    /// A draft written in Fastmail's web client, with an image in the text and a quoted original.
+    @Test func foreignDraftWithAnInlineImageIsSimplified() throws {
+        let html = """
+            <!DOCTYPE html><html><head><title></title><style type="text/css">p.MsoNormal{margin:0}</style></head>\
+            <body><div>Thanks, see the chart:<br></div><div><img src="cid:chart@fm" alt="chart"><br></div>\
+            <div><br></div><div>On Thu, 9 Oct 2026, at 16:03, Maya Lindqvist wrote:<br></div>\
+            <blockquote type="cite" id="qt" style=""><div>Can you send the numbers? \
+            <a href="https://numbers.example/q?utm_source=mail&amp;q=3">numbers</a><br></div></blockquote>\
+            <div><br></div></body></html>
+            """
+        let email = Fixture.email(
+            id: "d2", from: [("Alex Berg", "alex@fastmail.com")], subject: "Re: Numbers", messageId: ["web-1@fastmail.com"],
+            inReplyTo: ["m9@lindqvist.example"], html: html, text: nil, keywords: ["$draft"],
+            attachments: [Fixture.attachment("chart.png", type: "image/png", blobId: "G9", inline: "chart@fm")])
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+
+        #expect(parsed.fidelity == .simplified([.images]))
+        #expect(!parsed.draft.includesSignature)
+        #expect(parsed.draft.kind == .reply)
+        #expect(parsed.draft.messageID == "web-1@fastmail.com")
+        #expect(String(parsed.draft.body.characters) == "Thanks, see the chart:\n")
+        #expect(parsed.draft.attachments.isEmpty)
+        let tail = try #require(parsed.draft.preservedTail)
+        #expect(tail.html == """
+            <div>On Thu, 9 Oct 2026, at 16:03, Maya Lindqvist wrote:<br></div><blockquote type="cite">\
+            <div>Can you send the numbers? <a href="https://numbers.example/q?q=3">numbers</a><br></div></blockquote>
+            """)
+        #expect(tail.text == "On Thu, 9 Oct 2026, at 16:03, Maya Lindqvist wrote:\n> Can you send the numbers? numbers <https://numbers.example/q?q=3>")
+        #expect(tail.inlineParts.isEmpty)
+    }
+
+    /// Apple Mail on the Mac quotes the attribution with the original, inside a trailing `<div>`.
+    @Test func macMailQuotesArePreserved() throws {
+        let html = """
+            <html><head><meta http-equiv="content-type" content="text/html; charset=utf-8"></head>\
+            <body style="overflow-wrap: break-word;">Sure, Thursday works.<br id="lineBreakAtBeginningOfMessage">\
+            <div><br><blockquote type="cite"><div>On 9. Oct 2026, at 16:03, Maya Lindqvist \
+            &lt;maya@lindqvist.example&gt; wrote:</div><br class="Apple-interchange-newline">\
+            <div><div>Shall we meet on Thursday?</div></div></blockquote></div><br></body></html>
+            """
+        let email = Fixture.email(
+            id: "d4", from: [("Alex Berg", "alex@fastmail.com")], subject: "Re: Meeting", inReplyTo: ["m2@x"],
+            html: html, text: nil, keywords: ["$draft"])
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+        #expect(parsed.fidelity == .exact)
+        #expect(String(parsed.draft.body.characters) == "Sure, Thursday works.")
+        let tail = try #require(parsed.draft.preservedTail)
+        #expect(tail.html == """
+            <blockquote type="cite"><div>On 9. Oct 2026, at 16:03, Maya Lindqvist &lt;maya@lindqvist.example&gt; \
+            wrote:</div><br><div><div>Shall we meet on Thursday?</div></div></blockquote>
+            """)
+        #expect(tail.text == "> On 9. Oct 2026, at 16:03, Maya Lindqvist <maya@lindqvist.example> wrote:\n>\n> Shall we meet on Thursday?")
+    }
+
+    /// Apple Mail on iOS quotes the attribution on its own, at the end of the `<div>` before the quote.
+    @Test func iOSMailQuotesArePreserved() throws {
+        let html = """
+            <html><head><meta http-equiv="content-type" content="text/html; charset=utf-8"></head><body dir="auto">\
+            <div dir="ltr">Sure, Thursday works.</div><div dir="ltr"><br><blockquote type="cite">On 9. Oct 2026, \
+            at 16:03, Maya Lindqvist &lt;maya@lindqvist.example&gt; wrote:<br><br></blockquote></div>\
+            <blockquote type="cite"><div dir="ltr">Shall we meet on Thursday?</div></blockquote></body></html>
+            """
+        let email = Fixture.email(
+            id: "d5", from: [("Alex Berg", "alex@fastmail.com")], subject: "Re: Meeting", inReplyTo: ["m2@x"],
+            html: html, text: nil, keywords: ["$draft"])
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+        #expect(parsed.fidelity == .exact)
+        #expect(String(parsed.draft.body.characters) == "Sure, Thursday works.")
+        let tail = try #require(parsed.draft.preservedTail)
+        #expect(tail.html == """
+            <blockquote type="cite">On 9. Oct 2026, at 16:03, Maya Lindqvist &lt;maya@lindqvist.example&gt; wrote:\
+            <br><br></blockquote><blockquote type="cite"><div dir="ltr">Shall we meet on Thursday?</div></blockquote>
+            """)
+        #expect(tail.text == "On 9. Oct 2026, at 16:03, Maya Lindqvist <maya@lindqvist.example> wrote:\n> Shall we meet on Thursday?")
+    }
+
+    /// What the sanitizer has to take out of the text can't be edited back in, so such a draft opens read-only and
+    /// Edit Anyway keeps the original in Trash (D32) instead of saving over it.
+    @Test(arguments: [
+        "<div>Call <a href=\"sms:+15551234\">me</a>, <a href=\"ftp://files.example/r.pdf\">the report</a>, <a href=\"#details\">details</a></div>",
+        "<div>Formula <math><mi>x</mi></math>; Press <button>Accept</button>; <svg><text>label</text></svg></div>",
+        "<ol type=\"a\"><li>one</li><li>two</li></ol>",
+        """
+        <html><head><style>p.MsoNormal{font-family:Calibri;color:#1F497D} .big{font-size:24pt;font-weight:bold}</style>\
+        </head><body><p class="MsoNormal">Hello <span class="big">big</span></p></body></html>
+        """,
+        "<div style=\"margin-left: 40px\">indented</div>",
+        "<div>shown <span style=\"visibility:hidden\">hidden</span></div>",
+    ])
+    func draftsWithWhatTheEditorCannotHoldAreSimplified(html: String) {
+        let email = Fixture.email(
+            id: "d6", from: [("Alex Berg", "alex@fastmail.com")], subject: "Note", html: html, text: nil, keywords: ["$draft"])
+        #expect(DraftParser.parse(email, fallbackDomain: "fastmail.com").fidelity == .simplified([.other]))
+    }
+
+    /// Fastmail's web client styles Outlook's paragraphs in everything it writes; a reply to Outlook mail has them
+    /// only in the quote, which is kept as it is, so the text stays exact. So does anything else lost in the quote.
+    @Test func lossesInTheQuoteDoNotSimplifyTheText() throws {
+        let html = """
+            <!DOCTYPE html><html><head><title></title><style type="text/css">p.MsoNormal,p.MsoNoSpacing{margin:0}</style>\
+            </head><body><div>Sounds good.</div><div><br></div><div>On Thu, 9 Oct 2026, at 16:03, Jonas Weber wrote:</div>\
+            <blockquote type="cite" id="qt"><p class="MsoNormal">Can we meet?<o:p></o:p></p><svg></svg></blockquote></body></html>
+            """
+        let email = Fixture.email(
+            id: "d7", from: [("Alex Berg", "alex@fastmail.com")], subject: "Re: Meeting", inReplyTo: ["m4@weber.example"],
+            html: html, text: nil, keywords: ["$draft"])
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+        #expect(parsed.fidelity == .exact)
+        #expect(String(parsed.draft.body.characters) == "Sounds good.")
+        #expect(try #require(parsed.draft.preservedTail).html.hasSuffix("<blockquote type=\"cite\"><p>Can we meet?</p></blockquote>"))
+    }
+
+    @Test func plainTextDraftsAreExact() {
+        let email = Fixture.email(
+            id: "d3", subject: "Note", messageId: nil, html: nil, text: "Hello,\r\nthis is plain.\n\n-- \nMax", keywords: ["$draft"])
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+        #expect(parsed.fidelity == .exact)
+        #expect(String(parsed.draft.body.characters) == "Hello,\nthis is plain.\n\n-- \nMax")
+        #expect(!parsed.draft.includesSignature)
+        #expect(parsed.draft.messageID.hasSuffix("@lindqvist.example"))
+        #expect(parsed.draft.kind == .new)
+    }
+
+    @Test func truncatedDraftsAreNotEditedBlindly() {
+        let (email, _) = Self.saved(MessageDraft(from: Self.me, body: AttributedString("long")), signature: nil, truncated: true)
+        #expect(DraftParser.parse(email, fallbackDomain: "fastmail.com").fidelity == .simplified([.other]))
+    }
+
+    @Test func missingSenderFallsBackToTheAccountDomain() {
+        let email = Fixture.email(from: [], messageId: nil, html: nil, text: "x")
+        #expect(DraftParser.parse(email, fallbackDomain: "fastmail.com").draft.messageID.hasSuffix("@fastmail.com"))
+    }
+}
