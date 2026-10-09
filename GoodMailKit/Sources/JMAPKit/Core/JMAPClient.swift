@@ -1,6 +1,15 @@
 import Foundation
 import Synchronization
 
+/// How a request answered with "try again later" (HTTP 429 or 503) is handled.
+public enum RetryPolicy: Sendable {
+    /// Waits and sends it again, a few times.
+    case automatic
+    /// Never sends it again, for requests that must not run twice, such as sending mail: a 503 may come after
+    /// the server did the work. When the session can't be fetched first, the error is `sessionUnavailable`.
+    case never
+}
+
 /// A JMAP client for a single account connection.
 ///
 /// All thrown errors are `JMAPError`.
@@ -8,7 +17,8 @@ public actor JMAPClient {
     public static let fastmailSessionURL = URL(string: "https://api.fastmail.com/jmap/session")!
 
     private let sessionURL: URL
-    private let token: String
+    /// In a mutex rather than isolated to the actor, so that the push connection can read it.
+    private let token: Mutex<String>
     private let transport: any HTTPTransport
     private let maxRetries: Int
     private let retryDelay: @Sendable (_ attempt: Int) -> Duration
@@ -24,7 +34,7 @@ public actor JMAPClient {
         maxRetries: Int = 3,
         retryDelay: @escaping @Sendable (_ attempt: Int) -> Duration = { .seconds(1 << $0) }
     ) {
-        self.token = token
+        self.token = Mutex(token)
         self.sessionURL = sessionURL
         self.transport = transport
         self.maxRetries = maxRetries
@@ -51,10 +61,29 @@ public actor JMAPClient {
         try await session().primaryAccountId(for: capability)
     }
 
+    /// The session for a request about to be sent with `retry`.
+    ///
+    /// A timeout or 5xx while fetching the session would read as if the request itself may have run; for
+    /// one that must not run twice, it is reported as `sessionUnavailable` instead.
+    func session(for retry: RetryPolicy) async throws -> Session {
+        do {
+            return try await session()
+        } catch let error as JMAPError where retry == .never && error.mayHaveReachedServer {
+            throw JMAPError.sessionUnavailable(error)
+        }
+    }
+
+    /// Uses `token` for every request and push connection from now on, and fetches the session again, as the
+    /// new token may come with other capabilities.
+    public func setToken(_ token: String) {
+        self.token.withLock { $0 = token }
+        cachedSession = nil
+    }
+
     // MARK: API requests
 
-    public func send(_ batch: Batch) async throws -> BatchResponse {
-        let session = try await session()
+    public func send(_ batch: Batch, retry: RetryPolicy = .automatic) async throws -> BatchResponse {
+        let session = try await session(for: retry)
         var request = URLRequest(url: session.apiUrl)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -64,7 +93,7 @@ public actor JMAPClient {
             throw JMAPError.decoding("Encoding request: \(error)")
         }
 
-        let data = try await perform(request)
+        let data = try await perform(request, retry: retry)
         let response: BatchResponse
         do {
             response = try JMAPCoding.makeDecoder().decode(BatchResponse.self, from: data)
@@ -79,24 +108,10 @@ public actor JMAPClient {
     }
 
     /// Sends a single method call and returns its typed response.
-    public func call<Call: MethodCall>(_ call: Call) async throws -> Call.Response {
+    public func call<Call: MethodCall>(_ call: Call, retry: RetryPolicy = .automatic) async throws -> Call.Response {
         var batch = Batch()
         let handle = batch.add(call)
-        return try await send(batch).get(handle)
-    }
-
-    // MARK: Blobs
-
-    /// Downloads a blob such as an attachment or inline image from the mail account.
-    public func download(blobId: String, type: String = "application/octet-stream", name: String = "blob") async throws -> Data {
-        let session = try await session()
-        let accountId = try session.primaryAccountId(for: Capability.mail)
-        guard let url = session.downloadURL(accountId: accountId, blobId: blobId, type: type, name: name) else {
-            throw JMAPError.transport("Invalid download URL")
-        }
-        var request = URLRequest(url: url)
-        request.setValue(type, forHTTPHeaderField: "Accept")
-        return try await perform(request)
+        return try await send(batch, retry: retry).get(handle)
     }
 
     // MARK: Push
@@ -138,7 +153,7 @@ public actor JMAPClient {
             throw JMAPError.transport("Invalid event source URL")
         }
         var request = URLRequest(url: url)
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        request.setValue("Bearer \(token.withLock { $0 })", forHTTPHeaderField: "Authorization")
         request.setValue("text/event-stream", forHTTPHeaderField: "Accept")
         request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
         let lastEventID = self.lastEventID.withLock { $0 }
@@ -198,23 +213,18 @@ public actor JMAPClient {
 
     // MARK: HTTP
 
-    private func perform(_ request: URLRequest) async throws -> Data {
-        var request = request
-        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        if request.value(forHTTPHeaderField: "Accept") == nil {
-            request.setValue("application/json", forHTTPHeaderField: "Accept")
-        }
-
+    func perform(_ request: URLRequest, retry: RetryPolicy = .automatic) async throws -> Data {
+        let request = authorized(request)
         var attempt = 0
+        // Once a 503 came, the request may have run, however the retries end (see `mayHaveReachedServer`).
+        var unavailable: JMAPError?
         while true {
             let data: Data
             let response: HTTPURLResponse
             do {
                 (data, response) = try await transport.send(request)
-            } catch let error as JMAPError {
-                throw error
             } catch {
-                throw JMAPError.transport(error.localizedDescription)
+                throw Self.jmapError(error)
             }
 
             switch response.statusCode {
@@ -223,15 +233,73 @@ public actor JMAPClient {
             case 401:
                 throw JMAPError.unauthorized
             case 429, 503:
-                guard attempt < maxRetries else { throw JMAPError.rateLimited }
+                if response.statusCode == 503 {
+                    unavailable = .http(status: 503, problemType: Self.problemType(in: data))
+                }
+                guard retry == .automatic, attempt < maxRetries else { throw unavailable ?? JMAPError.rateLimited }
                 let delay = Self.retryAfter(response) ?? retryDelay(attempt)
                 attempt += 1
                 try? await Task.sleep(for: delay)
             default:
-                let problem = try? JSONDecoder().decode(ProblemDetails.self, from: data)
-                throw JMAPError.http(status: response.statusCode, problemType: problem?.type)
+                throw JMAPError.http(status: response.statusCode, problemType: Self.problemType(in: data))
             }
         }
+    }
+
+    /// Sends `request` once and hands over its body as it arrives, for downloads too large to hold in memory.
+    func performStreaming(
+        _ request: URLRequest
+    ) async throws -> (HTTPURLResponse, AsyncThrowingStream<Data, any Error>) {
+        let response: HTTPURLResponse
+        let body: AsyncThrowingStream<Data, any Error>
+        do {
+            (response, body) = try await transport.stream(authorized(request))
+        } catch {
+            throw Self.jmapError(error)
+        }
+        switch response.statusCode {
+        case 200..<300:
+            return (response, Self.mappingErrors(of: body))
+        case 401:
+            throw JMAPError.unauthorized
+        default:
+            throw JMAPError.http(status: response.statusCode, problemType: await Self.problemType(in: body))
+        }
+    }
+
+    private func authorized(_ request: URLRequest) -> URLRequest {
+        var request = request
+        request.setValue("Bearer \(token.withLock { $0 })", forHTTPHeaderField: "Authorization")
+        if request.value(forHTTPHeaderField: "Accept") == nil {
+            request.setValue("application/json", forHTTPHeaderField: "Accept")
+        }
+        return request
+    }
+
+    /// Keeps the code of a `URLError`, which tells whether the request can have reached the server.
+    static func jmapError(_ error: any Error) -> JMAPError {
+        switch error {
+        case let error as JMAPError: error
+        case let error as URLError: .connection(error.code, error.localizedDescription)
+        default: .transport(error.localizedDescription)
+        }
+    }
+
+    /// `body` with its errors turned into `JMAPError`s; ending its iteration early still cancels the request.
+    private static func mappingErrors(
+        of body: AsyncThrowingStream<Data, any Error>
+    ) -> AsyncThrowingStream<Data, any Error> {
+        let (chunks, continuation) = AsyncThrowingStream<Data, any Error>.makeStream()
+        let forwarding = Task {
+            do {
+                for try await chunk in body { continuation.yield(chunk) }
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: jmapError(error))
+            }
+        }
+        continuation.onTermination = { _ in forwarding.cancel() }
+        return chunks
     }
 
     private static func retryAfter(_ response: HTTPURLResponse) -> Duration? {
@@ -245,6 +313,10 @@ public actor JMAPClient {
         let type: String?
     }
 
+    private static func problemType(in data: Data) -> String? {
+        (try? JSONDecoder().decode(ProblemDetails.self, from: data))?.type
+    }
+
     /// The RFC 7807 problem type of a streamed error response, if it has one.
     private static func problemType(in body: AsyncThrowingStream<Data, any Error>) async -> String? {
         var data = Data()
@@ -256,7 +328,7 @@ public actor JMAPClient {
         } catch {
             return nil
         }
-        return (try? JSONDecoder().decode(ProblemDetails.self, from: data))?.type
+        return problemType(in: data)
     }
 }
 

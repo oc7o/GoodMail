@@ -69,18 +69,22 @@ public struct BatchResponse: Sendable {
     public let sessionState: String
 
     /// Returns the typed result of a call, or throws its method error.
+    ///
+    /// Only the first answer with the call's id counts: a call answers once, except that `EmailSubmission/set`
+    /// is followed by the answer of the implicit `Email/set` its `onSuccess…` arguments make, which may be an
+    /// error of its own (RFC 8621 §7.5).
     public func get<Call: MethodCall>(_ handle: CallHandle<Call>) throws -> Call.Response {
-        let matching = invocations.filter { $0.id == handle.id }
-        if let error = matching.first(where: { $0.name == "error" }) {
-            throw JMAPError.method(try Self.decode(MethodError.self, from: error.arguments))
-        }
-        guard let invocation = matching.first(where: { $0.name == Call.name }) else {
+        guard let invocation = invocations.first(where: { $0.id == handle.id }) else {
             throw JMAPError.unexpectedResponse(callId: handle.id)
         }
+        if invocation.name == "error" {
+            throw JMAPError.method(try Self.decode(MethodError.self, from: invocation.arguments))
+        }
+        guard invocation.name == Call.name else { throw JMAPError.unexpectedResponse(callId: handle.id) }
         return try Self.decode(Call.Response.self, from: invocation.arguments)
     }
 
-    private static func decode<T: Decodable>(_ type: T.Type, from value: JSONValue) throws -> T {
+    static func decode<T: Decodable>(_ type: T.Type, from value: JSONValue) throws -> T {
         do {
             let data = try JMAPCoding.makeEncoder().encode(value)
             return try JMAPCoding.makeDecoder().decode(T.self, from: data)

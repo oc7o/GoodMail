@@ -214,7 +214,6 @@ public struct SetResponse: Decodable, Sendable {
     /// Decodes the server-returned properties of a created object.
     public func created<T: Decodable>(_ creationId: String, as type: T.Type) throws -> T? {
         guard let value = created?[creationId] else { return nil }
-        let data = try JMAPCoding.makeEncoder().encode(value)
-        return try JMAPCoding.makeDecoder().decode(T.self, from: data)
+        return try BatchResponse.decode(T.self, from: value)
     }
 }

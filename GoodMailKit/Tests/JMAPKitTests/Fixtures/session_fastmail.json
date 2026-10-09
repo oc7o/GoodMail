@@ -1,0 +1,53 @@
+{
+  "capabilities": {
+    "urn:ietf:params:jmap:core": {
+      "maxSizeUpload": 250000000,
+      "maxConcurrentUpload": 10,
+      "maxSizeRequest": 10000000,
+      "maxConcurrentRequests": 10,
+      "maxCallsInRequest": 50,
+      "maxObjectsInGet": 4096,
+      "maxObjectsInSet": 4096,
+      "collationAlgorithms": ["i;ascii-numeric", "i;ascii-casemap", "i;octet"]
+    },
+    "urn:ietf:params:jmap:mail": {},
+    "urn:ietf:params:jmap:submission": {},
+    "urn:ietf:params:jmap:vacationresponse": {},
+    "https://www.fastmail.com/dev/maskedemail": {}
+  },
+  "accounts": {
+    "u1234": {
+      "name": "user@fastmail.com",
+      "isPersonal": true,
+      "isReadOnly": false,
+      "accountCapabilities": {
+        "urn:ietf:params:jmap:mail": {
+          "maxMailboxesPerEmail": 1000,
+          "maxMailboxDepth": null,
+          "maxSizeMailboxName": 490,
+          "maxSizeAttachmentsPerEmail": 50000000,
+          "emailQuerySortOptions": ["receivedAt", "sentAt", "size", "from", "to", "subject"],
+          "mayCreateTopLevelMailbox": true
+        },
+        "urn:ietf:params:jmap:submission": {
+          "maxDelayedSend": 44236800,
+          "submissionExtensions": {}
+        },
+        "urn:ietf:params:jmap:vacationresponse": {},
+        "https://www.fastmail.com/dev/maskedemail": {}
+      }
+    }
+  },
+  "primaryAccounts": {
+    "urn:ietf:params:jmap:mail": "u1234",
+    "urn:ietf:params:jmap:submission": "u1234",
+    "urn:ietf:params:jmap:vacationresponse": "u1234",
+    "https://www.fastmail.com/dev/maskedemail": "u1234"
+  },
+  "username": "user@fastmail.com",
+  "apiUrl": "https://api.fastmail.com/jmap/api/",
+  "downloadUrl": "https://www.fastmailusercontent.com/jmap/download/{accountId}/{blobId}/{name}?type={type}",
+  "uploadUrl": "https://api.fastmail.com/jmap/upload/{accountId}/",
+  "eventSourceUrl": "https://api.fastmail.com/jmap/event/",
+  "state": "cyrus-0;p-5;vfs-0"
+}

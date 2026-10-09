@@ -79,3 +79,79 @@ public struct Session: Decodable, Sendable, Equatable {
         value.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed.subtracting(["/"])) ?? value
     }
 }
+
+/// The server's limits (RFC 8620 §2, `urn:ietf:params:jmap:core`).
+public struct CoreCapabilities: Decodable, Sendable, Equatable {
+    public let maxSizeUpload: Int
+    public let maxConcurrentUpload: Int
+    public let maxSizeRequest: Int
+    public let maxConcurrentRequests: Int
+    public let maxCallsInRequest: Int
+    public let maxObjectsInGet: Int
+    public let maxObjectsInSet: Int
+
+    public init(
+        maxSizeUpload: Int, maxConcurrentUpload: Int, maxSizeRequest: Int, maxConcurrentRequests: Int,
+        maxCallsInRequest: Int, maxObjectsInGet: Int, maxObjectsInSet: Int
+    ) {
+        self.maxSizeUpload = maxSizeUpload
+        self.maxConcurrentUpload = maxConcurrentUpload
+        self.maxSizeRequest = maxSizeRequest
+        self.maxConcurrentRequests = maxConcurrentRequests
+        self.maxCallsInRequest = maxCallsInRequest
+        self.maxObjectsInGet = maxObjectsInGet
+        self.maxObjectsInSet = maxObjectsInSet
+    }
+}
+
+/// A mail account's limits (RFC 8621 §1.3.1).
+public struct MailAccountCapabilities: Decodable, Sendable, Equatable {
+    /// The total size of the attachments of one email, in octets, as their decoded size.
+    public let maxSizeAttachmentsPerEmail: Int?
+    public let maxMailboxesPerEmail: Int?
+
+    public init(maxSizeAttachmentsPerEmail: Int?, maxMailboxesPerEmail: Int?) {
+        self.maxSizeAttachmentsPerEmail = maxSizeAttachmentsPerEmail
+        self.maxMailboxesPerEmail = maxMailboxesPerEmail
+    }
+}
+
+/// What a submission account supports (RFC 8621 §1.3.2).
+public struct SubmissionAccountCapabilities: Decodable, Sendable, Equatable {
+    /// The longest a submission may be held before release, in seconds; 0 when delayed sending isn't supported.
+    public let maxDelayedSend: Int
+    /// SMTP extensions the server announces, by EHLO keyword.
+    public let submissionExtensions: [String: [String]]
+
+    public init(maxDelayedSend: Int, submissionExtensions: [String: [String]]) {
+        self.maxDelayedSend = maxDelayedSend
+        self.submissionExtensions = submissionExtensions
+    }
+}
+
+extension Session {
+    public var coreCapabilities: CoreCapabilities? {
+        capabilities[Capability.core].flatMap(Self.decode)
+    }
+
+    public func mailCapabilities(accountId: String) -> MailAccountCapabilities? {
+        accounts[accountId]?.accountCapabilities[Capability.mail].flatMap(Self.decode)
+    }
+
+    public func submissionCapabilities(accountId: String) -> SubmissionAccountCapabilities? {
+        accounts[accountId]?.accountCapabilities[Capability.submission].flatMap(Self.decode)
+    }
+
+    /// Whether this session may send mail: the token has the submission scope and its account isn't read-only.
+    public var canSubmit: Bool {
+        guard supports(Capability.submission), let id = primaryAccounts[Capability.submission],
+              let account = accounts[id]
+        else { return false }
+        return !account.isReadOnly
+    }
+
+    private static func decode<T: Decodable>(_ value: JSONValue) -> T? {
+        guard let data = try? JMAPCoding.makeEncoder().encode(value) else { return nil }
+        return try? JMAPCoding.makeDecoder().decode(T.self, from: data)
+    }
+}
