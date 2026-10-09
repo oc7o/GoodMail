@@ -159,7 +159,7 @@ struct AttachmentCenterTests {
     @Test func aDownloadShorterThanAnnouncedCachesNothing() async throws {
         transport.truncatesDownloads = true
 
-        await #expect(throws: AttachmentError.incomplete(name: "Flight confirmation.pdf")) {
+        await #expect(throws: AttachmentDownloadError.incomplete(name: "Flight confirmation.pdf")) {
             try await center.data(for: Self.part())
         }
         #expect(!(await center.isCached(Self.part())))
@@ -169,7 +169,7 @@ struct AttachmentCenterTests {
         await #expect(throws: JMAPError.http(status: 404, problemType: nil)) {
             try await center.previewURL(for: Self.part(blobId: "e3-file9"))
         }
-        await #expect(throws: AttachmentError.notDownloadable(name: "Flight confirmation.pdf")) {
+        await #expect(throws: AttachmentDownloadError.notDownloadable(name: "Flight confirmation.pdf")) {
             try await center.data(for: Self.part(blobId: nil))
         }
         #expect(center.downloads.isEmpty)

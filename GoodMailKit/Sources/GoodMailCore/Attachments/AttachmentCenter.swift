@@ -5,7 +5,7 @@ import MailStore
 import Observation
 
 /// Why an attachment couldn't be provided, besides the errors of the server and the store.
-public enum AttachmentError: Error, Equatable, Sendable, LocalizedError {
+public enum AttachmentDownloadError: Error, Equatable, Sendable, LocalizedError {
     /// The part has no blob to download, such as one the server couldn't parse.
     case notDownloadable(name: String)
     /// The download ended before the whole file arrived.
@@ -127,7 +127,9 @@ public final class AttachmentCenter {
     private func fromCache<Result>(
         _ part: EmailBodyPart, _ read: (String) async throws -> Result
     ) async throws -> Result {
-        guard let blobId = part.blobId else { throw AttachmentError.notDownloadable(name: Self.name(of: part)) }
+        guard let blobId = part.blobId else {
+            throw AttachmentDownloadError.notDownloadable(name: Self.name(of: part))
+        }
         let isCached = running[blobId] == nil ? (try? await store.isAttachmentCached(blobId: blobId)) == true : false
         if !isCached { try await download(part, blobId: blobId) }
         do {
@@ -171,7 +173,7 @@ public final class AttachmentCenter {
             // A stream ends without an error when its task is cancelled, so its end alone proves nothing.
             try Task.checkCancellation()
             if let expected = download.expectedLength, received != expected {
-                throw AttachmentError.incomplete(name: Self.name(of: part))
+                throw AttachmentDownloadError.incomplete(name: Self.name(of: part))
             }
             try await writer.finish(evictingBeyond: MailStore.attachmentCacheLimit)
         } catch {
