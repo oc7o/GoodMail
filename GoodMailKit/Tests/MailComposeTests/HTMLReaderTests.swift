@@ -100,6 +100,15 @@ struct HTMLReaderTests {
         #expect(result.dropped == [.other])
     }
 
+    @Test func deepNestingIsFlattened() {
+        let depth = 20_000
+        let html = String(repeating: "<div><b>", count: depth) + "deep" + String(repeating: "</b></div>", count: depth)
+            + "<div>after</div>"
+        let result = MailBodyHTMLReader.read(html)
+        #expect(String(result.text.characters) == "deep\nafter")
+        #expect(HTMLNode.parse("<i>a<b>b</b></i><br>").count == 2)
+    }
+
     @Test func untrustedMarkupIsSanitizedFirst() {
         let result = MailBodyHTMLReader.read("<div onclick=\"x()\">a<script>alert(1)</script><a href=\"javascript:x()\">b</a></div>")
         #expect(String(result.text.characters) == "ab")

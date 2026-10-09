@@ -194,11 +194,13 @@ struct ListItem: Equatable {
             // Writing Tools' list format.
             number = nil
             prefixLength = 3
-        } else if let match = paragraph.prefixMatch(of: #/(\d{1,3})\. /#), let value = Int(match.output.1) {
-            number = value
-            prefixLength = match.output.0.count
         } else {
-            return nil
+            let digits = paragraph.prefix { $0.isASCII && $0.isNumber }
+            guard (1...3).contains(digits.count), paragraph.dropFirst(digits.count).hasPrefix(". "),
+                  let value = Int(digits)
+            else { return nil }
+            number = value
+            prefixLength = digits.count + 2
         }
     }
 }

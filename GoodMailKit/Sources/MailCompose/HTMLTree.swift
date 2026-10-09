@@ -41,6 +41,10 @@ struct HTMLNode {
 
     static let collapsible: Set<Character> = [" ", "\t", "\n", "\r", "\r\n", "\u{0C}"]
 
+    /// Deeper elements are unwrapped into their ancestor at this depth, so walking the tree recursively can't
+    /// exhaust a thread's stack, whatever a draft contains. Real mail nests far less.
+    static let maximumDepth = 64
+
     static func parse(_ html: String) -> [HTMLNode] {
         struct Open {
             var name: String
@@ -49,6 +53,7 @@ struct HTMLNode {
             var start: String.Index
         }
         var stack: [Open] = []
+        var unwrapped: [String] = []
         var roots: [HTMLNode] = []
         func append(_ node: HTMLNode) {
             if stack.isEmpty { roots.append(node) } else { stack[stack.count - 1].children.append(node) }
@@ -63,7 +68,7 @@ struct HTMLNode {
         var index = html.startIndex
         while index < html.endIndex {
             guard html[index] == "<", let end = html[index...].firstIndex(of: ">") else {
-                let textEnd = html[index...].firstIndex(of: "<") ?? html.endIndex
+                let textEnd = html[html.index(after: index)...].firstIndex(of: "<") ?? html.endIndex
                 append(HTMLNode(content: .text(Entities.decode(String(html[index..<textEnd]))), range: index..<textEnd))
                 index = textEnd
                 continue
@@ -72,19 +77,20 @@ struct HTMLNode {
             let after = html.index(after: end)
             if tag.hasPrefix("/") {
                 let name = tag.dropFirst().lowercased()
-                if let position = stack.lastIndex(where: { $0.name == name }) {
+                if unwrapped.last == name {
+                    unwrapped.removeLast()
+                } else if let position = stack.lastIndex(where: { $0.name == name }) {
                     while stack.count > position + 1 { close(at: index) }
                     close(at: after)
                 }
             } else {
                 let name = String(tag.prefix { !$0.isWhitespace }).lowercased()
-                var attributes: [String: String] = [:]
-                for match in tag.matches(of: #/([a-zA-Z][a-zA-Z0-9-]*)="([^"]*)"/#) {
-                    attributes[match.output.1.lowercased()] = Entities.decode(String(match.output.2))
-                }
+                let attributes = Self.attributes(in: tag.drop { !$0.isWhitespace })
                 if OutgoingHTMLSanitizer.voidElements.contains(name) {
                     append(HTMLNode(content: .element(name: name, attributes: attributes, children: []),
                                     range: index..<after))
+                } else if stack.count >= maximumDepth || !unwrapped.isEmpty {
+                    unwrapped.append(name)
                 } else {
                     stack.append(Open(name: name, attributes: attributes, start: index))
                 }
@@ -93,5 +99,19 @@ struct HTMLNode {
         }
         while !stack.isEmpty { close(at: html.endIndex) }
         return roots
+    }
+
+    /// ` name="value"` pairs, the only form the sanitizer writes.
+    static func attributes(in text: Substring) -> [String: String] {
+        var attributes: [String: String] = [:]
+        var rest = text
+        while let equals = rest.firstIndex(of: "="),
+              let open = rest[equals...].firstIndex(of: "\""),
+              let close = rest[rest.index(after: open)...].firstIndex(of: "\"") {
+            let name = rest[..<equals].trimmingCharacters(in: .whitespaces).lowercased()
+            attributes[name] = Entities.decode(String(rest[rest.index(after: open)..<close]))
+            rest = rest[rest.index(after: close)...]
+        }
+        return attributes
     }
 }
