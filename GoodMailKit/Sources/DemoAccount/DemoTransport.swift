@@ -142,6 +142,8 @@ public final class DemoTransport: HTTPTransport {
             return types
         }
 
+        /// An id for an object the server makes: its type's capital letter and a number no other object got.
+        /// Seeded ids are lowercase (`e4`, `t2`, `ident-1`), so the two never collide.
         mutating func makeID(_ prefix: String) -> String {
             defer { nextID += 1 }
             return "\(prefix)\(nextID)"

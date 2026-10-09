@@ -363,6 +363,28 @@ struct DemoAccountTests {
         #expect(server.sentMessages.map(\.mailFrom) == ["fjord.k3x9@fastmail.com"])
     }
 
+    /// However many ids the server handed out before, a new identity never gets the id of an existing one.
+    @Test(arguments: [0, 1])
+    func identityMadeOnAFreshServerSendsFromItsMask(repliesSavedBefore: Int) async throws {
+        for index in 0..<repliesSavedBefore {
+            let reply = draft(
+                from: "fjord.k3x9@fastmail.com", name: nil, messageID: "reply-\(index)@fastmail.com",
+                inReplyTo: ["e4@demo"])
+            _ = try await client.saveDraft(reply, replacing: nil)
+        }
+
+        let identity = try await client.createIdentity(.init(email: "fjord.k3x9@fastmail.com"))
+        let ids = try await client.identities().map(\.id)
+        let sent = try await submit(draft(from: "fjord.k3x9@fastmail.com", name: nil), identity: identity.id,
+                                    envelope: envelope(from: "fjord.k3x9@fastmail.com"))
+        server.advanceClock(by: 15)
+
+        #expect(ids.count == 3)
+        #expect(Set(ids).count == ids.count)
+        #expect(sent.submissionError == nil)
+        #expect(server.sentMessages.map(\.identityId) == [identity.id])
+    }
+
     @Test(arguments: ["win.a7b2@fastmail.com", "someone@elsewhere.example", "alex@fastmail.com", "shop@berg.example"])
     func identitiesAreOnlyMadeForEnabledMaskedAddresses(address: String) async throws {
         await #expect(throws: SetError.self) { try await client.createIdentity(.init(email: address)) }

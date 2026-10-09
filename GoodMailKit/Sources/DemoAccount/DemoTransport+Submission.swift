@@ -166,7 +166,7 @@ extension DemoTransport.Store {
                         SetError.forbiddenFrom, description: "You can't send from \(email).")
                     continue
                 }
-                let id = makeID("ident-")
+                let id = makeID("I")
                 identities.append([
                     "id": .string(id), "name": .string(DemoTransport.string(create["name"])), "email": .string(email),
                     "replyTo": .null, "bcc": .null, "textSignature": "", "htmlSignature": "", "mayDelete": true,
