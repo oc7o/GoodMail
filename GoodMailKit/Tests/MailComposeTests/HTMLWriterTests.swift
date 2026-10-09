@@ -112,6 +112,28 @@ struct HTMLWriterTests {
                 == "Write to alex@fastmail.com or our team <mailto:team@fastmail.com>, see https://a.example")
     }
 
+    /// The target follows the whole link, however its text is formatted.
+    @Test func textAlternativeNamesEachLinkOnce() {
+        var text = AttributedString("Visit Google today, see the docs")
+        text[text.range(of: "Google")!].link = URL(string: "https://google.com")
+        text[text.range(of: "Go")!].font = MailFontStyle(isBold: true).font
+        text[text.range(of: "the docs")!].link = URL(string: "https://docs.example")
+        text[text.range(of: "docs")!].foregroundColor = MailPalette.colors[3].color
+        #expect(MailHTMLWriter.write(text).text == "Visit Google <https://google.com> today, see the docs <https://docs.example>")
+        #expect(MailHTMLWriter.write(text).html == """
+            <div>Visit <a href="https://google.com"><b>Go</b>ogle</a> today, see \
+            <a href="https://docs.example">the <span style="color: #0040dd">docs</span></a></div>
+            """)
+    }
+
+    /// A line break at the end of a paragraph only shows when a second follows, inside formatting too.
+    @Test func softBreakAtTheEndOfFormattedText() {
+        var text = AttributedString("end\u{2028}")
+        text.font = MailFontStyle(isBold: true).font
+        #expect(MailHTMLWriter.write(text).html == "<div><b>end<br><br></b></div>")
+        #expect(String(MailBodyHTMLReader.read(MailHTMLWriter.write(text).html).text.characters) == "end\u{2028}")
+    }
+
     @Test func constrainsBeforeWriting() {
         var text = AttributedString("unsafe custom off-palette")
         text[text.range(of: "unsafe")!].link = URL(string: "javascript:alert(1)")

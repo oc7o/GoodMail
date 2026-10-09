@@ -78,7 +78,12 @@ public enum MailBodyHTMLReader {
         /// <br>s not yet placed: line breaks inside the paragraph if more content follows, the end of the
         /// paragraph if a block boundary comes first (a trailing <br> doesn't render).
         var pendingBreaks = 0
+        /// The formatting at the first pending <br>: a line break belongs to the text it was written in.
+        var breakAttributes = AttributeContainer()
         var trailingCollapsibleSpace = false
+        /// Whether `MailHTMLWriter`, writing what has been read so far, would have just written a space or started a
+        /// line. It writes a space there as a no-break space, so only a no-break space elsewhere is the user's own.
+        var writerSawSpace = true
         var pendingPrefix: String?
         /// A <p> before or after: its margin reads as an empty line.
         var needsBlankLine = false
@@ -121,6 +126,11 @@ public enum MailBodyHTMLReader {
             if trailingCollapsibleSpace, current.characters.last == " " {
                 current.removeSubrange(current.characters.index(before: current.endIndex)..<current.endIndex)
             }
+            if current.characters.last == "\u{00A0}" {
+                // The writer ends a paragraph's trailing space with a no-break space so that it shows.
+                let last = current.characters.index(before: current.endIndex)
+                current.replaceSubrange(last..<current.endIndex, with: AttributedString(" ", attributes: current.runs[last].attributes))
+            }
             if needsBlankLine, let last = paragraphs.last, !last.text.characters.isEmpty {
                 paragraphs.append((AttributedString(), last.block))
             }
@@ -132,13 +142,21 @@ public enum MailBodyHTMLReader {
             current = AttributedString()
             hasContent = false
             trailingCollapsibleSpace = false
+            writerSawSpace = true
             pendingPrefix = nil
+        }
+
+        mutating func addLineBreak() {
+            if pendingBreaks == 0 { breakAttributes = style.attributes }
+            pendingBreaks += 1
         }
 
         mutating func appendLineBreaks(_ count: Int) {
             guard count > 0 else { return }
-            append(String(repeating: "\u{2028}", count: count))
+            current.append(AttributedString(String(repeating: "\u{2028}", count: count), attributes: breakAttributes))
+            hasContent = true
             trailingCollapsibleSpace = false
+            writerSawSpace = true
         }
 
         mutating func append(_ string: String) {
@@ -157,21 +175,23 @@ public enum MailBodyHTMLReader {
             for character in text {
                 if style.preservesWhitespace, character == "\n" || character == "\r" || character == "\r\n" {
                     flush(&self)
-                    pendingBreaks += 1
+                    addLineBreak()
                 } else if !style.preservesWhitespace, HTMLNode.collapsible.contains(character) {
                     // Collapsible: dropped at the start of a line and after another collapsible space.
                     let atLineStart = (!hasContent && piece.isEmpty) || pendingBreaks > 0
                     if atLineStart || trailingCollapsibleSpace { continue }
                     piece.append(" ")
                     trailingCollapsibleSpace = true
+                    writerSawSpace = true
                 } else {
                     if pendingBreaks > 0 {
                         flush(&self)
                         appendLineBreaks(pendingBreaks)
                         pendingBreaks = 0
                     }
-                    piece.append(character == "\u{00A0}" ? " " : character)
+                    piece.append(character == "\u{00A0}" && writerSawSpace ? " " : character)
                     trailingCollapsibleSpace = false
+                    writerSawSpace = false
                 }
             }
             flush(&self)
@@ -190,7 +210,7 @@ public enum MailBodyHTMLReader {
             }
             switch name {
             case "br":
-                pendingBreaks += 1
+                addLineBreak()
                 return
             case "wbr", "col":
                 return
@@ -240,6 +260,7 @@ public enum MailBodyHTMLReader {
                 if hasContent {
                     append("\t")
                     trailingCollapsibleSpace = false
+                    writerSawSpace = false
                 }
                 visit(children)
             case "p", "div", "blockquote", "center", "address", "pre", "h1", "h2", "h3", "h4", "h5", "h6", "dl", "dt",

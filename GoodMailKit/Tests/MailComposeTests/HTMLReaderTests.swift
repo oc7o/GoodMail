@@ -18,12 +18,31 @@ struct HTMLReaderTests {
         var link = AttributedString("a link and mail")
         link[link.range(of: "link")!].link = URL(string: "https://example.com/a?utm_source=x&b=%20c#frag")
         link[link.range(of: "mail")!].link = URL(string: "mailto:maya@lindqvist.example?subject=Hi")
+        var partlyBold = AttributedString("Visit Google today")
+        partlyBold[partlyBold.range(of: "Google")!].link = URL(string: "https://google.com")
+        partlyBold[partlyBold.range(of: "Go")!].font = MailFontStyle(isBold: true).font
+        // A line break at the end of formatted text, and one at the end of a list item.
+        var softBreaks = AttributedString("end\u{2028}\n• item\u{2028}")
+        softBreaks[softBreaks.range(of: "end\u{2028}")!].font = MailFontStyle(isBold: true).font
         return [
-            Fixture.formattedBody(), mixed, colours, link,
+            Fixture.formattedBody(), mixed, colours, link, partlyBold, softBreaks,
             AttributedString(""), AttributedString("\n\n"), AttributedString("  spaced   out  \n\ttab\t"),
             AttributedString("<html> & \"quotes\" 'too'"), AttributedString("10\u{2009}km\u{3000}wide \u{2003}em"),
-            AttributedString(" \n"),
+            AttributedString(" \n"), AttributedString("Bonjour\u{00A0}! 10\u{00A0}km\u{00A0}\u{2028}x\u{00A0} y"),
         ]
+    }
+
+    /// Typed no-break spaces stay what they are, except where the writer itself writes one for a space: at either
+    /// end of a line and after a space. There the two look the same, so they are read as spaces and written the same.
+    @Test func noBreakSpacesAreKept() {
+        let body = MailHTMLWriter.write(AttributedString("Bonjour\u{00A0}! 10\u{00A0}km  apart"))
+        #expect(body.html == "<div>Bonjour&nbsp;! 10&nbsp;km &nbsp;apart</div>")
+        #expect(String(MailBodyHTMLReader.read(body.html).text.characters) == "Bonjour\u{00A0}! 10\u{00A0}km  apart")
+
+        let edges = MailHTMLWriter.write(AttributedString("\u{00A0}lead, trail\u{00A0}"))
+        let read = MailBodyHTMLReader.read(edges.html)
+        #expect(String(read.text.characters) == " lead, trail ")
+        #expect(MailHTMLWriter.write(read.text).html == edges.html)
     }
 
     @Test(arguments: roundTripBodies)

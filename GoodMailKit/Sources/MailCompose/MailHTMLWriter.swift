@@ -42,13 +42,7 @@ public enum MailHTMLWriter {
             number += 1
             let body = item.map { dropPrefix($0.prefixLength, from: paragraph) } ?? paragraph
             let attributes = paragraphAttributes(paragraph)
-            var content = inlineHTML(body)
-            if content.isEmpty {
-                content = "<br>"
-            } else if content.hasSuffix("<br>") {
-                // A line break at the very end of a block doesn't render; a second one makes it visible.
-                content += "<br>"
-            }
+            let content = body.characters.isEmpty ? "<br>" : inlineHTML(body)
             html += item == nil ? "<div\(attributes)>\(content)</div>" : "<li\(attributes)>\(content)</li>"
             // Recipients' clients number an <ol> themselves, so the text alternative counts the same way.
             let prefix = item.map { $0.isNumbered ? "\(number). " : MailBodyNormalizer.bullet } ?? ""
@@ -156,20 +150,30 @@ public enum MailHTMLWriter {
             html += escapeText(String(paragraph[run.range].characters), afterSpace: &afterSpace)
         }
         if afterSpace, html.hasSuffix(" ") { html = String(html.dropLast()) + "&nbsp;" }
+        // A line break at the very end of a block doesn't render, inside formatting or not; a second one shows it.
+        if html.hasSuffix("<br>") { html += "<br>" }
         for mark in open.reversed() { html += mark.close }
         return html
     }
 
+    /// The text with each link's target after it, once per link however its text is formatted.
     static func plainText(_ paragraph: AttributedSubstring) -> String {
         var text = ""
+        var link: (url: String, shown: String)?
+        func endLink() {
+            guard let (url, shown) = link else { return }
+            let target = url.lowercased().hasPrefix("mailto:") ? String(url.dropFirst(7)) : url
+            if shown != target { text += " <\(url)>" }
+            link = nil
+        }
         for run in paragraph.runs {
             let string = String(paragraph[run.range].characters)
+            let url = run.link?.absoluteString
+            if url != link?.url { endLink() }
+            if let url { link = (url, (link?.shown ?? "") + string) }
             text += string
-            if let url = run.link?.absoluteString {
-                let shown = url.lowercased().hasPrefix("mailto:") ? String(url.dropFirst(7)) : url
-                if shown != string { text += " <\(url)>" }
-            }
         }
+        endLink()
         return text.replacingOccurrences(of: "\u{2028}", with: "\n")
     }
 
@@ -185,6 +189,9 @@ public enum MailHTMLWriter {
             case "<": output += "&lt;"; previousWasSpace = false
             case ">": output += "&gt;"; previousWasSpace = false
             case "\u{2028}": output += "<br>"; previousWasSpace = true
+            // As the entity, like the no-break spaces written for runs of spaces: where the reader can't tell the
+            // two apart and reads a space, saving again writes the same HTML.
+            case "\u{00A0}": output += "&nbsp;"; previousWasSpace = false
             case "\t": output += "<span style=\"white-space: pre\">\t</span>"; previousWasSpace = false
             case " ":
                 output += previousWasSpace ? "&nbsp;" : " "
