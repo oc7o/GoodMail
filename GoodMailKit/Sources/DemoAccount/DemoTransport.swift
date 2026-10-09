@@ -23,6 +23,8 @@ public final class DemoTransport: HTTPTransport {
         /// Changes up to this state have been forgotten, like a server that pruned its history.
         var oldestKnownState = 0
         var isOffline = false
+        var rejectedEmailIDs: Set<String> = []
+        var updateRequestCount = 0
 
         mutating func record(_ id: String, _ kind: Change.Kind) {
             state += 1
@@ -52,6 +54,17 @@ public final class DemoTransport: HTTPTransport {
     public var isOffline: Bool {
         get { store.withLock { $0.isOffline } }
         set { store.withLock { $0.isOffline = newValue } }
+    }
+
+    /// Emails whose `Email/set` updates are refused with a `forbidden` SetError.
+    public var rejectedEmailIDs: Set<String> {
+        get { store.withLock { $0.rejectedEmailIDs } }
+        set { store.withLock { $0.rejectedEmailIDs = newValue } }
+    }
+
+    /// How many `Email/set` calls have been received.
+    public var updateRequestCount: Int {
+        store.withLock { $0.updateRequestCount }
     }
 
     /// Delivers a new plain-text message, as if someone had just sent it.
@@ -171,18 +184,34 @@ public final class DemoTransport: HTTPTransport {
             }
             return .result(base.merging(["list": .array(list)]) { $1 })
         case "Email/set":
+            store.updateRequestCount += 1
             guard case .object(let updates)? = arguments["update"] else { return .error("invalidArguments") }
+            let oldState = store.state
+            var updated: Object = [:]
+            var notUpdated: Object = [:]
             for (id, patch) in updates {
-                guard let index = store.emails.firstIndex(where: { $0["id"] == .string(id) }),
-                      case .object(let patch) = patch
-                else { continue }
+                guard let index = store.emails.firstIndex(where: { $0["id"] == .string(id) }) else {
+                    notUpdated[id] = ["type": "notFound"]
+                    continue
+                }
+                guard case .object(let patch) = patch else {
+                    notUpdated[id] = ["type": "invalidPatch"]
+                    continue
+                }
+                guard !store.rejectedEmailIDs.contains(id) else {
+                    notUpdated[id] = ["type": "forbidden", "description": "Rejected by the demo server"]
+                    continue
+                }
                 Self.apply(patch, to: &store.emails[index])
                 store.record(id, .updated)
+                updated[id] = .null
             }
-            return .result([
-                "accountId": .string(Self.accountId), "newState": .string(String(store.state)),
-                "updated": .object(updates.mapValues { _ in .null }),
-            ])
+            var result: Object = [
+                "accountId": .string(Self.accountId), "oldState": .string(String(oldState)),
+                "newState": .string(String(store.state)), "updated": .object(updated),
+            ]
+            if !notUpdated.isEmpty { result["notUpdated"] = .object(notUpdated) }
+            return .result(result)
         case "MaskedEmail/get":
             return .result(base.merging(["list": .array(store.maskedEmails.map(JSONValue.object))]) { $1 })
         case "MaskedEmail/set":
@@ -310,11 +339,12 @@ public final class DemoTransport: HTTPTransport {
                 continue
             }
             guard case .object(var flags) = email[components[0]] ?? .object([:]) else { continue }
+            let key = components[1].replacingOccurrences(of: "~1", with: "/").replacingOccurrences(of: "~0", with: "~")
             // Not `flags[key] = nil`: JSONValue is nil-literal convertible, so that would store a JSON null.
             if value == .null {
-                flags.removeValue(forKey: components[1])
+                flags.removeValue(forKey: key)
             } else {
-                flags[components[1]] = value
+                flags[key] = value
             }
             email[components[0]] = .object(flags)
         }

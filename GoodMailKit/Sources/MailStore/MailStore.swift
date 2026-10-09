@@ -24,6 +24,9 @@ public struct SavedSearch: Sendable, Hashable, Identifiable {
 /// It is a cache. Everything in it can be fetched again, so an unreadable database is simply replaced.
 /// Stored emails are kept truthful by applying `Email/changes`; `coverage` records how far back the
 /// copy of a mailbox is also complete, so lists never show a recent message while missing a newer one.
+///
+/// The one exception is the outbox: changes the user made that the server hasn't confirmed yet. They
+/// are applied to the stored emails right away and reapplied to every copy fetched until they are sent.
 public final class MailStore: Sendable {
     private let writer: any DatabaseWriter
 
@@ -119,6 +122,16 @@ public final class MailStore: Sendable {
                 try index(email, rowid: row["rowid"], db)
             }
         }
+        migrator.registerMigration("v3") { db in
+            try db.execute(sql: """
+                CREATE TABLE pendingChange (
+                    seq INTEGER PRIMARY KEY AUTOINCREMENT,
+                    emailId TEXT NOT NULL,
+                    patch BLOB NOT NULL
+                );
+                CREATE INDEX pendingChange_emailId ON pendingChange(emailId);
+                """)
+        }
         return migrator
     }
 
@@ -148,12 +161,20 @@ public final class MailStore: Sendable {
 
     /// Inserts emails or refreshes their keywords and mailboxes. Emails that come with a body keep it
     /// for good, since nothing else about a delivered email ever changes.
+    ///
+    /// Changes still waiting in the outbox are applied on top, so a copy fetched before the server got
+    /// them doesn't undo what the user did.
     public func upsert(_ emails: [Email]) async throws {
         guard !emails.isEmpty else { return }
         try await writer.write { db in
             let encoder = JMAPCoding.makeEncoder()
+            let hasPendingChanges = try Bool.fetchOne(db, sql: "SELECT EXISTS (SELECT 1 FROM pendingChange)")!
             for email in emails {
                 guard let threadId = email.threadId, let receivedAt = email.receivedAt else { continue }
+                var email = email
+                if hasPendingChanges {
+                    email = try Self.pendingPatches(for: email.id, db).reduce(email) { $0.applying($1) }
+                }
                 let isNew = try !Bool.fetchOne(db, sql: "SELECT EXISTS (SELECT 1 FROM email WHERE id = ?)", arguments: [email.id])!
                 try db.execute(sql: """
                     INSERT INTO email (id, threadId, receivedAt, isSeen, isFlagged, hasAttachment, json, body)
@@ -167,19 +188,20 @@ public final class MailStore: Sendable {
                         try encoder.encode(email.strippingBody()),
                         email.hasBody ? try encoder.encode(email) : nil,
                     ])
-
-                try db.execute(sql: "DELETE FROM emailMailbox WHERE emailId = ?", arguments: [email.id])
-                for mailboxId in (email.mailboxIds ?? [:]).keys {
-                    try db.execute(
-                        sql: "INSERT INTO emailMailbox (mailboxId, emailId) VALUES (?, ?)",
-                        arguments: [mailboxId, email.id])
-                }
+                try Self.storeMailboxes(of: email, db)
 
                 if isNew || email.hasBody {
                     let rowid = try Int64.fetchOne(db, sql: "SELECT rowid FROM email WHERE id = ?", arguments: [email.id])!
                     try Self.index(email, rowid: rowid, db)
                 }
             }
+        }
+    }
+
+    private static func storeMailboxes(of email: Email, _ db: Database) throws {
+        try db.execute(sql: "DELETE FROM emailMailbox WHERE emailId = ?", arguments: [email.id])
+        for mailboxId in (email.mailboxIds ?? [:]).keys {
+            try db.execute(sql: "INSERT INTO emailMailbox (mailboxId, emailId) VALUES (?, ?)", arguments: [mailboxId, email.id])
         }
     }
 
@@ -200,6 +222,7 @@ public final class MailStore: Sendable {
                 try db.execute(
                     sql: "DELETE FROM emailText WHERE rowid = (SELECT rowid FROM email WHERE id = ?)", arguments: [id])
                 try db.execute(sql: "DELETE FROM email WHERE id = ?", arguments: [id])
+                try db.execute(sql: "DELETE FROM pendingChange WHERE emailId = ?", arguments: [id])
             }
         }
     }
@@ -242,8 +265,8 @@ public final class MailStore: Sendable {
         }
     }
 
-    /// Forgets all emails and sync progress, keeping mailboxes. Used when the server can no longer
-    /// tell what changed since our last sync.
+    /// Forgets all emails and sync progress, keeping mailboxes and the outbox. Used when the server can
+    /// no longer tell what changed since our last sync.
     public func resetEmails() async throws {
         try await writer.write { db in
             try db.execute(sql: "DELETE FROM emailText; DELETE FROM email; DELETE FROM meta")
@@ -406,6 +429,88 @@ public final class MailStore: Sendable {
         try await writer.write { db in
             try db.execute(sql: "DELETE FROM savedSearch WHERE id = ?", arguments: [id])
         }
+    }
+
+    // MARK: Outbox
+
+    /// Changes to send to the server in one `Email/set`.
+    public struct PendingChanges: Sendable, Equatable {
+        /// The last queued change included; pass it to ``removePendingChanges(through:)`` once sent.
+        public let throughSeq: Int64
+        /// Each email's queued patches merged into one.
+        public let updates: [String: PatchObject]
+    }
+
+    /// Applies patches to the stored emails and queues them for the server. Emails that aren't stored
+    /// are queued all the same.
+    public func enqueue(_ updates: [String: PatchObject]) async throws {
+        guard !updates.isEmpty else { return }
+        try await writer.write { db in
+            let decoder = JMAPCoding.makeDecoder(), encoder = JMAPCoding.makeEncoder()
+            for (id, patch) in updates.sorted(by: { $0.key < $1.key }) {
+                if let json = try Data.fetchOne(db, sql: "SELECT json FROM email WHERE id = ?", arguments: [id]) {
+                    let email = try decoder.decode(Email.self, from: json).applying(patch)
+                    try db.execute(
+                        sql: "UPDATE email SET isSeen = ?, isFlagged = ?, json = ? WHERE id = ?",
+                        arguments: [email.has(.seen), email.has(.flagged), try encoder.encode(email), id])
+                    try Self.storeMailboxes(of: email, db)
+                }
+                try db.execute(
+                    sql: "INSERT INTO pendingChange (emailId, patch) VALUES (?, ?)",
+                    arguments: [id, try Self.patchEncoder.encode(patch)])
+            }
+        }
+    }
+
+    /// The oldest queued changes, merged per email, or `nil` if nothing is queued.
+    ///
+    /// Takes changes in order and stops before the first one for an email beyond `limit`, so a later
+    /// change is never sent ahead of an earlier one.
+    public func pendingChanges(limit: Int = 200) async throws -> PendingChanges? {
+        precondition(limit > 0)
+        return try await writer.read { db in
+            var updates: [String: PatchObject] = [:]
+            var throughSeq: Int64?
+            let rows = try Row.fetchCursor(db, sql: "SELECT seq, emailId, patch FROM pendingChange ORDER BY seq")
+            while let row = try rows.next() {
+                let id: String = row["emailId"]
+                if updates[id] == nil, updates.count == limit { break }
+                let patch = try JSONDecoder().decode(PatchObject.self, from: row["patch"])
+                updates[id] = updates[id].map { $0.merging(patch) } ?? patch
+                throughSeq = row["seq"]
+            }
+            return throughSeq.map { PendingChanges(throughSeq: $0, updates: updates) }
+        }
+    }
+
+    /// Drops queued changes up to and including `seq`; with `emailIDs`, only those to these emails.
+    public func removePendingChanges(through seq: Int64, emailIDs: Set<String>? = nil) async throws {
+        try await writer.write { db in
+            guard let emailIDs else {
+                return try db.execute(sql: "DELETE FROM pendingChange WHERE seq <= ?", arguments: [seq])
+            }
+            for id in emailIDs {
+                try db.execute(sql: "DELETE FROM pendingChange WHERE seq <= ? AND emailId = ?", arguments: [seq, id])
+            }
+        }
+    }
+
+    /// How many emails have changes waiting.
+    public func pendingEmailCount() async throws -> Int {
+        try await writer.read { db in
+            try Int.fetchOne(db, sql: "SELECT COUNT(DISTINCT emailId) FROM pendingChange") ?? 0
+        }
+    }
+
+    private static let patchEncoder = {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = .sortedKeys
+        return encoder
+    }()
+
+    private static func pendingPatches(for emailId: String, _ db: Database) throws -> [PatchObject] {
+        try Data.fetchAll(db, sql: "SELECT patch FROM pendingChange WHERE emailId = ? ORDER BY seq", arguments: [emailId])
+            .map { try JSONDecoder().decode(PatchObject.self, from: $0) }
     }
 
     // MARK: Sync progress

@@ -8,6 +8,7 @@ public struct MethodError: Decodable, Sendable, Equatable, Error {
     public static let cannotCalculateChanges = "cannotCalculateChanges"
     public static let stateMismatch = "stateMismatch"
     public static let tooManyChanges = "tooManyChanges"
+    public static let serverUnavailable = "serverUnavailable"
 }
 
 /// A per-object failure inside a `/set` response (RFC 8620 §5.3).
@@ -15,6 +16,8 @@ public struct SetError: Decodable, Sendable, Equatable, Error {
     public let type: String
     public let description: String?
     public let properties: [String]?
+
+    public static let notFound = "notFound"
 }
 
 public enum JMAPError: Error, Sendable, Equatable {
@@ -30,6 +33,23 @@ public enum JMAPError: Error, Sendable, Equatable {
     case unexpectedResponse(callId: String)
     case decoding(String)
     case transport(String)
+
+    /// The request-level problem type for exceeding a server limit (RFC 8620 §3.6.1).
+    public static let limitProblemType = "urn:ietf:params:jmap:error:limit"
+
+    /// Whether the same request may succeed later unchanged (offline, throttled, server trouble).
+    ///
+    /// A request over a limit counts as temporary because the one requests hit in practice is
+    /// `maxConcurrentRequests`.
+    public var isTemporary: Bool {
+        switch self {
+        case .transport, .rateLimited: true
+        case .http(let status, let problemType):
+            status == 408 || status == 429 || status >= 500 || problemType == Self.limitProblemType
+        case .method(let error): error.type == MethodError.serverUnavailable
+        default: false
+        }
+    }
 }
 
 extension JMAPError: LocalizedError {

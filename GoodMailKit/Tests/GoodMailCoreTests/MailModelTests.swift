@@ -345,14 +345,93 @@ struct MailModelTests {
         #expect(model.selectedThreadID == "t2")
     }
 
-    @Test func failedTriageIsReportedAndUndone() async {
+    // MARK: Outbox
+
+    private func serverEmail(_ id: String) async throws -> Email? {
+        try await JMAPClient(token: "demo", transport: server, maxRetries: 0).emails(ids: [id]).first
+    }
+
+    @Test func triageOfflineWaitsInTheOutboxAcrossLaunches() async throws {
         let model = await started()
         server.isOffline = true
 
-        await model.archive(threadID: "t1")
+        await model.archive(threadID: "t2")
 
-        #expect(model.errorMessage != nil)
-        #expect(model.threads.map(\.id).first == "t1")
-        #expect(model.thread(id: "t1")?.emails.first?.mailboxIds == ["inbox": true])
+        #expect(model.thread(id: "t2") == nil)
+        #expect(model.errorMessage == nil)
+        #expect(model.connectionProblem != nil)
+        #expect(model.pendingChangeCount == 1)
+
+        let relaunched = Self.makeModel(server: server, store: store)
+        await relaunched.start()
+        await relaunched.loadThreads()
+        #expect(relaunched.threads.map(\.id) == ["t1", "t3", "t4", "t5", "t6", "t7", "t8"])
+        #expect(relaunched.pendingChangeCount == 1)
+
+        server.isOffline = false
+        await relaunched.refresh()
+        #expect(relaunched.pendingChangeCount == 0)
+        #expect(relaunched.connectionProblem == nil)
+        #expect(relaunched.errorMessage == nil)
+        #expect(relaunched.thread(id: "t2") == nil)
+        #expect(try await serverEmail("e4")?.mailboxIds == ["archive": true])
+    }
+
+    @Test func sendingQueuedChangesAfterTheServerForgotItsHistoryReloadsTheList() async throws {
+        let model = await started()
+        server.isOffline = true
+        await model.archive(threadID: "t2")
+        server.deliver(id: "new1", threadId: "tNew", from: "Jonas", subject: "Lunch?", text: "Tomorrow?")
+        server.forgetChangeHistory()
+
+        server.isOffline = false
+        await model.refresh()
+
+        #expect(model.pendingChangeCount == 0)
+        #expect(model.threads.map(\.id) == ["tNew", "t1", "t3", "t4", "t5", "t6", "t7", "t8"])
+    }
+
+    @Test func refusedTriageIsReportedAndUndone() async throws {
+        let model = await started()
+        server.rejectedEmailIDs = ["e4"]
+
+        await model.archive(threadID: "t2")
+
+        #expect(model.errorMessage == "Fastmail didn't accept a change to a message: Rejected by the demo server.")
+        #expect(model.thread(id: "t2")?.emails.first?.mailboxIds == ["inbox": true])
+        #expect(model.pendingChangeCount == 0)
+        #expect(model.connectionProblem == nil)
+    }
+
+    @Test func changesMadeOfflineAreCoalescedIntoOneRequest() async throws {
+        let model = await started()
+        server.isOffline = true
+
+        await model.toggleFlag(threadID: "t1")
+        #expect(model.thread(id: "t1")?.isFlagged == true)
+        await model.toggleFlag(threadID: "t1")
+        #expect(model.thread(id: "t1")?.isFlagged == false)
+        #expect(model.pendingChangeCount == 1)
+
+        server.isOffline = false
+        let requests = server.updateRequestCount
+        await model.refresh()
+
+        #expect(server.updateRequestCount == requests + 1)
+        #expect(model.pendingChangeCount == 0)
+        #expect(try await serverEmail("e3")?.has(.flagged) == false)
+    }
+
+    @Test func changesQueuedDuringAFlushAreSentByIt() async throws {
+        let model = await started()
+
+        async let archived: Void = model.archive(threadID: "t2")
+        async let flagged: Void = model.toggleFlag(threadID: "t3")
+        async let refreshed: Void = model.refresh()
+        _ = await (archived, flagged, refreshed)
+
+        #expect(model.pendingChangeCount == 0)
+        #expect(try await serverEmail("e4")?.mailboxIds == ["archive": true])
+        #expect(try await serverEmail("e5")?.has(.flagged) == true)
     }
 }

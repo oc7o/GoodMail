@@ -260,4 +260,137 @@ struct MailStoreTests {
         #expect(try await threadIDs(.init(mailboxID: "inbox")) == [])
         #expect(try await threadIDs(.init(search: SearchQuery(parsing: "receipt"))) == [])
     }
+
+    // MARK: Outbox
+
+    @Test func queuedChangesApplyLocallyRightAway() async throws {
+        try await store.upsert([
+            Self.email("e1", thread: "t1", day: 1, seen: false, subject: "Receipt"),
+            Self.email("e2", thread: "t2", day: 2, seen: false),
+        ])
+        let archive: PatchObject = .move(from: "inbox", to: "archive").merging(.setKeyword(.seen, true))
+        let label: PatchObject = .setKeyword(.init(rawValue: "a/b~c"), true)
+
+        try await store.enqueue(["e1": archive, "e3": label])
+
+        #expect(try await threadIDs(.init(mailboxID: "inbox")) == ["t2"])
+        #expect(try await threadIDs(.init(mailboxID: "archive", search: SearchQuery(parsing: "receipt"))) == ["t1"])
+        #expect(try await threadIDs(.init(unreadOnly: true)) == ["t2"])
+        #expect(try await store.emails(ids: ["e1"]).first?.mailboxIds == ["archive": true])
+        #expect(try await store.emails(ids: ["e3"]).isEmpty)
+        #expect(try await store.pendingEmailCount() == 2)
+        #expect(try await store.pendingChanges() == .init(throughSeq: 2, updates: ["e1": archive, "e3": label]))
+    }
+
+    @Test func flagsChangedInTheOutboxAreFilterable() async throws {
+        try await store.upsert([Self.email("e1", thread: "t1", day: 1)])
+
+        try await store.enqueue(["e1": .setKeyword(.flagged, true)])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "is:flagged"))) == ["t1"])
+
+        try await store.enqueue(["e1": .setKeyword(.flagged, false)])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "is:flagged"))) == [])
+        #expect(try await store.pendingChanges()?.updates == ["e1": ["keywords/$flagged": nil]])
+        #expect(try await store.pendingEmailCount() == 1)
+    }
+
+    @Test func batchesStopBeforeAnEmailBeyondTheLimit() async throws {
+        let read: PatchObject = .setKeyword(.seen, true), flag: PatchObject = .setKeyword(.flagged, true)
+        for (id, patch) in [("e1", read), ("e2", read), ("e3", read), ("e1", flag)] {
+            try await store.enqueue([id: patch])
+        }
+
+        #expect(try await store.pendingChanges(limit: 3) == .init(
+            throughSeq: 4, updates: ["e1": read.merging(flag), "e2": read, "e3": read]))
+        // e1's flag comes after e3, which doesn't fit, so it has to wait too.
+        let first = try #require(try await store.pendingChanges(limit: 2))
+        #expect(first == .init(throughSeq: 2, updates: ["e1": read, "e2": read]))
+
+        try await store.removePendingChanges(through: first.throughSeq)
+        #expect(try await store.pendingEmailCount() == 2)
+        #expect(try await store.pendingChanges(limit: 2) == .init(throughSeq: 4, updates: ["e3": read, "e1": flag]))
+        #expect(try await store.pendingChanges(limit: 1) == .init(throughSeq: 3, updates: ["e3": read]))
+
+        try await store.removePendingChanges(through: 4, emailIDs: ["e1", "e2"])
+        #expect(try await store.pendingChanges() == .init(throughSeq: 3, updates: ["e3": read]))
+        try await store.removePendingChanges(through: 4)
+        #expect(try await store.pendingChanges() == nil)
+        #expect(try await store.pendingEmailCount() == 0)
+    }
+
+    @Test func fetchedCopiesKeepQueuedChangesUntilTheyAreSent() async throws {
+        let stale = Self.email("e1", thread: "t1", day: 1, seen: false, html: "<p>Quarterly numbers</p>")
+        try await store.upsert([stale])
+        try await store.enqueue(["e1": .moveExclusively(to: "archive")])
+        try await store.enqueue(["e1": .setKeyword(.seen, true)])
+
+        try await store.upsert([Self.email("e1", thread: "t1", day: 1, seen: false, flagged: true)])
+
+        let email = try #require(try await store.emailsWithBodies(inThread: "t1")?.first)
+        #expect(email.mailboxIds == ["archive": true])
+        #expect(email.keywords == ["$seen": true, "$flagged": true])
+        #expect(try await threadIDs(.init(mailboxID: "inbox")) == [])
+        #expect(try await threadIDs(.init(mailboxID: "archive", search: SearchQuery(parsing: "is:flagged is:read"))) == ["t1"])
+
+        try await store.removePendingChanges(through: 2)
+        try await store.upsert([stale])
+        #expect(try await store.emails(ids: ["e1"]).first?.keywords == [:])
+        #expect(try await threadIDs(.init(mailboxID: "inbox")) == ["t1"])
+    }
+
+    @Test func queuedChangesForEmailsNotYetStoredApplyWhenTheyArrive() async throws {
+        try await store.enqueue(["e1": .move(from: "inbox", to: "archive")])
+
+        try await store.upsert([Self.email("e1", thread: "t1", day: 1)])
+
+        #expect(try await store.emails(ids: ["e1"]).first?.mailboxIds == ["archive": true])
+        #expect(try await store.pendingEmailCount() == 1)
+    }
+
+    @Test func deletingEmailsDropsTheirQueuedChanges() async throws {
+        try await store.upsert([Self.email("e1", thread: "t1", day: 1), Self.email("e2", thread: "t2", day: 2)])
+        try await store.enqueue(["e1": .setKeyword(.flagged, true), "e2": .setKeyword(.flagged, true)])
+
+        try await store.deleteEmails(ids: ["e1"])
+
+        #expect(try await store.pendingChanges()?.updates.keys.sorted() == ["e2"])
+    }
+
+    @Test func resetKeepsQueuedChanges() async throws {
+        try await store.upsert([Self.email("e1", thread: "t1", day: 1)])
+        try await store.enqueue(["e1": .move(from: "inbox", to: "archive")])
+
+        try await store.resetEmails()
+        #expect(try await store.pendingEmailCount() == 1)
+
+        try await store.upsert([Self.email("e1", thread: "t1", day: 1)])
+        #expect(try await threadIDs(.init(mailboxID: "archive")) == ["t1"])
+    }
+
+    @Test func upgradingToTheOutboxKeepsStoredMail() async throws {
+        let database = try DatabaseQueue()
+        try MailStore.migrator.migrate(database, upTo: "v2")
+        let email = Self.email("e1", thread: "t1", day: 1, seen: false, subject: "Receipt")
+        try await database.write { db in
+            try db.execute(sql: """
+                INSERT INTO email (id, threadId, receivedAt, isSeen, json) VALUES ('e1', 't1', ?, 0, ?);
+                INSERT INTO emailMailbox (mailboxId, emailId) VALUES ('inbox', 'e1');
+                INSERT INTO emailText (rowid, subject) VALUES ((SELECT rowid FROM email WHERE id = 'e1'), 'Receipt');
+                INSERT INTO savedSearch (id, position, name, query) VALUES ('s1', 0, 'Unread', 'is:unread');
+                INSERT INTO meta (key, value) VALUES ('emailState', 's1');
+                """, arguments: [email.receivedAt!.timeIntervalSince1970, try JMAPCoding.makeEncoder().encode(email)])
+        }
+
+        let store = try MailStore(writer: database)
+
+        #expect(try await store.threads(matching: .init(mailboxID: "inbox", search: SearchQuery(parsing: "receipt")), limit: 5)
+            .map(\.id) == ["t1"])
+        #expect(try await store.savedSearches().map(\.id) == ["s1"])
+        #expect(try await store.emailState() == "s1")
+        #expect(try await store.pendingChanges() == nil)
+
+        try await store.enqueue(["e1": .move(from: "inbox", to: "archive")])
+        #expect(try await store.threads(matching: .init(mailboxID: "archive"), limit: 5).map(\.id) == ["t1"])
+        #expect(try await store.pendingEmailCount() == 1)
+    }
 }

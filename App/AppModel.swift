@@ -38,6 +38,8 @@ final class AppModel {
     private let keychain = Keychain(service: "dev.goodmail.GoodMail")
     private let tokenKey = "fastmail-api-token"
     private nonisolated static let storeKeyName = "mail-store-key"
+    /// The account whose mail is on disk.
+    private static let storeAccountDefaultsKey = "storeAccountID"
 
     func restore() {
         guard case .loading = state else { return }
@@ -72,10 +74,15 @@ final class AppModel {
             throw SignInError.missingScope(scope)
         }
 
-        // Whatever is left on disk belongs to an earlier sign-in, possibly a different account.
-        MailStore.destroy(at: Self.storeURL)
+        // Whatever is left on disk belongs to an earlier sign-in. Only the same account may keep it,
+        // along with any changes it couldn't send before its token stopped working.
+        let accountID = try? session.primaryAccountId(for: Capability.mail)
+        if accountID == nil || UserDefaults.standard.string(forKey: Self.storeAccountDefaultsKey) != accountID {
+            MailStore.destroy(at: Self.storeURL)
+        }
         let store = try openStore()
         try keychain.write(token, for: tokenKey)
+        UserDefaults.standard.set(accountID, forKey: Self.storeAccountDefaultsKey)
         state = .signedIn(mailModel(client: client, store: store))
     }
 
@@ -85,11 +92,20 @@ final class AppModel {
         try? keychain.delete(tokenKey)
         try? keychain.delete(Self.storeKeyName)
         MailStore.destroy(at: Self.storeURL)
+        UserDefaults.standard.removeObject(forKey: Self.storeAccountDefaultsKey)
+        state = .signedOut
+    }
+
+    /// Fastmail stopped accepting the token. The stored mail stays, so that changes still waiting to
+    /// be sent go out once the same account signs in again.
+    private func tokenRejected() {
+        if case .signedIn(let mail) = state { mail.stop() }
+        try? keychain.delete(tokenKey)
         state = .signedOut
     }
 
     private func mailModel(client: JMAPClient, store: MailStore) -> MailModel {
-        MailModel(client: client, store: store) { [weak self] in self?.signOut() }
+        MailModel(client: client, store: store) { [weak self] in self?.tokenRejected() }
     }
 
     // MARK: Stored mail
@@ -98,13 +114,17 @@ final class AppModel {
         URL.applicationSupportDirectory.appending(path: "GoodMail/Mail.sqlite")
     }
 
-    /// Opens the encrypted mail store. It only holds what the server has too, so a store that can't
-    /// be read (say, because its key is gone from the Keychain) is thrown away and started afresh.
+    /// Opens the encrypted mail store. Apart from changes not sent yet it only holds what the server
+    /// has too, so a store that can't be decrypted (say, because its key is gone from the Keychain) is
+    /// thrown away and started afresh.
     private func openStore() throws -> MailStore {
         let keychain = keychain
         func open() throws -> MailStore {
             try MailStore(url: Self.storeURL) { try Self.storeKey(in: keychain) }
         }
+        // A Keychain that can't be read right now, say before first unlock, is no reason to give up
+        // those unsent changes.
+        _ = try Self.storeKey(in: keychain)
 
         let store: MailStore
         do {

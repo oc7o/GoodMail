@@ -63,7 +63,7 @@ struct MailOperationsTests {
         #expect(args["fetchHTMLBodyValues"] == true)
     }
 
-    @Test func updateEmailsSendsPatchesAndThrowsSetErrors() async throws {
+    @Test func updateEmailsSendsPatchesAndReturnsRejections() async throws {
         transport.enqueue(fixture: "session")
         transport.enqueue(.init(body: Data("""
             {"sessionState": "s1", "methodResponses": [["Email/set",
@@ -71,12 +71,12 @@ struct MailOperationsTests {
                "notUpdated": {"e2": {"type": "notFound"}}}, "c0"]]}
             """.utf8)))
 
-        await #expect(throws: SetError(type: "notFound", description: nil, properties: nil)) {
-            try await makeClient().updateEmails([
-                "e1": .setKeyword(.seen, true),
-                "e2": .move(from: "mb1", to: "arch"),
-            ])
-        }
+        let rejected = try await makeClient().updateEmails([
+            "e1": .setKeyword(.seen, true),
+            "e2": .move(from: "mb1", to: "arch"),
+        ])
+
+        #expect(rejected == ["e2": SetError(type: SetError.notFound, description: nil, properties: nil)])
 
         guard case .object(let body)? = transport.requests.last?.jsonBody,
               case .array(let calls)? = body["methodCalls"], case .array(let call) = calls[0]
@@ -91,8 +91,29 @@ struct MailOperationsTests {
         ])
     }
 
+    @Test func updateEmailsReportsNothingWhenAllSucceed() async throws {
+        transport.enqueue(fixture: "session")
+        transport.enqueue(.init(body: Data("""
+            {"sessionState": "s1", "methodResponses": [["Email/set",
+              {"accountId": "u1234", "newState": "e2", "updated": {"e1": null}}, "c0"]]}
+            """.utf8)))
+
+        #expect(try await makeClient().updateEmails(["e1": .setKeyword(.seen, true)]).isEmpty)
+    }
+
+    @Test func updateEmailsThrowsMethodErrors() async throws {
+        transport.enqueue(fixture: "session")
+        transport.enqueue(.init(body: Data("""
+            {"sessionState": "s1", "methodResponses": [["error", {"type": "invalidArguments"}, "c0"]]}
+            """.utf8)))
+
+        await #expect(throws: JMAPError.method(MethodError(type: "invalidArguments", description: nil))) {
+            try await makeClient().updateEmails(["e1": .setKeyword(.seen, true)])
+        }
+    }
+
     @Test func updateEmailsWithNothingToDoSkipsTheNetwork() async throws {
-        try await makeClient().updateEmails([:])
+        #expect(try await makeClient().updateEmails([:]).isEmpty)
         #expect(transport.requests.isEmpty)
     }
 
@@ -106,6 +127,71 @@ struct MailOperationsTests {
         #expect(email.applying(.move(from: "inbox", to: "arch")).mailboxIds == ["arch": true])
         #expect(email.applying(.move(to: "label")).mailboxIds == ["inbox": true, "label": true])
         #expect(email.applying(.moveExclusively(to: "trash")).mailboxIds == ["trash": true])
+    }
+
+    static let mergeablePatches: [PatchObject] = [
+        .setKeyword(.seen, true),
+        .setKeyword(.seen, false),
+        .setKeyword(.flagged, true),
+        .move(from: "inbox", to: "arch"),
+        .move(from: "arch", to: "inbox"),
+        .move(to: "label"),
+        ["mailboxIds/label": nil],
+        .moveExclusively(to: "trash"),
+        ["mailboxIds": ["arch": true, "label": true]],
+        ["keywords": ["$draft": true]],
+        ["keywords": [:]],
+        ["keywords/a~1b~0c": true],
+        ["keywords/$seen": true, "mailboxIds/inbox": nil, "mailboxIds/arch": true],
+    ]
+
+    @Test(arguments: mergeablePatches)
+    func mergedPatchesApplyLikeSuccessivePatches(first: PatchObject) throws {
+        let email = try JMAPCoding.makeDecoder().decode(Email.self, from: Data("""
+            {"id": "e1", "mailboxIds": {"inbox": true, "label": true}, "keywords": {"$seen": true, "x": true}}
+            """.utf8))
+
+        for second in Self.mergeablePatches {
+            for third in Self.mergeablePatches {
+                let merged = first.merging(second).merging(third)
+                #expect(email.applying(merged) == email.applying(first).applying(second).applying(third),
+                    "\(first) + \(second) + \(third) -> \(merged)")
+                #expect(!merged.keys.contains { path in merged.keys.contains { path.hasPrefix($0 + "/") } },
+                    "\(merged) sets a property and a path inside it")
+            }
+        }
+    }
+
+    @Test func mergingFoldsPathsIntoEarlierValues() {
+        #expect(PatchObject.moveExclusively(to: "trash").merging(.move(from: "trash", to: "inbox"))
+            == ["mailboxIds": ["inbox": true]])
+        #expect(PatchObject.setKeyword(.seen, true).merging(["keywords": ["x": true]]) == ["keywords": ["x": true]])
+        #expect(PatchObject.setKeyword(.flagged, true).merging(.setKeyword(.flagged, false))
+            == ["keywords/$flagged": nil])
+        #expect((["subject": "a"] as PatchObject).merging(["keywords/$seen": true])
+            == ["subject": "a", "keywords/$seen": true])
+    }
+
+    @Test func mergingHandlesNestedAndEscapedPaths() {
+        let earlier: PatchObject = ["header:X": ["a/b": ["c": 1]], "other/x~1y/z": 1]
+        #expect(earlier.merging(["header:X/a~1b/d": 2, "other/x~1y": 3])
+            == ["header:X": ["a/b": ["c": 1, "d": 2]], "other/x~1y": 3])
+        #expect(earlier.merging(["header:X/a~1b/c": nil]) == ["header:X": ["a/b": [:]], "other/x~1y/z": 1])
+    }
+
+    @Test func temporaryErrorsAreRetryable() {
+        #expect(JMAPError.transport("offline").isTemporary)
+        #expect(JMAPError.rateLimited.isTemporary)
+        #expect(JMAPError.http(status: 503, problemType: nil).isTemporary)
+        #expect(JMAPError.http(status: 408, problemType: nil).isTemporary)
+        #expect(JMAPError.http(status: 429, problemType: nil).isTemporary)
+        #expect(JMAPError.http(status: 400, problemType: JMAPError.limitProblemType).isTemporary)
+        #expect(JMAPError.method(MethodError(type: MethodError.serverUnavailable, description: nil)).isTemporary)
+        #expect(!JMAPError.http(status: 400, problemType: nil).isTemporary)
+        #expect(!JMAPError.unauthorized.isTemporary)
+        #expect(!JMAPError.decoding("bad").isTemporary)
+        #expect(!JMAPError.method(MethodError(type: "invalidArguments", description: nil)).isTemporary)
+        #expect(!JMAPError.method(MethodError(type: "serverFail", description: nil)).isTemporary)
     }
 
     @Test func patchPathsEscapeJSONPointerTokens() {

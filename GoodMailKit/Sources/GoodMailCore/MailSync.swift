@@ -4,8 +4,9 @@ import MailStore
 
 /// Moves mail between the server and the local store.
 ///
-/// Stored emails stay truthful through `syncChanges()`. Everything else here only adds emails, so the
-/// calls can run in any order and repeat safely.
+/// Stored emails stay truthful through `syncChanges()`, with the user's changes queued in the store's
+/// outbox applied on top until `flushPendingChanges()` sends them. Everything else here only adds
+/// emails, so the calls can run in any order and repeat safely.
 public struct MailSync: Sendable {
     public enum Outcome: Sendable, Equatable {
         case unchanged
@@ -111,21 +112,76 @@ public struct MailSync: Sendable {
         return emails.count
     }
 
-    /// Applies patches to the stored emails ahead of the server and returns the previous versions.
-    public func stage(_ updates: [String: PatchObject]) async throws -> [Email] {
-        let originals = try await store.emails(ids: Array(updates.keys))
-        try await store.upsert(originals.map { email in updates[email.id].map(email.applying) ?? email })
-        return originals
+    // MARK: Outbox
+
+    public struct FlushResult: Sendable, Equatable {
+        /// Emails whose changes the server applied.
+        public var sent = 0
+        /// Emails whose changes the server refused; the store has its copy of them again.
+        public var rejected: [String: SetError] = [:]
     }
 
-    /// Sends staged patches to the server, restoring `originals` if it refuses.
-    public func commit(_ updates: [String: PatchObject], reverting originals: [Email]) async throws {
+    /// Applies patches to the stored emails right away and queues them for the server.
+    public func enqueue(_ updates: [String: PatchObject]) async throws {
+        try await store.enqueue(updates)
+    }
+
+    /// Sends queued changes until none are left.
+    ///
+    /// A thrown error leaves the changes queued for another try, unless the server could never accept
+    /// them (see ``discardsChanges(after:)``): then they are dropped so they don't block everything
+    /// queued after them, as soon as the affected emails could be fetched again, and the error rethrown.
+    /// Changes the server refuses one by one are dropped the same way.
+    public func flushPendingChanges() async throws -> FlushResult {
+        var result = FlushResult()
+        while let batch = try await store.pendingChanges() {
+            let ids = Set(batch.updates.keys)
+            let rejected: [String: SetError]
+            do {
+                rejected = try await client.updateEmails(batch.updates)
+            } catch {
+                if Self.discardsChanges(after: error) {
+                    try await restoreFromServer(ids, droppingChangesThrough: batch.throughSeq)
+                }
+                throw error
+            }
+            let missing = Set(rejected.filter { $0.value.type == SetError.notFound }.keys)
+            let refused = Set(rejected.keys).subtracting(missing)
+            try await store.removePendingChanges(through: batch.throughSeq, emailIDs: ids.subtracting(refused))
+            try await store.deleteEmails(ids: Array(missing))
+            result.sent += batch.updates.count - rejected.count
+            result.rejected.merge(rejected) { _, later in later }
+            try await restoreFromServer(refused, droppingChangesThrough: batch.throughSeq)
+        }
+        return result
+    }
+
+    /// Whether changes whose sending failed with `error` must be dropped because resending them can't
+    /// succeed. Connection trouble and an invalid token are worth waiting out.
+    static func discardsChanges(after error: Error) -> Bool {
+        guard let error = error as? JMAPError, !error.isTemporary else { return false }
+        switch error {
+        case .unauthorized, .missingCapability: return false
+        default: return true
+        }
+    }
+
+    /// Replaces the stored copies with the server's, rebased onto any changes queued after `seq`.
+    ///
+    /// The changes stay queued while the server can't be asked, so the stored copies never keep
+    /// showing a change that is no longer on its way; the next flush sends them again and ends up here.
+    private func restoreFromServer(_ ids: Set<String>, droppingChangesThrough seq: Int64) async throws {
+        guard !ids.isEmpty else { return }
+        let emails: [Email]
         do {
-            try await client.updateEmails(updates)
+            emails = try await client.emails(ids: Array(ids))
         } catch {
-            try? await store.upsert(originals)
+            if Self.discardsChanges(after: error) { try await store.removePendingChanges(through: seq, emailIDs: ids) }
             throw error
         }
+        try await store.removePendingChanges(through: seq, emailIDs: ids)
+        try await store.upsert(emails)
+        try await store.deleteEmails(ids: Array(ids.subtracting(emails.map(\.id))))
     }
 
     private func adoptStateIfFirst(_ state: String) async throws {

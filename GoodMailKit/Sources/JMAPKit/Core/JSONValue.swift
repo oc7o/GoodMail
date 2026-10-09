@@ -57,3 +57,39 @@ extension JSONValue: ExpressibleByNilLiteral, ExpressibleByBooleanLiteral, Expre
 
 /// A JMAP PatchObject: JSON pointer paths mapped to new values (`null` removes the property).
 public typealias PatchObject = [String: JSONValue]
+
+extension PatchObject {
+    /// A single patch equivalent to applying `self`, then `later`.
+    ///
+    /// JMAP rejects a patch that sets both a property and a path inside it, so instead of keeping both,
+    /// a later path is folded into an earlier value of one of its ancestors, and a later value drops
+    /// earlier paths inside it.
+    public func merging(_ later: PatchObject) -> PatchObject {
+        var merged = self
+        for (path, value) in later {
+            merged = merged.filter { !$0.key.hasPrefix(path + "/") }
+            if let ancestor = merged.keys.first(where: { path.hasPrefix($0 + "/") }) {
+                let tokens = path.dropFirst(ancestor.count + 1).split(separator: "/", omittingEmptySubsequences: false)
+                merged[ancestor] = merged[ancestor]?.setting(tokens.map { JSONPointer.unescape(String($0)) }, to: value)
+            } else {
+                merged[path] = value
+            }
+        }
+        return merged
+    }
+}
+
+extension JSONValue {
+    /// The value with the member at `tokens` replaced (or removed, for `null`) as a patch would do it.
+    fileprivate func setting(_ tokens: some Collection<String>, to value: JSONValue) -> JSONValue {
+        guard let token = tokens.first else { return value }
+        var object: [String: JSONValue] = if case .object(let object) = self { object } else { [:] }
+        let rest = tokens.dropFirst()
+        if rest.isEmpty, value == .null {
+            object[token] = nil
+        } else {
+            object[token] = (object[token] ?? .null).setting(rest, to: value)
+        }
+        return .object(object)
+    }
+}

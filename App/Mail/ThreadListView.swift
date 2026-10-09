@@ -92,7 +92,7 @@ struct ThreadListView: View {
         }
         .safeAreaInset(edge: .bottom) {
             if let problem = model.connectionProblem {
-                Label("Offline. Showing saved mail.", systemImage: "wifi.slash")
+                Label(offlineNotice, systemImage: "wifi.slash")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
                     .frame(maxWidth: .infinity)
@@ -122,6 +122,14 @@ struct ThreadListView: View {
             ("is:unread", "Unread"), ("is:flagged", "Flagged"), ("in:", "Mailbox"),
             ("after:\(monthAgo)", "Received since"), ("before:\(monthAgo)", "Received before"),
         ]
+    }
+
+    private var offlineNotice: String {
+        switch model.pendingChangeCount {
+        case 0: "Offline. Showing saved mail."
+        case 1: "Offline. 1 change waiting to sync."
+        case let count: "Offline. \(count) changes waiting to sync."
+        }
     }
 
     private var showsRecipients: Bool {

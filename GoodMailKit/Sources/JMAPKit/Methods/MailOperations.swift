@@ -148,11 +148,11 @@ extension JMAPClient {
         return EmailPage(emails: ids.compactMap { emailsById[$0] }, state: result.state, isLast: ids.count < limit)
     }
 
-    /// Applies one patch per email id. Throws the first `SetError` if the server rejects any of them.
-    public func updateEmails(_ updates: [String: PatchObject]) async throws {
-        guard !updates.isEmpty else { return }
+    /// Applies one patch per email id and returns the ones the server rejected, keyed by email id.
+    @discardableResult
+    public func updateEmails(_ updates: [String: PatchObject]) async throws -> [String: SetError] {
+        guard !updates.isEmpty else { return [:] }
         let accountId = try await accountId(for: Capability.mail)
-        let response = try await call(EmailSet(accountId: accountId, update: updates))
-        if let error = response.notUpdated?.min(by: { $0.key < $1.key })?.value { throw error }
+        return try await call(EmailSet(accountId: accountId, update: updates)).notUpdated ?? [:]
     }
 }

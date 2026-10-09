@@ -81,6 +81,8 @@ public final class MailModel {
     private var pinnedThreadIDs: [String] = []
     private var isLoadingMore = false
     @ObservationIgnored private var backgroundTask: Task<Void, Never>?
+    @ObservationIgnored private var flushTask: Task<Void, Never>?
+    @ObservationIgnored private var needsAnotherFlush = false
 
     public private(set) var maskedEmails: [MaskedEmail] = [] {
         didSet {
@@ -95,6 +97,8 @@ public final class MailModel {
     public var errorMessage: String?
     /// Why the server can't be reached right now, while lists keep showing stored mail.
     public private(set) var connectionProblem: String?
+    /// Emails with changes the server hasn't received yet.
+    public private(set) var pendingChangeCount = 0
 
     /// - Parameter syncsInBackground: Keep polling for changes, backfilling older mail and prefetching
     ///   bodies for as long as the model lives.
@@ -111,6 +115,7 @@ public final class MailModel {
         mailboxes = (try? await store.mailboxes()) ?? []
         savedSearches = (try? await store.savedSearches()) ?? []
         selectInboxIfNeeded()
+        await updatePendingChangeCount()
         username = try? await client.session().username
         await refresh()
         selectInboxIfNeeded()
@@ -123,8 +128,9 @@ public final class MailModel {
         backgroundTask = nil
     }
 
-    /// Brings mailboxes and stored mail up to date with the server.
+    /// Sends queued changes, then brings mailboxes and stored mail up to date with the server.
     public func refresh() async {
+        await flushPendingChanges()
         await loadMailboxes()
         do {
             let outcome = try await sync.syncChanges()
@@ -170,6 +176,7 @@ public final class MailModel {
 
     /// One slice of low-priority work. Returns whether more is waiting.
     private func performBackgroundWork() async -> Bool {
+        if pendingChangeCount > 0 { await flushPendingChanges() }
         do {
             if try await sync.backfillNextPage() { return true }
             return try await sync.prefetchBodies() > 0
@@ -501,36 +508,73 @@ public final class MailModel {
         await apply(Dictionary(uniqueKeysWithValues: targets.map { ($0.id, .moveExclusively(to: trash.id)) }))
     }
 
-    /// Changes the stored emails and the list right away, then tells the server; if it refuses, the
-    /// stored emails are put back.
+    /// Changes the stored emails and the list right away, then sends the change. While the server
+    /// can't be reached it waits in the outbox; if the server refuses it, the emails are put back the
+    /// way the server has them.
     private func apply(_ updates: [String: PatchObject], userInitiated: Bool = true) async {
         guard !updates.isEmpty else { return }
         let listedBefore = threads.map(\.id)
         do {
-            let originals = try await sync.stage(updates)
-            await showStoredThreads()
-            let removed = Set(listedBefore).subtracting(threads.map(\.id))
-            if let selected = selectedThreadID, removed.contains(selected) {
-                selectedThreadID = neighbour(of: selected, in: listedBefore, excluding: removed)
-            }
-            let serverCounts = (serverLoaded, serverTotal)
-            serverLoaded = max(0, serverLoaded - removed.count)
-            serverTotal = serverTotal.map { max(0, $0 - removed.count) }
-
-            do {
-                try await sync.commit(updates, reverting: originals)
-            } catch {
-                (serverLoaded, serverTotal) = serverCounts
-                report(error, userInitiated: userInitiated)
-                await showStoredThreads()
-                return
-            }
-            _ = try? await sync.syncChanges()
-            await loadMailboxes()
-            await showStoredThreads()
+            try await sync.enqueue(updates)
         } catch {
             report(error, userInitiated: userInitiated)
+            return
         }
+        await updatePendingChangeCount()
+        await showStoredThreads()
+        let removed = Set(listedBefore).subtracting(threads.map(\.id))
+        if let selected = selectedThreadID, removed.contains(selected) {
+            selectedThreadID = neighbour(of: selected, in: listedBefore, excluding: removed)
+        }
+        serverLoaded = max(0, serverLoaded - removed.count)
+        serverTotal = serverTotal.map { max(0, $0 - removed.count) }
+        await flushPendingChanges()
+    }
+
+    /// Sends everything in the outbox.
+    ///
+    /// Only one flush runs at a time; callers arriving meanwhile wait for it, and it then makes one
+    /// more pass so that a change queued after its last look at the outbox isn't left behind.
+    private func flushPendingChanges() async {
+        if let flushTask {
+            needsAnotherFlush = true
+            return await flushTask.value
+        }
+        let task = Task {
+            repeat {
+                needsAnotherFlush = false
+                await flushOnce()
+            } while needsAnotherFlush
+            // Cleared in here rather than by the awaiting caller, so no caller can find a finished task.
+            flushTask = nil
+        }
+        flushTask = task
+        await task.value
+    }
+
+    private func flushOnce() async {
+        do {
+            let result = try await sync.flushPendingChanges()
+            let refused = result.rejected.filter { $0.value.type != SetError.notFound }.sorted { $0.key < $1.key }
+            if let reason = refused.first?.value {
+                let messages = refused.count == 1 ? "a message" : "\(refused.count) messages"
+                errorMessage = "Fastmail didn't accept a change to \(messages): \(reason.description ?? reason.type)."
+            }
+            if result.sent > 0 {
+                connectionProblem = nil
+                if (try? await sync.syncChanges()) == .reset { await loadThreads(debounce: false) }
+                await loadMailboxes()
+            }
+            if result.sent > 0 || !result.rejected.isEmpty { await showStoredThreads() }
+        } catch {
+            report(error, userInitiated: MailSync.discardsChanges(after: error))
+            await showStoredThreads()
+        }
+        await updatePendingChangeCount()
+    }
+
+    private func updatePendingChangeCount() async {
+        if let count = try? await store.pendingEmailCount() { pendingChangeCount = count }
     }
 
     private func neighbour(of threadID: String, in order: [String], excluding removed: Set<String>) -> String? {
