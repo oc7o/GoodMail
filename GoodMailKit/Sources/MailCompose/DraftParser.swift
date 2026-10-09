@@ -29,7 +29,8 @@ public struct ParsedDraft: Sendable, Equatable {
 public enum DraftParser {
     public static func parse(_ email: Email, fallbackDomain: String) -> ParsedDraft {
         let htmlParts = (email.htmlBody ?? []).filter { $0.type?.lowercased() == "text/html" }
-        let textParts = ((email.textBody ?? []) + (email.htmlBody ?? [])).filter { $0.type?.lowercased() == "text/plain" }
+        let textParts = ((email.textBody ?? []) + (email.htmlBody ?? []))
+            .filter { $0.type?.lowercased() == "text/plain" }
         let plainAlternative = uniqueParts(textParts).compactMap { QuotedMessage.value(of: $0, in: email) }
             .joined(separator: "\n")
 
@@ -101,24 +102,15 @@ public enum DraftParser {
             let clean = OutgoingHTMLSanitizer.sanitize(html, options: options).html
             var nodes = HTMLNode.parse(clean)
 
-            if let quote = Self.lastIndex(in: nodes, skippingEmptyBlocks: true),
-               nodes[quote].name == "blockquote", nodes[quote].attributes["type"]?.lowercased() == "cite"
-            {
-                var start = quote
-                var attribution: String?
-                if let previous = Self.lastIndex(in: nodes, before: quote), Self.isAttribution(nodes[previous]) {
-                    start = previous
-                    attribution = Self.collapsed(nodes[previous].plainText)
-                }
-                let tailHTML = String(clean[nodes[start].range.lowerBound..<nodes[quote].range.upperBound])
-                let sanitized = OutgoingHTMLSanitizer.sanitize(tailHTML)
+            if let (attribution, quote) = Self.removeTail(from: &nodes) {
+                let start = (attribution ?? quote).range.lowerBound
+                let sanitized = OutgoingHTMLSanitizer.sanitize(String(clean[start..<quote.range.upperBound]))
                 tail = PreservedTail(
                     html: sanitized.html,
                     text: Self.tailText(
-                        attribution: attribution, quote: nodes[quote], plainAlternative: plainAlternative),
+                        attribution: attribution.map { Self.collapsed($0.plainText) }, quote: quote,
+                        plainAlternative: plainAlternative),
                     inlineParts: Self.inlineParts(sanitized.contentIDs, of: email))
-                nodes.removeSubrange(start...)
-                Self.removeSeparator(from: &nodes)
             }
 
             if let last = Self.lastIndex(in: nodes, skippingEmptyBlocks: false),
@@ -130,6 +122,44 @@ public enum DraftParser {
                 hasSignature = true
             }
             body = MailBodyHTMLReader.read(nodes: nodes)
+        }
+
+        /// Takes a trailing `<blockquote type="cite">` and the attribution line before it out of `nodes`, with the
+        /// empty line that separates them from the text. Apple Mail's layouts are recognised too: on the Mac the
+        /// quote, attribution inside, ends a trailing `<div>`; on iOS the attribution is quoted on its own at the
+        /// end of the `<div>` before the quote.
+        static func removeTail(from nodes: inout [HTMLNode]) -> (attribution: HTMLNode?, quote: HTMLNode)? {
+            guard let last = lastIndex(in: nodes, skippingEmptyBlocks: true) else { return nil }
+            let node = nodes[last]
+            if node.name == "blockquote", node.attributes["type"]?.lowercased() == "cite" {
+                var start = last
+                var attribution: HTMLNode?
+                if let previous = lastIndex(in: nodes, before: last) {
+                    if isAttribution(nodes[previous]) {
+                        start = previous
+                        attribution = nodes[previous]
+                    } else if case .element("div", let attributes, var children) = nodes[previous].content,
+                              let inner = lastIndex(in: children, skippingEmptyBlocks: false),
+                              children[inner].name == "blockquote", isAttribution(children[inner]) {
+                        attribution = children[inner]
+                        children.removeSubrange(inner...)
+                        removeSeparator(from: &children)
+                        nodes[previous] = HTMLNode(
+                            content: .element(name: "div", attributes: attributes, children: children),
+                            range: nodes[previous].range)
+                    }
+                }
+                nodes.removeSubrange(start...)
+                removeSeparator(from: &nodes)
+                return (attribution, node)
+            }
+            guard case .element("div", let attributes, var children) = node.content,
+                  let found = removeTail(from: &children)
+            else { return nil }
+            nodes[last] = HTMLNode(
+                content: .element(name: "div", attributes: attributes, children: children), range: node.range)
+            nodes.removeSubrange((last + 1)...)
+            return found
         }
 
         /// The last node that isn't whitespace (and, if asked, isn't an empty block such as `<div><br></div>`).
@@ -159,7 +189,7 @@ public enum DraftParser {
 
         /// A short line of text ending in a colon, such as "On 9 Oct 2026 at 14:03 UTC, Maya wrote:".
         static func isAttribution(_ node: HTMLNode) -> Bool {
-            guard node.name == "div" || node.name == "p",
+            guard ["div", "p", "blockquote"].contains(node.name),
                   node.children.allSatisfy({ child in
                       child.name.map { !["div", "p", "blockquote", "ul", "ol", "table"].contains($0) } ?? true
                   })
@@ -207,7 +237,9 @@ extension HTMLNode {
         case .text(let text):
             return HTMLEscaping.text(text)
         case .element(let name, let attributes, let children):
-            let attributeList = attributes.keys.sorted().map { " \($0)=\"\(HTMLEscaping.attribute(attributes[$0] ?? ""))\"" }
+            let attributeList = attributes.keys.sorted().map { key in
+                " \(key)=\"\(HTMLEscaping.attribute(attributes[key] ?? ""))\""
+            }
             let open = "<\(name)\(attributeList.joined())>"
             if OutgoingHTMLSanitizer.voidElements.contains(name) { return open }
             return open + children.map(\.markup).joined() + "</\(name)>"

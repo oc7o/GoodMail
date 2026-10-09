@@ -71,7 +71,9 @@ public enum UnsubscribeTarget {
         // IPv4-mapped ::ffff:0:0/96, IPv4-compatible ::/96 and NAT64 64:ff9b::/96 carry an IPv4 address.
         if isZero(0..<10) && bytes[10] == 0xFF && bytes[11] == 0xFF { return isPublic(v4: Array(bytes[12..<16])) }
         if isZero(0..<12) { return false }
-        if bytes[0..<12] == [0x00, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0] { return isPublic(v4: Array(bytes[12..<16])) }
+        if bytes[0..<12] == [0x00, 0x64, 0xFF, 0x9B, 0, 0, 0, 0, 0, 0, 0, 0] {
+            return isPublic(v4: Array(bytes[12..<16]))
+        }
         if first == 0x20 && bytes[1] == 0x02 { return isPublic(v4: Array(bytes[2..<6])) } // 6to4 2002::/16
         return true
     }

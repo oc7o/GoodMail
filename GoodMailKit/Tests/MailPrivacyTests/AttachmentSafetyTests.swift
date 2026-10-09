@@ -53,14 +53,21 @@ struct SafeFilenameTests {
 
 struct PhotoMetadataTests {
     static func image(type: UTType, gps: Bool) throws -> Data {
-        let context = try #require(CGContext(
+        try #require(encoded(type: type, gps: gps))
+    }
+
+    /// nil when this Mac can't encode the type (HEIC needs a hardware encoder some virtual machines lack).
+    static func encoded(type: UTType, gps: Bool) -> Data? {
+        guard let context = CGContext(
             data: nil, width: 8, height: 6, bitsPerComponent: 8, bytesPerRow: 0,
-            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue))
+            space: CGColorSpace(name: CGColorSpace.sRGB)!, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)
+        else { return nil }
         context.setFillColor(red: 0.2, green: 0.5, blue: 0.8, alpha: 1)
         context.fill(CGRect(x: 0, y: 0, width: 8, height: 6))
-        let image = try #require(context.makeImage())
         let data = NSMutableData()
-        let destination = try #require(CGImageDestinationCreateWithData(data, type.identifier as CFString, 1, nil))
+        guard let image = context.makeImage(),
+              let destination = CGImageDestinationCreateWithData(data, type.identifier as CFString, 1, nil)
+        else { return nil }
         var properties: [CFString: Any] = [
             kCGImagePropertyTIFFDictionary: [kCGImagePropertyTIFFMake: "Camera", kCGImagePropertyTIFFModel: "One"],
             kCGImagePropertyOrientation: 6,
@@ -72,9 +79,10 @@ struct PhotoMetadataTests {
             ]
         }
         CGImageDestinationAddImage(destination, image, properties as CFDictionary)
-        #expect(CGImageDestinationFinalize(destination))
-        return data as Data
+        return CGImageDestinationFinalize(destination) ? data as Data : nil
     }
+
+    static let encodableTypes = [UTType.jpeg, .heic, .png, .tiff].filter { encoded(type: $0, gps: false) != nil }
 
     static func properties(_ data: Data) throws -> [CFString: Any] {
         let source = try #require(CGImageSourceCreateWithData(data as CFData, nil))
@@ -82,7 +90,7 @@ struct PhotoMetadataTests {
     }
 
     /// HEIC is what an iPhone camera writes; ImageIO's exclude-GPS option leaves its location in place.
-    @Test(arguments: [UTType.jpeg, .heic, .png, .tiff])
+    @Test(arguments: encodableTypes)
     func removesTheLocationAndKeepsTheImage(type: UTType) throws {
         let original = try Self.image(type: type, gps: true)
         #expect(try Self.properties(original)[kCGImagePropertyGPSDictionary] != nil)
@@ -96,6 +104,10 @@ struct PhotoMetadataTests {
         #expect(properties[kCGImagePropertyPixelWidth] as? Int == 8)
         #expect(properties[kCGImagePropertyPixelHeight] as? Int == 6)
         #expect(properties[kCGImagePropertyOrientation] as? Int == 6)
+    }
+
+    @Test func coversTheCommonPhotoFormats() {
+        #expect(Self.encodableTypes.contains(.jpeg) && Self.encodableTypes.contains(.png))
     }
 
     @Test func findsPhotosWithAVagueType() throws {

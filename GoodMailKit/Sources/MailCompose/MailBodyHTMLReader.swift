@@ -103,7 +103,7 @@ public enum MailBodyHTMLReader {
                 appendLineBreaks(pendingBreaks - 1)
                 pendingBreaks = 0
             }
-            if trailingCollapsibleSpace {
+            if trailingCollapsibleSpace, current.characters.last == " " {
                 current.removeSubrange(current.characters.index(before: current.endIndex)..<current.endIndex)
             }
             if needsBlankLine, let last = paragraphs.last, !last.text.characters.isEmpty {
@@ -221,7 +221,10 @@ public enum MailBodyHTMLReader {
                 visitBlock(children, block)
                 if !paragraphs.isEmpty { needsBlankLine = true }
             case "td", "th":
-                if hasContent { append("\t") }
+                if hasContent {
+                    append("\t")
+                    trailingCollapsibleSpace = false
+                }
                 visit(children)
             case "p", "div", "blockquote", "center", "address", "pre", "h1", "h2", "h3", "h4", "h5", "h6", "dl", "dt",
                  "dd", "caption", "table", "tbody", "thead", "tfoot", "tr":
@@ -305,7 +308,11 @@ public enum MailBodyHTMLReader {
                     if value.contains("underline") { style.underline = true }
                     if value.contains("line-through") { style.strike = true }
                 case "font-family":
-                    if Self.isMonospaced(family: value) { style.font.isMonospaced = true } else { dropped.insert(.fonts) }
+                    if Self.isMonospaced(family: value) {
+                        style.font.isMonospaced = true
+                    } else {
+                        dropped.insert(.fonts)
+                    }
                 case "font":
                     dropped.insert(.fonts)
                 case "font-size":
@@ -364,7 +371,7 @@ public enum MailBodyHTMLReader {
                 else if value.hasSuffix("pt") { number / 12 }
                 else if value.hasSuffix("em") || value.hasSuffix("rem") { number }
                 else { 1 }
-            style.font.size = MailFontStyle.Size.allCases.min { abs($0.scale - ratio) < abs($1.scale - ratio) } ?? .normal
+            style.font.size = MailFontStyle.Size.nearest(to: ratio)
         }
 
         mutating func applyColor(_ value: String) {

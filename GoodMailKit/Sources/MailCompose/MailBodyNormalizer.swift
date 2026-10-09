@@ -6,19 +6,26 @@ import SwiftUI
 ///
 /// The editor ignores Foundation's block presentation intents (Markdown lists and quotes collapse into one line),
 /// so text from Markdown, App Intents (`.mail.createDraft` passes `body: AttributedString?`) or the clipboard is
-/// flattened before it is shown. Nested lists become one level: the editor has no indentation.
+/// flattened before it is shown. Blocks are separated by an empty line, as they are when rendered, except items
+/// of the same list; nested lists become one level, since the editor has no indentation.
 public enum MailBodyNormalizer {
     public static let bullet = ListItem.bullet
 
     public static func normalize(_ input: AttributedString) -> AttributedString {
         var output = AttributedString()
         var previousBlock: Int?
+        var previousList: Int?
         for (intent, range) in input.runs[\.presentationIntent] {
             var piece = AttributedString(input[range])
             let block = intent?.components.first?.identity
-            if block != previousBlock, !output.characters.isEmpty, output.characters.last != "\n" {
-                output.append(AttributedString("\n"))
+            let list = intent?.components.last { $0.kind == .orderedList || $0.kind == .unorderedList }?.identity
+            if block != previousBlock, !output.characters.isEmpty {
+                if output.characters.last != "\n" { output.append(AttributedString("\n")) }
+                if intent != nil, previousBlock != nil, list == nil || list != previousList {
+                    output.append(AttributedString("\n"))
+                }
             }
+            previousList = list
             if let intent, block != previousBlock {
                 piece = prefix(for: intent) + piece
                 for component in intent.components {

@@ -79,8 +79,8 @@ struct HTMLReaderTests {
     }
 
     @Test func tablesBecomeTabSeparatedLines() {
-        let result = MailBodyHTMLReader.read("<table><tr><td>a</td><td>b</td></tr><tr><td>c</td><td>d</td></tr></table>")
-        #expect(String(result.text.characters) == "a\tb\nc\td")
+        let result = MailBodyHTMLReader.read("<table><tr><td>a</td><td>b</td></tr><tr><td>c </td><td>d</td></tr></table>")
+        #expect(String(result.text.characters) == "a\tb\nc \td")
     }
 
     @Test func paragraphMarginsReadAsEmptyLines() {

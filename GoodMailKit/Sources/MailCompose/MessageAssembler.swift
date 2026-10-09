@@ -66,9 +66,8 @@ public enum MessageAssembler {
         }
 
         if draft.includesSignature, let signature = options.signature, !signature.isEmpty {
-            let sanitized = signature.html.flatMap { $0.allSatisfy(\.isWhitespace) ? nil : OutgoingHTMLSanitizer.sanitize($0) }
-            let signatureText = signature.text.map(unifiedLineBreaks).flatMap { $0.allSatisfy(\.isWhitespace) ? nil : $0 }
-                ?? sanitized?.text ?? ""
+            let sanitized = nonBlank(signature.html).map { OutgoingHTMLSanitizer.sanitize($0) }
+            let signatureText = nonBlank(signature.text).map(unifiedLineBreaks) ?? sanitized?.text ?? ""
             html.append("<div class=\"signature\">\(sanitized?.html ?? Self.html(fromPlainText: signatureText))</div>")
             text.append(startsWithDelimiter(signatureText) ? signatureText : "-- \n" + signatureText)
             add(sanitized)
@@ -82,8 +81,10 @@ public enum MessageAssembler {
         } else if let original = draft.original, let quoted = quotedBody(original.quote) {
             switch draft.kind {
             case .reply, .replyAll:
-                let line = attribution(for: original.quote, hidingSender: options.hidesAddress(original.quote.fromEmail))
-                html.append("<div>\(HTMLEscaping.text(line))</div><blockquote type=\"cite\">\(quoted.html)</blockquote>")
+                let hidden = options.hidesAddress(original.quote.fromEmail)
+                let line = attribution(for: original.quote, hidingSender: hidden)
+                html.append(
+                    "<div>\(HTMLEscaping.text(line))</div><blockquote type=\"cite\">\(quoted.html)</blockquote>")
                 text.append(line + "\n" + quoteLines(quoted.text))
                 add(quoted.sanitized)
             case .forward:
@@ -91,17 +92,18 @@ public enum MessageAssembler {
                 html.append("<div>Begin forwarded message:</div><blockquote type=\"cite\">"
                     + header.map { "<div><b>\($0.name):</b> \(HTMLEscaping.text($0.value))</div>" }.joined()
                     + separator + quoted.html + "</blockquote>")
-                text.append("Begin forwarded message:\n\n" + header.map { "\($0.name): \($0.value)" }.joined(separator: "\n")
-                    + "\n\n" + quoted.text)
+                let headerText = header.map { "\($0.name): \($0.value)" }.joined(separator: "\n")
+                text.append("Begin forwarded message:\n\n" + headerText + "\n\n" + quoted.text)
                 add(quoted.sanitized)
             case .new, .forwardAsAttachment:
                 break
             }
         }
 
-        let body = html.joined(separator: separator)
-        let document = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>\(body)</body></html>"
-        return OutgoingBody(html: document, text: text.joined(separator: "\n\n"), contentIDs: contentIDs, removedTrackers: trackers)
+        let document = "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>"
+            + html.joined(separator: separator) + "</body></html>"
+        return OutgoingBody(
+            html: document, text: text.joined(separator: "\n\n"), contentIDs: contentIDs, removedTrackers: trackers)
     }
 
     /// "On 9 Oct 2026 at 14:03 UTC, Maya Lindqvist <maya@lindqvist.example> wrote:"
@@ -140,7 +142,8 @@ public enum MessageAssembler {
     static func quotedBody(_ quote: QuotedMessage) -> QuotedBody? {
         if let html = quote.html {
             let sanitized = OutgoingHTMLSanitizer.sanitize(html)
-            return QuotedBody(html: sanitized.html, text: quote.text.map(unifiedLineBreaks) ?? sanitized.text, sanitized: sanitized)
+            let text = quote.text.map(unifiedLineBreaks) ?? sanitized.text
+            return QuotedBody(html: sanitized.html, text: text, sanitized: sanitized)
         }
         guard let text = quote.text.map(unifiedLineBreaks) else { return nil }
         return QuotedBody(html: html(fromPlainText: text), text: text, sanitized: nil)
@@ -175,6 +178,10 @@ public enum MessageAssembler {
     static func startsWithDelimiter(_ signature: String) -> Bool {
         let firstLine = signature.prefix { $0 != "\n" }
         return firstLine.trimmingCharacters(in: .whitespaces) == "--"
+    }
+
+    static func nonBlank(_ text: String?) -> String? {
+        text.flatMap { $0.allSatisfy(\.isWhitespace) ? nil : $0 }
     }
 
     static func unifiedLineBreaks(_ text: String) -> String {

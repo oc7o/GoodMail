@@ -114,7 +114,8 @@ extension AttributedString {
         guard case .insertionPoint(let caret) = selection.indices(in: self), caret > startIndex else { return false }
         let newline = characters.index(before: caret)
         guard characters[newline] == "\n" else { return false }
-        let paragraphStart = characters[..<newline].lastIndex(of: "\n").map { characters.index(after: $0) } ?? startIndex
+        let paragraphStart = characters[..<newline].lastIndex(of: "\n").map { characters.index(after: $0) }
+            ?? startIndex
         guard let item = listItem(at: paragraphStart) else { return false }
         let typing = selection.typingAttributes(in: self)
         let startOffset = characters.distance(from: startIndex, to: paragraphStart)

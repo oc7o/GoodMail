@@ -106,7 +106,9 @@ public enum OutgoingHTMLSanitizer {
         "block", "inline", "inline-block", "none", "table", "table-row", "table-cell", "list-item",
     ]
     static let linkSchemes: Set<String> = ["http", "https", "mailto", "tel"]
-    static let dataImageTypes = ["data:image/png", "data:image/gif", "data:image/jpeg", "data:image/jpg", "data:image/webp"]
+    static let dataImageTypes = [
+        "data:image/png", "data:image/gif", "data:image/jpeg", "data:image/jpg", "data:image/webp",
+    ]
 
     // MARK: Tokeniser and emitter
 
@@ -182,7 +184,8 @@ public enum OutgoingHTMLSanitizer {
                 if cursor < source.count, source[cursor] == UInt8(ascii: "=") {
                     cursor += 1
                     while cursor < source.count, isSpace(source[cursor]) { cursor += 1 }
-                    if cursor < source.count, source[cursor] == UInt8(ascii: "\"") || source[cursor] == UInt8(ascii: "'") {
+                    if cursor < source.count,
+                       source[cursor] == UInt8(ascii: "\"") || source[cursor] == UInt8(ascii: "'") {
                         let quote = source[cursor]
                         let valueStart = cursor + 1
                         cursor = valueStart
@@ -419,7 +422,8 @@ public enum OutgoingHTMLSanitizer {
             if preDepth > 0 {
                 text += decoded
             } else {
-                let collapsed = decoded.replacingOccurrences(of: #"[ \t\r\n\f]+"#, with: " ", options: .regularExpression)
+                let collapsed = decoded.replacingOccurrences(
+                    of: #"[ \t\r\n\f]+"#, with: " ", options: .regularExpression)
                 if collapsed == " " && (text.isEmpty || text.hasSuffix("\n") || text.hasSuffix(" ")) { return }
                 text += (text.isEmpty || text.hasSuffix("\n")) ? String(collapsed.drop { $0 == " " }) : collapsed
             }

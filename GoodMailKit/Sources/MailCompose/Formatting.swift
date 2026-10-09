@@ -78,6 +78,10 @@ public struct MailFontStyle: Hashable, Sendable {
         /// The CSS `font-size` the HTML writer uses; normal text has none.
         var css: String? { ["80%", nil, "130%", "170%"][rawValue] }
         public var title: String { ["Small", "Normal", "Large", "Huge"][rawValue] }
+
+        static func nearest(to ratio: Double) -> Size {
+            allCases.min { abs($0.scale - ratio) < abs($1.scale - ratio) } ?? .normal
+        }
     }
 
     public var isBold: Bool
@@ -105,8 +109,7 @@ public struct MailFontStyle: Hashable, Sendable {
         isBold = resolved.isBold
         isItalic = resolved.isItalic
         isMonospaced = resolved.isMonospaced
-        let ratio = resolved.pointSize / Font.default.resolve(in: context).pointSize
-        size = Size.allCases.min { abs($0.scale - ratio) < abs($1.scale - ratio) } ?? .normal
+        size = Size.nearest(to: resolved.pointSize / Font.default.resolve(in: context).pointSize)
     }
 
     /// The canonical font for this style; nil for plain text, so the environment's font applies. Sizes scale the

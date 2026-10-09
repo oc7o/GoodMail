@@ -60,13 +60,19 @@ struct NormalizerTests {
             markdown: "# Agenda\n\n- **Budget** review\n- *Hiring*\n  - nested\n\n1. first\n2. second\n\nSee `code` and ~~old~~.",
             options: .init(interpretedSyntax: .full))
         let normalized = MailBodyNormalizer.normalize(markdown)
-        #expect(String(normalized.characters) == "Agenda\n• Budget review\n• Hiring\n• nested\n1. first\n2. second\nSee code and old.")
+        #expect(String(normalized.characters)
+                == "Agenda\n\n• Budget review\n• Hiring\n• nested\n\n1. first\n2. second\n\nSee code and old.")
         #expect(MailHTMLWriter.write(normalized).html == """
-            <div><span style="font-size: 170%"><b>Agenda</b></span></div><ul><li><b>Budget</b> review</li>\
-            <li><i>Hiring</i></li><li>nested</li></ul><ol><li>first</li><li>second</li></ol>\
+            <div><span style="font-size: 170%"><b>Agenda</b></span></div><div><br></div><ul><li><b>Budget</b> review</li>\
+            <li><i>Hiring</i></li><li>nested</li></ul><div><br></div><ol><li>first</li><li>second</li></ol><div><br></div>\
             <div>See <code>code</code> and <s>old</s>.</div>
             """)
         #expect(normalized.runs.allSatisfy { $0.presentationIntent == nil && $0.inlinePresentationIntent == nil })
+    }
+
+    @Test func plainTextIsLeftAlone() {
+        let text = AttributedString("Hi Anna,\n\nthanks!\n- not a list\n**not bold**")
+        #expect(MailBodyNormalizer.normalize(text) == text)
     }
 
     @Test func unifiesLineBreaks() {

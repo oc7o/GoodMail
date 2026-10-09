@@ -111,7 +111,8 @@ public enum AddressParser {
         if character.isASCII {
             return character.isLetter || character.isNumber || "!#$%&'*+/=?^_`{|}~-".contains(character)
         }
-        return !character.isWhitespace && !character.unicodeScalars.contains { $0.properties.generalCategory == .control }
+        return !character.isWhitespace
+            && !character.unicodeScalars.contains { $0.properties.generalCategory == .control }
     }
 
     static func isValidDomain(_ domain: String) -> Bool {

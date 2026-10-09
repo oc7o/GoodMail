@@ -64,6 +64,16 @@ struct DraftParserTests {
         #expect(again.text == body.text)
     }
 
+    @Test func emptyLinesAtTheEndOfTheTextSurvive() {
+        var draft = Self.reply()
+        draft.body = AttributedString("Hi\n\n")
+        let (email, body) = Self.saved(draft, signature: Self.signature)
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+        #expect(parsed.fidelity == .exact)
+        #expect(String(parsed.draft.body.characters) == "Hi\n\n")
+        #expect(MessageAssembler.assemble(parsed.draft, options: AssemblyOptions(signature: Self.signature)).html == body.html)
+    }
+
     @Test func draftsWithoutSignatureOrQuote() {
         var draft = MessageDraft(from: EmailAddress(email: "fjord.k3x9@fastmail.com"), subject: "Question", body: AttributedString("Hi\n\nthere\n"))
         let (email, body) = Self.saved(draft, signature: nil)
@@ -124,6 +134,51 @@ struct DraftParserTests {
             """)
         #expect(tail.text == "On Thu, 9 Oct 2026, at 16:03, Maya Lindqvist wrote:\n> Can you send the numbers? numbers <https://numbers.example/q?q=3>")
         #expect(tail.inlineParts.isEmpty)
+    }
+
+    /// Apple Mail on the Mac quotes the attribution with the original, inside a trailing `<div>`.
+    @Test func macMailQuotesArePreserved() throws {
+        let html = """
+            <html><head><meta http-equiv="content-type" content="text/html; charset=utf-8"></head>\
+            <body style="overflow-wrap: break-word;">Sure, Thursday works.<br id="lineBreakAtBeginningOfMessage">\
+            <div><br><blockquote type="cite"><div>On 9. Oct 2026, at 16:03, Maya Lindqvist \
+            &lt;maya@lindqvist.example&gt; wrote:</div><br class="Apple-interchange-newline">\
+            <div><div>Shall we meet on Thursday?</div></div></blockquote></div><br></body></html>
+            """
+        let email = Fixture.email(
+            id: "d4", from: [("Alex Berg", "alex@fastmail.com")], subject: "Re: Meeting", inReplyTo: ["m2@x"],
+            html: html, text: nil, keywords: ["$draft"])
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+        #expect(parsed.fidelity == .exact)
+        #expect(String(parsed.draft.body.characters) == "Sure, Thursday works.")
+        let tail = try #require(parsed.draft.preservedTail)
+        #expect(tail.html == """
+            <blockquote type="cite"><div>On 9. Oct 2026, at 16:03, Maya Lindqvist &lt;maya@lindqvist.example&gt; \
+            wrote:</div><br><div><div>Shall we meet on Thursday?</div></div></blockquote>
+            """)
+        #expect(tail.text == "> On 9. Oct 2026, at 16:03, Maya Lindqvist <maya@lindqvist.example> wrote:\n>\n> Shall we meet on Thursday?")
+    }
+
+    /// Apple Mail on iOS quotes the attribution on its own, at the end of the `<div>` before the quote.
+    @Test func iOSMailQuotesArePreserved() throws {
+        let html = """
+            <html><head><meta http-equiv="content-type" content="text/html; charset=utf-8"></head><body dir="auto">\
+            <div dir="ltr">Sure, Thursday works.</div><div dir="ltr"><br><blockquote type="cite">On 9. Oct 2026, \
+            at 16:03, Maya Lindqvist &lt;maya@lindqvist.example&gt; wrote:<br><br></blockquote></div>\
+            <blockquote type="cite"><div dir="ltr">Shall we meet on Thursday?</div></blockquote></body></html>
+            """
+        let email = Fixture.email(
+            id: "d5", from: [("Alex Berg", "alex@fastmail.com")], subject: "Re: Meeting", inReplyTo: ["m2@x"],
+            html: html, text: nil, keywords: ["$draft"])
+        let parsed = DraftParser.parse(email, fallbackDomain: "fastmail.com")
+        #expect(parsed.fidelity == .exact)
+        #expect(String(parsed.draft.body.characters) == "Sure, Thursday works.")
+        let tail = try #require(parsed.draft.preservedTail)
+        #expect(tail.html == """
+            <blockquote type="cite">On 9. Oct 2026, at 16:03, Maya Lindqvist &lt;maya@lindqvist.example&gt; wrote:\
+            <br><br></blockquote><blockquote type="cite"><div dir="ltr">Shall we meet on Thursday?</div></blockquote>
+            """)
+        #expect(tail.text == "On 9. Oct 2026, at 16:03, Maya Lindqvist <maya@lindqvist.example> wrote:\n> Shall we meet on Thursday?")
     }
 
     @Test func plainTextDraftsAreExact() {
