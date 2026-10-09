@@ -9,7 +9,13 @@ struct PrivacyLintTests {
         var name: String
         var pattern: String
         /// Text the rule must catch, so a broken pattern can't pass silently.
-        var positive: String
+        var positives: [String]
+
+        init(name: String, pattern: String, positive: String...) {
+            self.name = name
+            self.pattern = pattern
+            self.positives = positive
+        }
     }
 
     static let rules: [Rule] = [
@@ -27,6 +33,15 @@ struct PrivacyLintTests {
         // `.init(html:` calls the importer; declaring a value type's own `init(html:text:)` doesn't.
         Rule(name: "explicit HTML initialiser", pattern: #"\.init\(html:"#, positive: "NSAttributedString.init(html: data)"),
         Rule(name: "HTML initialiser", pattern: #"\(HTML:"#, positive: "NSAttributedString(HTML: data, documentAttributes: nil)"),
+        // Without a document type the importers detect HTML themselves and load it through WebKit. Every form of
+        // them takes `documentAttributes:` (so do the exporters, which GoodMail has no use for).
+        Rule(name: "document importer", pattern: #"documentAttributes"#,
+             positive: "try NSAttributedString(data: Data(html.utf8), options: [:], documentAttributes: &attributes)",
+             "try NSAttributedString(url: fileURL, options: [:], documentAttributes: nil)",
+             "try text.read(from: url, options: [:], documentAttributes: nil)",
+             "try NSMutableAttributedString(\n    data: data,\n    documentAttributes: nil)"),
+        Rule(name: "document reading options", pattern: #"DocumentReadingOptionKey"#,
+             positive: "let options: [NSAttributedString.DocumentReadingOptionKey: Any] = [:]"),
         Rule(name: "formatting transferable", pattern: #"AttributedTextFormatting\.Transferable"#,
              positive: "let item = AttributedTextFormatting.Transferable(text: text)"),
         Rule(name: "mailer header", pattern: #"X-Mailer"#, positive: "\"X-Mailer\": \"GoodMail\""),
@@ -43,6 +58,8 @@ struct PrivacyLintTests {
         "OutgoingHTMLSanitizer.sanitize(html, options: .init(cleansLinks: false))",
         "public init(html: String, text: String) {",
         "let tail = PreservedTail(html: sanitized.html, text: text)",
+        "let attributes = paragraphAttributes(paragraph)",
+        "func applyAttributes(of name: String, _ attributes: [String: String], to block: inout Block) -> Margins {",
     ]
 
     static func regex(_ rule: Rule) throws -> NSRegularExpression {
@@ -56,7 +73,9 @@ struct PrivacyLintTests {
     @Test(arguments: rules.map(\.name))
     func ruleCatchesItsExample(name: String) throws {
         let rule = try #require(Self.rules.first { $0.name == name })
-        #expect(try Self.matches(rule, rule.positive))
+        for positive in rule.positives {
+            #expect(try Self.matches(rule, positive), "\(positive)")
+        }
     }
 
     @Test func rulesLeaveOrdinaryCodeAlone() throws {
