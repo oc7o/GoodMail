@@ -3,12 +3,8 @@ import JMAPKit
 
 /// What goes into the full-text index for an email.
 enum SearchText {
-    static func people(of email: Email) -> String {
-        [email.from, email.to, email.cc, email.bcc]
-            .flatMap { $0 ?? [] }
-            .flatMap { [$0.name, $0.email] }
-            .compactMap { $0 }
-            .joined(separator: " ")
+    static func addresses(_ addresses: [EmailAddress]?) -> String {
+        (addresses ?? []).flatMap { [$0.name, $0.email] }.compactMap { $0 }.joined(separator: " ")
     }
 
     /// The readable text of the body if it was fetched, else the server's preview.

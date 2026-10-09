@@ -232,6 +232,103 @@ struct MailModelTests {
         #expect(model.threads.map(\.id) == ["t9"])
     }
 
+    @Test func searchOperatorsAskTheServerPrecisely() async {
+        let model = await started()
+        model.searchScope = .everywhere
+        func search(_ text: String) async -> [String] {
+            model.searchText = text
+            await model.loadThreads(debounce: false)
+            return model.threads.map(\.id)
+        }
+
+        #expect(await search("from:maya") == ["t1"])
+        #expect(await search("to:lena") == ["t11"])
+        #expect(await search("lena") == ["t11", "t9"])
+        #expect(await search("is:flagged") == ["t4"])
+        #expect(await search("from:maya has:attachment") == ["t1"])
+        #expect(await search("in:archive") == ["t9"])
+        #expect(await search("in:receipts corner") == ["t10"])
+        #expect(await search("in:nowhere") == [])
+        #expect(model.totalThreads == 0)
+        #expect(model.connectionProblem == nil)
+    }
+
+    @Test func searchOperatorsWorkOnStoredMailOffline() async throws {
+        let model = await started()
+        while try await MailSync(client: model.client, store: store).backfillNextPage() {}
+        server.isOffline = true
+        model.searchScope = .everywhere
+        func search(_ text: String) async -> [String] {
+            model.searchText = text
+            await model.loadThreads(debounce: false)
+            return model.threads.map(\.id)
+        }
+
+        #expect(await search("to:lena") == ["t11"])
+        #expect(await search("lena") == ["t11", "t9"])
+        #expect(await search("is:flagged") == ["t4"])
+        #expect(await search("from:maya has:attachment") == ["t1"])
+        #expect(await search("in:archive") == ["t9"])
+    }
+
+    @Test func savedSearchListsRefinesAndSurvivesRelaunch() async throws {
+        let model = await started()
+        #expect(model.searchToSave == nil)
+        model.searchScope = .everywhere
+        model.searchText = "from:maya"
+
+        let proposal = try #require(model.searchToSave)
+        #expect(proposal.query == "from:maya")
+        #expect(proposal.mailboxID == nil)
+        await model.saveSearch(named: "Maya")
+
+        let saved = try #require(model.savedSearches.first)
+        #expect(model.destination == .savedSearch(saved.id))
+        #expect(model.searchText.isEmpty)
+        await model.loadThreads()
+        #expect(model.threads.map(\.id) == ["t1"])
+
+        model.searchText = "is:flagged"
+        await model.loadThreads(debounce: false)
+        #expect(model.threads.isEmpty)
+        #expect(model.searchToSave?.query == "from:maya is:flagged")
+
+        await model.renameSavedSearch(id: saved.id, to: "Maya L.")
+        let relaunched = Self.makeModel(server: server, store: store)
+        await relaunched.start()
+        #expect(relaunched.savedSearches.map(\.name) == ["Maya L."])
+
+        await model.deleteSavedSearch(id: saved.id)
+        #expect(model.savedSearches.isEmpty)
+        #expect(model.currentMailbox?.role == .inbox)
+    }
+
+    @Test func savingUnreadOnlyKeepsTheMailbox() async {
+        let model = await started()
+        model.showsUnreadOnly = true
+
+        #expect(model.searchToSave?.query == "is:unread")
+        #expect(model.searchToSave?.mailboxID == "inbox")
+        await model.saveSearch(named: "Unread")
+        #expect(!model.showsUnreadOnly)
+
+        await model.loadThreads()
+        #expect(model.threads.map(\.id) == ["t1", "t2"])
+    }
+
+    @Test func archivingFromAllMailTakesTheConversationOutOfItsFolder() async throws {
+        let model = await started()
+        model.searchScope = .everywhere
+        model.searchText = "corner"
+        await model.loadThreads(debounce: false)
+        #expect(model.listedMailboxID == nil)
+
+        await model.archive(threadID: "t10")
+
+        #expect(model.errorMessage == nil)
+        #expect(model.thread(id: "t10")?.emails.map(\.mailboxIds) == [["archive": true]])
+    }
+
     @Test func conversationStaysInUnreadListWhileBeingRead() async {
         let model = await started()
         model.showsUnreadOnly = true

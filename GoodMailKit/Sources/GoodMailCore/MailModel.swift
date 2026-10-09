@@ -12,7 +12,12 @@ import Observation
 public final class MailModel {
     public enum Destination: Hashable {
         case mailbox(String)
+        case savedSearch(String)
         case maskedEmail
+
+        var isSavedSearch: Bool {
+            if case .savedSearch = self { true } else { false }
+        }
     }
 
     public enum SearchScope: Hashable {
@@ -21,14 +26,16 @@ public final class MailModel {
     }
 
     public struct ThreadQuery: Hashable {
-        public var mailboxID: String
-        public var search: String
-        public var scope: SearchScope
+        var destination: Destination
+        /// The mailbox listed or searched; `nil` for all mail but Trash and Spam.
+        public var mailboxID: String?
+        public var search: SearchQuery
         public var unreadOnly: Bool
+        /// The mailbox it names doesn't exist.
+        var matchesNothing = false
 
-        public var searchesEverywhere: Bool { scope == .everywhere && !search.isEmpty }
         /// Whether this is simply everything in the mailbox, which is what coverage is tracked for.
-        var isWholeMailbox: Bool { search.isEmpty && !unreadOnly }
+        var isWholeMailbox: Bool { mailboxID != nil && !search.hasCriteria && !unreadOnly }
     }
 
     public struct MailboxRow: Identifiable {
@@ -47,7 +54,15 @@ public final class MailModel {
 
     public private(set) var username: String?
     public private(set) var mailboxes: [Mailbox] = []
-    public var destination: Destination?
+    public private(set) var savedSearches: [SavedSearch] = []
+    public var destination: Destination? {
+        didSet {
+            // Text typed into a saved search refines it, so it means nothing anywhere else.
+            if destination != oldValue, destination?.isSavedSearch == true || oldValue?.isSavedSearch == true {
+                searchText = ""
+            }
+        }
+    }
 
     public var searchText = ""
     public var searchScope = SearchScope.mailbox
@@ -94,6 +109,7 @@ public final class MailModel {
 
     public func start() async {
         mailboxes = (try? await store.mailboxes()) ?? []
+        savedSearches = (try? await store.savedSearches()) ?? []
         selectInboxIfNeeded()
         username = try? await client.session().username
         await refresh()
@@ -192,6 +208,19 @@ public final class MailModel {
         return mailbox(id: id)
     }
 
+    /// The mailbox `in:` refers to: a role such as `inbox` or `spam`, else a name, ignoring case.
+    public func mailbox(named name: String) -> Mailbox? {
+        let role = Mailbox.Role(rawValue: name.lowercased() == "spam" ? "junk" : name.lowercased())
+        return mailbox(role) ?? mailboxRows.lazy.map(\.mailbox).first {
+            $0.name.compare(name, options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame
+        }
+    }
+
+    /// The mailbox the shown list is limited to, if any; triage moves conversations out of it.
+    public var listedMailboxID: String? {
+        shownQuery?.mailboxID
+    }
+
     /// Depth-first order: role mailboxes first, then by `sortOrder` and name.
     public var mailboxRows: [MailboxRow] {
         let children = Dictionary(grouping: mailboxes, by: \.parentId)
@@ -211,10 +240,30 @@ public final class MailModel {
     // MARK: Thread list
 
     public var threadQuery: ThreadQuery? {
-        guard case .mailbox(let id) = destination else { return nil }
-        return ThreadQuery(
-            mailboxID: id, search: searchText.trimmingCharacters(in: .whitespaces),
-            scope: searchScope, unreadOnly: showsUnreadOnly)
+        guard let destination else { return nil }
+        var query: ThreadQuery
+        switch destination {
+        case .mailbox(let id):
+            let search = SearchQuery(parsing: searchText)
+            let searchesEverywhere = searchScope == .everywhere && search.hasCriteria
+            query = ThreadQuery(
+                destination: destination, mailboxID: searchesEverywhere ? nil : id, search: search,
+                unreadOnly: showsUnreadOnly)
+        case .savedSearch(let id):
+            guard let saved = savedSearch(id: id) else { return nil }
+            query = ThreadQuery(
+                destination: destination, mailboxID: saved.mailboxID,
+                search: SearchQuery(parsing: saved.query + " " + searchText), unreadOnly: showsUnreadOnly)
+        case .maskedEmail:
+            return nil
+        }
+        if let name = query.search.mailbox {
+            query.mailboxID = mailbox(named: name)?.id
+            query.matchesNothing = query.mailboxID == nil
+        } else if let id = query.mailboxID, mailbox(id: id) == nil {
+            query.matchesNothing = true
+        }
+        return query
     }
 
     /// Number of conversations in the current list, as far as it is known.
@@ -230,7 +279,7 @@ public final class MailModel {
     public func loadThreads(debounce: Bool = true) async {
         guard let query = threadQuery else { return }
         let isNewSearch = query.search != shownQuery?.search
-        if query.mailboxID != shownQuery?.mailboxID { selectedThreadID = nil }
+        if query.destination != shownQuery?.destination { selectedThreadID = nil }
         if query != shownQuery {
             visibleLimit = Self.pageSize
             serverLoaded = 0
@@ -239,8 +288,12 @@ public final class MailModel {
             shownQuery = query
         }
         await showStoredThreads()
+        if query.matchesNothing {
+            serverTotal = 0
+            return
+        }
 
-        if debounce, !query.search.isEmpty, isNewSearch {
+        if debounce, query.search.hasCriteria, isNewSearch {
             try? await Task.sleep(for: .milliseconds(300))
         }
         guard !Task.isCancelled, shownQuery == query else { return }
@@ -318,28 +371,51 @@ public final class MailModel {
 
     /// The store query matching `query`, or `nil` while nothing stored can answer it yet.
     private func storeQuery(for query: ThreadQuery) async throws -> MailStore.ThreadQuery? {
-        if query.searchesEverywhere {
-            return .init(hiddenMailboxIDs: hiddenFromSearchMailboxIDs, search: query.search, unreadOnly: query.unreadOnly)
-        }
-        guard query.isWholeMailbox else {
-            return .init(mailboxID: query.mailboxID, search: query.search, unreadOnly: query.unreadOnly)
+        if query.matchesNothing { return nil }
+        guard let mailboxID = query.mailboxID, query.isWholeMailbox else {
+            return .init(
+                mailboxID: query.mailboxID, hiddenMailboxIDs: query.mailboxID == nil ? hiddenFromSearchMailboxIDs : [],
+                search: query.search, unreadOnly: query.unreadOnly)
         }
         // A plain mailbox list must not have gaps, so it only reaches as far back as the copy is complete.
-        guard let coverage = try await store.coverage(mailboxID: query.mailboxID) else { return nil }
-        return .init(mailboxID: query.mailboxID, since: coverage)
+        guard let coverage = try await store.coverage(mailboxID: mailboxID) else { return nil }
+        return .init(mailboxID: mailboxID, since: coverage)
     }
 
     private func filter(for query: ThreadQuery) -> Filter<Email.FilterCondition> {
-        var conditions: [Filter<Email.FilterCondition>] = []
-        if query.searchesEverywhere {
-            let hidden = hiddenFromSearchMailboxIDs
-            if !hidden.isEmpty { conditions.append(.condition(.init(inMailboxOtherThan: hidden))) }
-        } else {
-            conditions.append(.condition(.init(inMailbox: query.mailboxID)))
+        typealias Condition = Email.FilterCondition
+        var conditions: [Condition] = []
+        if let mailboxID = query.mailboxID {
+            conditions.append(.init(inMailbox: mailboxID))
+        } else if !hiddenFromSearchMailboxIDs.isEmpty {
+            conditions.append(.init(inMailboxOtherThan: hiddenFromSearchMailboxIDs))
         }
-        if !query.search.isEmpty { conditions.append(.condition(.init(text: query.search))) }
-        if query.unreadOnly { conditions.append(.condition(.init(notKeyword: Email.Keyword.seen.rawValue))) }
-        return conditions.count == 1 ? conditions[0] : .and(conditions)
+        let search = query.search
+        for term in search.terms {
+            let condition = switch term.field {
+            case .text: Condition(text: term.value)
+            case .from: Condition(from: term.value)
+            case .to: Condition(to: term.value)
+            case .cc: Condition(cc: term.value)
+            case .bcc: Condition(bcc: term.value)
+            case .subject: Condition(subject: term.value)
+            case .body: Condition(body: term.value)
+            }
+            conditions.append(condition)
+        }
+        if query.unreadOnly || search.isUnread == true {
+            conditions.append(.init(notKeyword: Email.Keyword.seen.rawValue))
+        } else if search.isUnread == false {
+            conditions.append(.init(hasKeyword: Email.Keyword.seen.rawValue))
+        }
+        if let isFlagged = search.isFlagged {
+            let flagged = Email.Keyword.flagged.rawValue
+            conditions.append(isFlagged ? .init(hasKeyword: flagged) : .init(notKeyword: flagged))
+        }
+        if let hasAttachment = search.hasAttachment { conditions.append(.init(hasAttachment: hasAttachment)) }
+        if let before = search.before { conditions.append(.init(before: before)) }
+        if let after = search.after { conditions.append(.init(after: after)) }
+        return conditions.count == 1 ? .condition(conditions[0]) : .and(conditions.map { .condition($0) })
     }
 
     private var hiddenFromSearchMailboxIDs: [String] {
@@ -347,13 +423,13 @@ public final class MailModel {
     }
 
     private func isListed(_ thread: ThreadSummary, in query: ThreadQuery) -> Bool {
-        if query.searchesEverywhere {
-            let hidden = Set(hiddenFromSearchMailboxIDs)
-            return thread.emails.contains { email in
-                !(email.mailboxIds ?? [:]).keys.allSatisfy(hidden.contains)
-            }
+        if let mailboxID = query.mailboxID {
+            return thread.emails.contains { $0.mailboxIds?[mailboxID] == true }
         }
-        return thread.emails.contains { $0.mailboxIds?[query.mailboxID] == true }
+        let hidden = Set(hiddenFromSearchMailboxIDs)
+        return thread.emails.contains { email in
+            !(email.mailboxIds ?? [:]).keys.allSatisfy(hidden.contains)
+        }
     }
 
     // MARK: Reading
@@ -391,28 +467,32 @@ public final class MailModel {
 
     public var canArchive: Bool {
         guard let archive = mailbox(.archive) else { return false }
-        return currentMailbox?.id != archive.id
+        return listedMailboxID != archive.id
     }
 
     public func archive(threadID: String) async {
-        guard let archive = mailbox(.archive), let source = currentMailbox ?? mailbox(.inbox) else { return }
-        await move(threadID: threadID, from: source.id, to: archive.id)
+        guard let archive = mailbox(.archive) else { return }
+        await move(threadID: threadID, to: archive.id)
     }
 
-    public func move(threadID: String, to mailboxID: String) async {
-        guard let source = currentMailbox else { return }
-        await move(threadID: threadID, from: source.id, to: mailboxID)
-    }
-
-    private func move(threadID: String, from source: String, to destination: String) async {
-        guard let thread = thread(id: threadID), source != destination else { return }
-        let targets = thread.emails.filter { $0.mailboxIds?[source] == true }
-        await apply(Dictionary(uniqueKeysWithValues: targets.map { ($0.id, .move(from: source, to: destination)) }))
+    /// Takes the conversation out of the listed mailbox. In lists spanning all mail, that is wherever
+    /// its messages are filed, except that sent messages and drafts stay where they are.
+    public func move(threadID: String, to destination: String) async {
+        guard let thread = thread(id: threadID) else { return }
+        if let source = listedMailboxID {
+            guard source != destination else { return }
+            let targets = thread.emails.filter { $0.mailboxIds?[source] == true }
+            await apply(Dictionary(uniqueKeysWithValues: targets.map { ($0.id, .move(from: source, to: destination)) }))
+        } else {
+            let staying = Set([destination] + [Mailbox.Role.sent, .drafts].compactMap { mailbox($0)?.id })
+            let targets = thread.emails.filter { Set(($0.mailboxIds ?? [:]).keys).isDisjoint(with: staying) }
+            await apply(Dictionary(uniqueKeysWithValues: targets.map { ($0.id, .moveExclusively(to: destination)) }))
+        }
     }
 
     public var canTrash: Bool {
         guard let trash = mailbox(.trash) else { return false }
-        return currentMailbox?.id != trash.id
+        return listedMailboxID != trash.id
     }
 
     public func trash(threadID: String) async {
@@ -502,8 +582,79 @@ public final class MailModel {
     /// Jumps to a search for all mail delivered to `address`.
     public func showMail(to address: String) {
         guard let inbox = mailbox(.inbox) ?? mailboxes.first else { return }
+        destination = .mailbox(inbox.id)
         searchScope = .everywhere
         searchText = address
-        destination = .mailbox(inbox.id)
+    }
+
+    // MARK: Saved searches
+
+    public func savedSearch(id: String) -> SavedSearch? {
+        savedSearches.first { $0.id == id }
+    }
+
+    public var currentSavedSearch: SavedSearch? {
+        guard case .savedSearch(let id) = destination else { return nil }
+        return savedSearch(id: id)
+    }
+
+    /// What the list currently shows, as a saved search; `nil` unless something is being searched for.
+    public var searchToSave: SavedSearch? {
+        var parts: [String]
+        let mailboxID: String?
+        switch destination {
+        case .mailbox(let id)?:
+            parts = [searchText]
+            mailboxID = searchScope == .mailbox ? id : nil
+        case .savedSearch(let id)?:
+            guard let saved = savedSearch(id: id), !searchText.allSatisfy(\.isWhitespace) || showsUnreadOnly
+            else { return nil }
+            parts = [saved.query, searchText]
+            mailboxID = saved.mailboxID
+        default:
+            return nil
+        }
+        if showsUnreadOnly { parts.append("is:unread") }
+        let query = parts.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }.joined(separator: " ")
+        guard SearchQuery(parsing: query).hasCriteria else { return nil }
+        return SavedSearch(name: query, query: query, mailboxID: mailboxID)
+    }
+
+    /// Saves what the list currently shows and switches to the saved search.
+    public func saveSearch(named name: String) async {
+        guard var search = searchToSave else { return }
+        search.name = name
+        do {
+            try await store.save(search)
+            savedSearches.append(search)
+            destination = .savedSearch(search.id)
+            showsUnreadOnly = false
+        } catch {
+            report(error, userInitiated: true)
+        }
+    }
+
+    public func renameSavedSearch(id: String, to name: String) async {
+        guard var search = savedSearch(id: id) else { return }
+        search.name = name
+        do {
+            try await store.save(search)
+            savedSearches = try await store.savedSearches()
+        } catch {
+            report(error, userInitiated: true)
+        }
+    }
+
+    public func deleteSavedSearch(id: String) async {
+        do {
+            try await store.deleteSavedSearch(id: id)
+            savedSearches.removeAll { $0.id == id }
+            if destination == .savedSearch(id) {
+                destination = nil
+                selectInboxIfNeeded()
+            }
+        } catch {
+            report(error, userInitiated: true)
+        }
     }
 }

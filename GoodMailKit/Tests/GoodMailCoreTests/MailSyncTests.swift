@@ -111,7 +111,7 @@ struct MailSyncTests {
         let emails = try #require(try await store.emailsWithBodies(inThread: "t1"))
         #expect(emails.map(\.id) == ["e1", "e2", "e3"])
         #expect(emails[2].bodyValues?["1"]?.value.contains("Booked!") == true)
-        #expect(try await store.threads(matching: .init(search: "early check-in"), limit: 5).map(\.id) == ["t1"])
+        #expect(try await store.threads(matching: .init(search: SearchQuery(parsing: "early check-in")), limit: 5).map(\.id) == ["t1"])
     }
 
     @Test func refusedChangesAreRolledBack() async throws {

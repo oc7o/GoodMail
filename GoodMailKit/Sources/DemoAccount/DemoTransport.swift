@@ -269,6 +269,10 @@ public final class DemoTransport: HTTPTransport {
             case "notKeyword": !flags(email["keywords"]).contains(string(value))
             case "hasKeyword": flags(email["keywords"]).contains(string(value))
             case "text": searchableText(email).localizedCaseInsensitiveContains(string(value))
+            case "from", "to", "cc", "bcc": addressText(email[key]).localizedCaseInsensitiveContains(string(value))
+            case "subject": string(email["subject"]).localizedCaseInsensitiveContains(string(value))
+            case "body": bodyText(email).localizedCaseInsensitiveContains(string(value))
+            case "hasAttachment": email["hasAttachment"] == value
             // Both sides are ISO 8601 in UTC, which sorts as text.
             case "before": string(email["receivedAt"]) < string(value)
             case "after": string(email["receivedAt"]) >= string(value)
@@ -278,13 +282,20 @@ public final class DemoTransport: HTTPTransport {
     }
 
     private static func searchableText(_ email: Object) -> String {
-        var text = [string(email["subject"]), string(email["preview"])]
-        for key in ["from", "to", "cc"] {
-            guard case .array(let addresses)? = email[key] else { continue }
-            for case .object(let address) in addresses {
-                text += [string(address["name"]), string(address["email"])]
-            }
-        }
+        ([string(email["subject"]), bodyText(email)] + ["from", "to", "cc"].map { addressText(email[$0]) })
+            .joined(separator: "\n")
+    }
+
+    private static func addressText(_ value: JSONValue?) -> String {
+        guard case .array(let addresses)? = value else { return "" }
+        return addresses.compactMap { address -> String? in
+            guard case .object(let address) = address else { return nil }
+            return string(address["name"]) + " " + string(address["email"])
+        }.joined(separator: "\n")
+    }
+
+    private static func bodyText(_ email: Object) -> String {
+        var text = [string(email["preview"])]
         if case .object(let values)? = email["bodyValues"] {
             for case .object(let value) in values.values { text.append(string(value["value"])) }
         }

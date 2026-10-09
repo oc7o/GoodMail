@@ -1,4 +1,5 @@
 import Foundation
+import GRDB
 import JMAPKit
 import Testing
 @testable import MailStore
@@ -10,13 +11,20 @@ struct MailStoreTests {
     /// An email received `day` days after a fixed date, optionally with a fetched body.
     static func email(
         _ id: String, thread: String, in mailboxes: [String] = ["inbox"], day: Double, seen: Bool = true,
-        subject: String = "Hello", from: String = "Maya Lindqvist", preview: String = "", html: String? = nil
+        flagged: Bool = false, subject: String = "Hello", from: String = "Maya Lindqvist", to: String = "Alex Berg",
+        preview: String = "", hasAttachment: Bool = false, html: String? = nil
     ) -> Email {
+        func address(_ name: String) -> [[String: String]] {
+            [["name": name, "email": "\(name.split(separator: " ")[0].lowercased())@example.com"]]
+        }
+        var keywords: [String: Bool] = [:]
+        if seen { keywords["$seen"] = true }
+        if flagged { keywords["$flagged"] = true }
         var json: [String: Any] = [
             "id": id, "threadId": thread, "receivedAt": epoch.addingTimeInterval(day * 86_400).formatted(.iso8601),
             "mailboxIds": Dictionary(uniqueKeysWithValues: mailboxes.map { ($0, true) }),
-            "keywords": seen ? ["$seen": true] : [:], "subject": subject, "preview": preview,
-            "from": [["name": from, "email": "\(from.split(separator: " ")[0].lowercased())@example.com"]],
+            "keywords": keywords, "subject": subject, "preview": preview, "hasAttachment": hasAttachment,
+            "from": address(from), "to": address(to),
         ]
         if let html {
             json["htmlBody"] = [["partId": "1", "type": "text/html"]]
@@ -111,20 +119,78 @@ struct MailStoreTests {
             Self.email("e3", thread: "t3", in: ["archive"], day: 3, subject: "Café menu"),
         ])
 
-        #expect(try await threadIDs(.init(search: "lisb")) == ["t1"])
-        #expect(try await threadIDs(.init(search: "flights trip")) == ["t1"])
-        #expect(try await threadIDs(.init(search: "northwind")) == ["t2"])
-        #expect(try await threadIDs(.init(search: "cafe")) == ["t3"])
-        #expect(try await threadIDs(.init(mailboxID: "inbox", search: "cafe")) == [])
-        #expect(try await threadIDs(.init(search: "\"*")) == [])
-        #expect(try await threadIDs(.init(search: "apartment")) == [])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "lisb"))) == ["t1"])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "flights trip"))) == ["t1"])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "northwind"))) == ["t2"])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "cafe"))) == ["t3"])
+        #expect(try await threadIDs(.init(mailboxID: "inbox", search: SearchQuery(parsing: "cafe"))) == [])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "\"*"))) == [])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "apartment"))) == [])
 
         try await store.upsert([Self.email(
             "e1", thread: "t1", day: 1, subject: "Trip to Lisbon",
             html: "<style>p { color: apartmentcolor }</style><p>The <b>apartment</b> in Alfama is free &amp; cheap</p>")])
-        #expect(try await threadIDs(.init(search: "apartment alfama")) == ["t1"])
-        #expect(try await threadIDs(.init(search: "apartmentcolor")) == [])
-        #expect(try await threadIDs(.init(search: "lisbon")) == ["t1"])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "apartment alfama"))) == ["t1"])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "apartmentcolor"))) == [])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "lisbon"))) == ["t1"])
+    }
+
+    @Test func searchOperatorsLookAtTheirOwnFieldsAndFlags() async throws {
+        let day = { (n: Double) in Self.epoch.addingTimeInterval(n * 86_400) }
+        try await store.upsert([
+            Self.email("e1", thread: "t1", day: 1, subject: "Notes for Maya", from: "Jonas Weber", to: "Maya Lindqvist"),
+            Self.email("e2", thread: "t2", day: 2, flagged: true, subject: "Lisbon", from: "Maya Lindqvist"),
+            Self.email("e3", thread: "t3", day: 3, subject: "Invoice", from: "Northwind Hosting", hasAttachment: true),
+        ])
+        func ids(_ search: String) async throws -> [String] {
+            try await threadIDs(.init(search: SearchQuery(parsing: search)))
+        }
+
+        #expect(try await ids("maya") == ["t2", "t1"])
+        #expect(try await ids("from:maya") == ["t2"])
+        #expect(try await ids("to:maya") == ["t1"])
+        #expect(try await ids("subject:maya") == ["t1"])
+        #expect(try await ids("from:maya subject:invoice") == [])
+        #expect(try await ids("is:flagged") == ["t2"])
+        #expect(try await ids("has:attachment") == ["t3"])
+        #expect(try await ids("is:unread") == [])
+
+        var window = SearchQuery()
+        window.after = day(2)
+        window.before = day(3)
+        #expect(try await threadIDs(.init(search: window)) == ["t2"])
+        #expect(try await threadIDs(.init(search: window, since: day(2.5))) == [])
+    }
+
+    @Test func upgradingReindexesStoredMailForSearchOperators() async throws {
+        let database = try DatabaseQueue()
+        try MailStore.migrator.migrate(database, upTo: "v1")
+        let email = Self.email("e1", thread: "t1", day: 1, flagged: true, from: "Maya Lindqvist", hasAttachment: true)
+        try await database.write { db in
+            try db.execute(
+                sql: "INSERT INTO email (id, threadId, receivedAt, isSeen, json) VALUES ('e1', 't1', ?, 1, ?)",
+                arguments: [email.receivedAt!.timeIntervalSince1970, try JMAPCoding.makeEncoder().encode(email)])
+        }
+
+        let store = try MailStore(writer: database)
+
+        let search = SearchQuery(parsing: "from:maya is:flagged has:attachment")
+        #expect(try await store.threads(matching: .init(search: search), limit: 5).map(\.id) == ["t1"])
+        #expect(try await store.threads(matching: .init(search: SearchQuery(parsing: "to:maya")), limit: 5).isEmpty)
+    }
+
+    @Test func savedSearchesKeepTheirOrderThroughEdits() async throws {
+        let unread = SavedSearch(name: "Unread", query: "is:unread", mailboxID: "inbox")
+        var maya = SavedSearch(name: "Maya", query: "from:maya")
+        try await store.save(unread)
+        try await store.save(maya)
+
+        maya.name = "Maya L."
+        try await store.save(maya)
+        #expect(try await store.savedSearches() == [unread, maya])
+
+        try await store.deleteSavedSearch(id: unread.id)
+        #expect(try await store.savedSearches() == [maya])
     }
 
     @Test func refreshingFlagsKeepsTheStoredBodyAndItsSearchText() async throws {
@@ -137,7 +203,7 @@ struct MailStoreTests {
         #expect(email.has(.seen))
         #expect(email.mailboxIds == ["archive": true])
         #expect(email.bodyValues?["1"]?.value == "<p>Quarterly numbers</p>")
-        #expect(try await threadIDs(.init(search: "quarterly")) == ["t1"])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "quarterly"))) == ["t1"])
         #expect(try await threadIDs(.init(mailboxID: "inbox")) == [])
         #expect(try await threadIDs(.init(mailboxID: "archive")) == ["t1"])
     }
@@ -163,7 +229,7 @@ struct MailStoreTests {
         try await store.deleteEmails(ids: ["e1"])
 
         #expect(try await store.threads(matching: .init(mailboxID: "inbox"), limit: 5).first?.emails.map(\.id) == ["e2"])
-        #expect(try await threadIDs(.init(search: "receipt")) == [])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "receipt"))) == [])
         #expect(try await store.threads(ids: ["t1", "gone"]).map(\.id) == ["t1"])
     }
 
@@ -192,6 +258,6 @@ struct MailStoreTests {
         #expect(try await store.emailState() == nil)
         #expect(try await store.coverage(mailboxID: "inbox") == nil)
         #expect(try await threadIDs(.init(mailboxID: "inbox")) == [])
-        #expect(try await threadIDs(.init(search: "receipt")) == [])
+        #expect(try await threadIDs(.init(search: SearchQuery(parsing: "receipt"))) == [])
     }
 }

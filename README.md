@@ -2,15 +2,15 @@
 
 An open-source, privacy-first mail client for [Fastmail](https://www.fastmail.com), native on iOS and macOS (SwiftUI).
 
-> Status: early development. M1 is nearly done: you can read, triage and search mail, online and from the
-> encrypted local copy, and manage Masked Email. You cannot compose yet.
+> Status: early development. M1 is done: you can read, triage and search mail, online and from the
+> encrypted local copy, save searches, and manage Masked Email. You cannot compose yet.
 
 ## Goals
 
 - **Built for Fastmail.** Uses JMAP directly, no IMAP. First-class **Masked Email**: create, send from, disable and delete masked addresses without leaving the app.
 - **Privacy first.** Remote content and tracking pixels are blocked by default, tracking parameters are stripped from links, the local cache is encrypted, and the app has an optional Face ID / Touch ID lock. No analytics, no closed-source SDKs, and no servers of ours in the middle.
 - **One-tap unsubscribe** via `List-Unsubscribe` / RFC 8058 one-click.
-- **Fast search and filtering.** Instant local full-text search merged with server-side search, plus saved searches.
+- **Fast search and filtering.** Instant local full-text search merged with server-side search, Fastmail-style operators (`from:` `to:` `cc:` `subject:` `body:` `in:` `is:unread` `is:flagged` `has:attachment` `before:` `after:`), plus saved searches.
 - Everything else a good mail client needs: threads, swipe actions, keyboard shortcuts, offline actions, and undo.
 
 ## Roadmap

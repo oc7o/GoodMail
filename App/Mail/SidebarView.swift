@@ -1,10 +1,13 @@
 import GoodMailCore
 import JMAPKit
+import MailStore
 import SwiftUI
 
 struct SidebarView: View {
     @Bindable var model: MailModel
     @Environment(AppModel.self) private var appModel
+    @State private var renaming: SavedSearch?
+    @State private var newName = ""
 
     var body: some View {
         List(selection: $model.destination) {
@@ -16,12 +19,47 @@ struct SidebarView: View {
                         .tag(MailModel.Destination.mailbox(row.id))
                 }
             }
+            if !model.savedSearches.isEmpty {
+                Section("Saved Searches") {
+                    ForEach(model.savedSearches) { search in
+                        Label(search.name, systemImage: "magnifyingglass")
+                            .help(search.query)
+                            .tag(MailModel.Destination.savedSearch(search.id))
+                            .contextMenu {
+                                Button("Rename…", systemImage: "pencil") {
+                                    newName = search.name
+                                    renaming = search
+                                }
+                                Button("Delete", systemImage: "trash", role: .destructive) {
+                                    Task { await model.deleteSavedSearch(id: search.id) }
+                                }
+                            }
+                    }
+                    .onDelete { offsets in
+                        let ids = offsets.map { model.savedSearches[$0].id }
+                        Task { for id in ids { await model.deleteSavedSearch(id: id) } }
+                    }
+                }
+            }
             Section("Privacy") {
                 Label("Masked Email", systemImage: "theatermasks")
                     .tag(MailModel.Destination.maskedEmail)
             }
         }
         .navigationTitle("GoodMail")
+        .alert(
+            "Rename Saved Search",
+            isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } }),
+            presenting: renaming
+        ) { search in
+            TextField("Name", text: $newName)
+            Button("Rename") {
+                let name = newName.trimmingCharacters(in: .whitespaces)
+                guard !name.isEmpty else { return }
+                Task { await model.renameSavedSearch(id: search.id, to: name) }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
         #if os(macOS)
         .navigationSplitViewColumnWidth(min: 190, ideal: 220)
         #endif

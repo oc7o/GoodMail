@@ -84,7 +84,7 @@ struct ThreadView: View {
                 .keyboardShortcut(.delete, modifiers: .command)
             }
             Menu("Move", systemImage: "folder") {
-                ForEach(model.mailboxRows.filter { $0.id != model.currentMailbox?.id }) { row in
+                ForEach(model.mailboxRows.filter { $0.id != model.listedMailboxID }) { row in
                     Button(row.mailbox.name, systemImage: row.mailbox.role.symbolName) {
                         Task { await model.move(threadID: threadID, to: row.id) }
                     }

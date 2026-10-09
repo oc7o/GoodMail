@@ -4,6 +4,8 @@ import SwiftUI
 
 struct ThreadListView: View {
     @Bindable var model: MailModel
+    @State private var isNamingSearch = false
+    @State private var searchName = ""
 
     var body: some View {
         List(selection: $model.selectedThreadID) {
@@ -37,17 +39,42 @@ struct ThreadListView: View {
         }
         .listStyle(.plain)
         .overlay { emptyState }
-        .navigationTitle(model.currentMailbox?.name ?? "Mail")
+        .navigationTitle(model.currentSavedSearch?.name ?? model.currentMailbox?.name ?? "Mail")
         #if os(macOS)
         .navigationSplitViewColumnWidth(min: 300, ideal: 360)
         .navigationSubtitle(subtitle)
         #endif
-        .searchable(text: $model.searchText, prompt: "Search")
+        .searchable(text: $model.searchText, prompt: model.currentSavedSearch == nil ? "Search" : "Refine")
+        .searchSuggestions {
+            if model.searchText.isEmpty {
+                ForEach(Self.operatorHints, id: \.syntax) { hint in
+                    Label {
+                        HStack {
+                            Text(hint.syntax).monospaced()
+                            Text(hint.meaning).foregroundStyle(.secondary)
+                        }
+                    } icon: {
+                        Image(systemName: "magnifyingglass")
+                    }
+                    .searchCompletion(hint.syntax)
+                }
+            }
+        }
         .searchScopes($model.searchScope) {
-            Text(model.currentMailbox?.name ?? "Mailbox").tag(MailModel.SearchScope.mailbox)
-            Text("All Mail").tag(MailModel.SearchScope.everywhere)
+            if model.currentSavedSearch == nil {
+                Text(model.currentMailbox?.name ?? "Mailbox").tag(MailModel.SearchScope.mailbox)
+                Text("All Mail").tag(MailModel.SearchScope.everywhere)
+            }
         }
         .toolbar {
+            ToolbarItem {
+                Button("Save Search", systemImage: "bookmark") {
+                    searchName = model.searchToSave?.name ?? ""
+                    isNamingSearch = true
+                }
+                .disabled(model.searchToSave == nil)
+                .help("Keep this search in the sidebar")
+            }
             ToolbarItem {
                 Toggle(isOn: $model.showsUnreadOnly) {
                     Label("Unread Only", systemImage: "line.3.horizontal.decrease.circle")
@@ -74,8 +101,27 @@ struct ThreadListView: View {
                     .help(problem)
             }
         }
+        .alert("Save Search", isPresented: $isNamingSearch) {
+            TextField("Name", text: $searchName)
+            Button("Save") {
+                let name = searchName.trimmingCharacters(in: .whitespaces)
+                Task { await model.saveSearch(named: name.isEmpty ? model.searchToSave?.name ?? "Search" : name) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Saved searches are kept on this device.")
+        }
         .refreshable { await model.refresh() }
         .task(id: model.threadQuery) { await model.loadThreads() }
+    }
+
+    private static var operatorHints: [(syntax: String, meaning: String)] {
+        let monthAgo = Date.now.addingTimeInterval(-30 * 86_400).formatted(.iso8601.year().month().day())
+        return [
+            ("from:", "Sender"), ("to:", "Recipient"), ("subject:", "Subject"), ("has:attachment", "With attachments"),
+            ("is:unread", "Unread"), ("is:flagged", "Flagged"), ("in:", "Mailbox"),
+            ("after:\(monthAgo)", "Received since"), ("before:\(monthAgo)", "Received before"),
+        ]
     }
 
     private var showsRecipients: Bool {
@@ -94,6 +140,8 @@ struct ThreadListView: View {
                 ProgressView()
             } else if !model.searchText.isEmpty {
                 ContentUnavailableView.search(text: model.searchText)
+            } else if let search = model.currentSavedSearch {
+                ContentUnavailableView("No Matches", systemImage: "magnifyingglass", description: Text(search.query))
             } else if model.showsUnreadOnly {
                 ContentUnavailableView("No Unread Mail", systemImage: "checkmark.circle")
             } else {

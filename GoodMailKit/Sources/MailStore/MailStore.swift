@@ -2,6 +2,23 @@ import Foundation
 import GRDB
 import JMAPKit
 
+/// A search the user keeps in the sidebar.
+public struct SavedSearch: Sendable, Hashable, Identifiable {
+    public let id: String
+    public var name: String
+    /// In ``SearchQuery`` syntax.
+    public var query: String
+    /// The mailbox it searches, or `nil` for all mail but Trash and Spam. An `in:` in the query wins.
+    public var mailboxID: String?
+
+    public init(id: String = UUID().uuidString, name: String, query: String, mailboxID: String? = nil) {
+        self.id = id
+        self.name = name
+        self.query = query
+        self.mailboxID = mailboxID
+    }
+}
+
 /// The local, encrypted copy of an account's mail: mailboxes, emails, and a full-text index.
 ///
 /// It is a cache. Everything in it can be fetched again, so an unreadable database is simply replaced.
@@ -24,8 +41,12 @@ public final class MailStore: Sendable {
     }
 
     /// A store that lives only as long as the object, for tests and the demo account.
-    public init() throws {
-        writer = try DatabaseQueue()
+    public convenience init() throws {
+        try self.init(writer: DatabaseQueue())
+    }
+
+    init(writer: any DatabaseWriter) throws {
+        self.writer = writer
         try Self.migrator.migrate(writer)
     }
 
@@ -36,7 +57,7 @@ public final class MailStore: Sendable {
         }
     }
 
-    private static var migrator: DatabaseMigrator {
+    static var migrator: DatabaseMigrator {
         var migrator = DatabaseMigrator()
         migrator.registerMigration("v1") { db in
             try db.execute(sql: """
@@ -70,6 +91,33 @@ public final class MailStore: Sendable {
                     value TEXT NOT NULL
                 ) WITHOUT ROWID;
                 """)
+        }
+        migrator.registerMigration("v2") { db in
+            // Search operators need the addresses split by header, and flags they can filter on.
+            try db.execute(sql: """
+                ALTER TABLE email ADD COLUMN isFlagged BOOLEAN NOT NULL DEFAULT 0;
+                ALTER TABLE email ADD COLUMN hasAttachment BOOLEAN NOT NULL DEFAULT 0;
+                DROP TABLE emailText;
+                CREATE VIRTUAL TABLE emailText USING fts5(
+                    subject, sender, toRecipients, ccRecipients, bccRecipients, body,
+                    content = '', contentless_delete = 1, tokenize = 'unicode61 remove_diacritics 2'
+                );
+                CREATE TABLE savedSearch (
+                    id TEXT PRIMARY KEY,
+                    position INTEGER NOT NULL,
+                    name TEXT NOT NULL,
+                    query TEXT NOT NULL,
+                    mailboxId TEXT
+                );
+                """)
+            let decoder = JMAPCoding.makeDecoder()
+            for row in try Row.fetchAll(db, sql: "SELECT rowid, json, body FROM email") {
+                let email = try decoder.decode(Email.self, from: row["body"] ?? row["json"])
+                try db.execute(
+                    sql: "UPDATE email SET isFlagged = ?, hasAttachment = ? WHERE rowid = ?",
+                    arguments: [email.has(.flagged), email.hasAttachment ?? false, row["rowid"]])
+                try index(email, rowid: row["rowid"], db)
+            }
         }
         return migrator
     }
@@ -108,11 +156,14 @@ public final class MailStore: Sendable {
                 guard let threadId = email.threadId, let receivedAt = email.receivedAt else { continue }
                 let isNew = try !Bool.fetchOne(db, sql: "SELECT EXISTS (SELECT 1 FROM email WHERE id = ?)", arguments: [email.id])!
                 try db.execute(sql: """
-                    INSERT INTO email (id, threadId, receivedAt, isSeen, json, body) VALUES (?, ?, ?, ?, ?, ?)
+                    INSERT INTO email (id, threadId, receivedAt, isSeen, isFlagged, hasAttachment, json, body)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT (id) DO UPDATE SET
-                        isSeen = excluded.isSeen, json = excluded.json, body = COALESCE(excluded.body, body)
+                        isSeen = excluded.isSeen, isFlagged = excluded.isFlagged, json = excluded.json,
+                        body = COALESCE(excluded.body, body)
                     """, arguments: [
-                        email.id, threadId, receivedAt.timeIntervalSince1970, email.has(.seen),
+                        email.id, threadId, receivedAt.timeIntervalSince1970, email.has(.seen), email.has(.flagged),
+                        email.hasAttachment ?? false,
                         try encoder.encode(email.strippingBody()),
                         email.hasBody ? try encoder.encode(email) : nil,
                     ])
@@ -125,13 +176,21 @@ public final class MailStore: Sendable {
                 }
 
                 if isNew || email.hasBody {
-                    try db.execute(sql: """
-                        INSERT OR REPLACE INTO emailText (rowid, subject, people, body)
-                        SELECT rowid, ?, ?, ? FROM email WHERE id = ?
-                        """, arguments: [email.subject, SearchText.people(of: email), SearchText.body(of: email), email.id])
+                    let rowid = try Int64.fetchOne(db, sql: "SELECT rowid FROM email WHERE id = ?", arguments: [email.id])!
+                    try Self.index(email, rowid: rowid, db)
                 }
             }
         }
+    }
+
+    private static func index(_ email: Email, rowid: Int64, _ db: Database) throws {
+        try db.execute(sql: """
+            INSERT OR REPLACE INTO emailText (rowid, subject, sender, toRecipients, ccRecipients, bccRecipients, body)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, arguments: [
+                rowid, email.subject, SearchText.addresses(email.from), SearchText.addresses(email.to),
+                SearchText.addresses(email.cc), SearchText.addresses(email.bcc), SearchText.body(of: email),
+            ])
     }
 
     public func deleteEmails(ids: [String]) async throws {
@@ -198,13 +257,14 @@ public final class MailStore: Sendable {
         public var mailboxID: String?
         /// Emails that are in none but these mailboxes don't count, e.g. Trash and Spam.
         public var hiddenMailboxIDs: [String]
-        public var search: String
+        /// Its `mailbox` is ignored; pass the resolved mailbox as `mailboxID` instead.
+        public var search: SearchQuery
         public var unreadOnly: Bool
         /// Ignore emails received before this date.
         public var since: Date?
 
         public init(
-            mailboxID: String? = nil, hiddenMailboxIDs: [String] = [], search: String = "",
+            mailboxID: String? = nil, hiddenMailboxIDs: [String] = [], search: SearchQuery = .init(),
             unreadOnly: Bool = false, since: Date? = nil
         ) {
             self.mailboxID = mailboxID
@@ -263,19 +323,52 @@ public final class MailStore: Sendable {
                 "EXISTS (SELECT 1 FROM emailMailbox m WHERE m.emailId = e.id AND m.mailboxId NOT IN (\(placeholders)))")
             arguments += StatementArguments(query.hiddenMailboxIDs)
         }
-        if !query.search.isEmpty {
-            guard let pattern = FTS5Pattern(matchingAllPrefixesIn: query.search) else { return nil }
+        let search = query.search
+        if !search.terms.isEmpty {
+            guard let pattern = matchPattern(for: search.terms) else { return nil }
             conditions.append("e.rowid IN (SELECT rowid FROM emailText WHERE emailText MATCH ?)")
             arguments += [pattern]
         }
-        if query.unreadOnly {
+        if query.unreadOnly || search.isUnread == true {
             conditions.append("NOT e.isSeen")
+        } else if search.isUnread == false {
+            conditions.append("e.isSeen")
         }
-        if let since = query.since {
+        if let isFlagged = search.isFlagged {
+            conditions.append(isFlagged ? "e.isFlagged" : "NOT e.isFlagged")
+        }
+        if let hasAttachment = search.hasAttachment {
+            conditions.append(hasAttachment ? "e.hasAttachment" : "NOT e.hasAttachment")
+        }
+        if let since = [query.since, search.after].compactMap({ $0 }).max() {
             conditions.append("e.receivedAt >= ?")
             arguments += [since.timeIntervalSince1970]
         }
+        if let before = search.before {
+            conditions.append("e.receivedAt < ?")
+            arguments += [before.timeIntervalSince1970]
+        }
         return (conditions.joined(separator: " AND "), arguments)
+    }
+
+    /// An FTS5 query requiring every term, each limited to its column, or `nil` if a term has nothing
+    /// to search for.
+    private static func matchPattern(for terms: [SearchQuery.Term]) -> String? {
+        var parts: [String] = []
+        for term in terms {
+            guard let pattern = FTS5Pattern(matchingAllPrefixesIn: term.value) else { return nil }
+            let column: String? = switch term.field {
+            case .text: nil
+            case .from: "sender"
+            case .to: "toRecipients"
+            case .cc: "ccRecipients"
+            case .bcc: "bccRecipients"
+            case .subject: "subject"
+            case .body: "body"
+            }
+            parts.append(column.map { "\($0) : (\(pattern.rawPattern))" } ?? "(\(pattern.rawPattern))")
+        }
+        return parts.joined(separator: " AND ")
     }
 
     private static func summaries(_ db: Database, anchors: [(threadId: String, anchorId: String)]) throws -> [ThreadSummary] {
@@ -285,6 +378,33 @@ public final class MailStore: Sendable {
                 db, sql: "SELECT json FROM email WHERE threadId = ? ORDER BY receivedAt, id", arguments: [anchor.threadId]
             ).map { try decoder.decode(Email.self, from: $0) }
             return ThreadSummary(id: anchor.threadId, emails: emails, anchorId: anchor.anchorId)
+        }
+    }
+
+    // MARK: Saved searches
+
+    public func savedSearches() async throws -> [SavedSearch] {
+        try await writer.read { db in
+            try Row.fetchAll(db, sql: "SELECT id, name, query, mailboxId FROM savedSearch ORDER BY position").map {
+                SavedSearch(id: $0["id"], name: $0["name"], query: $0["query"], mailboxID: $0["mailboxId"])
+            }
+        }
+    }
+
+    /// Adds a saved search at the end, or updates it where it is.
+    public func save(_ search: SavedSearch) async throws {
+        try await writer.write { db in
+            try db.execute(sql: """
+                INSERT INTO savedSearch (id, position, name, query, mailboxId)
+                VALUES (?, (SELECT COALESCE(MAX(position), -1) + 1 FROM savedSearch), ?, ?, ?)
+                ON CONFLICT (id) DO UPDATE SET name = excluded.name, query = excluded.query, mailboxId = excluded.mailboxId
+                """, arguments: [search.id, search.name, search.query, search.mailboxID])
+        }
+    }
+
+    public func deleteSavedSearch(id: String) async throws {
+        try await writer.write { db in
+            try db.execute(sql: "DELETE FROM savedSearch WHERE id = ?", arguments: [id])
         }
     }
 

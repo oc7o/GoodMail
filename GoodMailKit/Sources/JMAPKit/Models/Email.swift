@@ -87,14 +87,14 @@ public struct Email: QueryableObject, Equatable, Encodable {
 
     /// Property sets to request with `Email/get`.
     public enum Properties {
-        /// Enough to render a message list row.
+        /// Enough to render a message list row, and to search stored mail by its addresses.
         public static let listing = [
             "id", "blobId", "threadId", "mailboxIds", "keywords", "size", "receivedAt",
-            "from", "to", "subject", "sentAt", "hasAttachment", "preview",
+            "from", "to", "cc", "bcc", "subject", "sentAt", "hasAttachment", "preview",
         ]
         /// Everything needed to display a message.
         public static let full = listing + [
-            "messageId", "inReplyTo", "references", "sender", "cc", "bcc", "replyTo",
+            "messageId", "inReplyTo", "references", "sender", "replyTo",
             "bodyValues", "textBody", "htmlBody", "attachments",
             CodingKeys.listUnsubscribe.rawValue, CodingKeys.listUnsubscribePost.rawValue,
         ]
