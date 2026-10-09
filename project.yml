@@ -32,6 +32,8 @@ targets:
       - package: GoodMailKit
         product: MailPrivacy
       - package: GoodMailKit
+        product: MailCompose
+      - package: GoodMailKit
         product: MailStore
       - package: GoodMailKit
         product: GoodMailCore
@@ -50,6 +52,17 @@ targets:
           UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight
         ENABLE_APP_SANDBOX: YES
         ENABLE_OUTGOING_NETWORK_CONNECTIONS: YES
+        # Attachments: files the user picks to attach, and where received ones are saved.
+        ENABLE_USER_SELECTED_FILES: readwrite
+        # Recipient suggestions from Apple Contacts (the macOS sandbox entitlement; iOS asks at runtime).
+        ENABLE_RESOURCE_ACCESS_CONTACTS: YES
+        INFOPLIST_KEY_NSContactsUsageDescription: "GoodMail suggests recipients from your contacts as you type. Your contacts stay on this device."
+        INFOPLIST_KEY_NSCameraUsageDescription: "GoodMail uses the camera to scan documents you attach to a message."
+        # The share sheet's "Save Image" for image attachments needs this, or iOS terminates the app.
+        INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription: "GoodMail saves images from your mail to Photos when you ask it to."
+        # Keys without an INFOPLIST_KEY_ setting (background modes, background task ids) live in this partial plist,
+        # which Xcode merges with the generated one.
+        INFOPLIST_FILE: Config/GoodMail-Info.plist
         ENABLE_HARDENED_RUNTIME: YES
         # The embedded SQLCipher framework lives in Contents/Frameworks on the Mac.
         "LD_RUNPATH_SEARCH_PATHS[sdk=macosx*]": "$(inherited) @executable_path/../Frameworks"

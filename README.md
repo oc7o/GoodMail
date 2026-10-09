@@ -19,11 +19,12 @@ An open-source, privacy-first mail client for [Fastmail](https://www.fastmail.co
 |---|---|
 | M0 | Foundations: JMAP client (`JMAPKit`), app scaffold, API-token onboarding, CI |
 | M1 | Read & triage, Masked Email management, tracker blocking, encrypted cache, search |
-| M2 | Compose (incl. sending from masked addresses), drafts, attachments, unsubscribe |
-| M3 | Rules & filters, snooze, notifications, widgets, Shortcuts, accessibility |
-| M4 | OAuth, multiple accounts, optional self-hostable push relay |
-| M5 | OpenPGP |
-| M6 | S/MIME |
+| M2 | Compose with rich text (incl. sending from masked addresses), drafts, offline outbox with Undo Send, attachments, unsubscribe, Contacts autofill, Writing Tools, Liquid Glass |
+| M3 | Apple integration: Siri & Apple Intelligence (App Intents), Spotlight, Shortcuts, Handoff |
+| M4 | Rules & filters, snooze, notifications, widgets, accessibility |
+| M5 | OAuth, multiple accounts, optional self-hostable push relay |
+| M6 | OpenPGP |
+| M7 | S/MIME |
 
 ## Project layout
 
@@ -32,7 +33,9 @@ project.yml           XcodeGen spec for the iOS + macOS app (the .xcodeproj is g
 App/                  SwiftUI app: onboarding, screens, Keychain
 GoodMailKit/          Swift package holding all non-UI logic
   Sources/JMAPKit/      JMAP protocol layer (RFC 8620/8621 + Fastmail Masked Email)
-  Sources/MailPrivacy/  Tracker removal, link cleaning and the locked-down HTML that messages render as
+  Sources/MailPrivacy/  Tracker removal, link cleaning, the locked-down HTML that messages render as, and the
+                        allowlist sanitizer for HTML that leaves the device
+  Sources/MailCompose/  The message being written: rich text, the HTML and text it becomes, replies, forwards
   Sources/MailStore/    Encrypted local copy of the account (SQLCipher) with a full-text index
   Sources/GoodMailCore/ Sync between server and store, and the app state behind the screens
   Sources/DemoAccount/  In-memory fake Fastmail account with sample mail
@@ -95,9 +98,11 @@ Team-signed builds store the token in the data protection keychain, as on iOS.
 
 ### Signing in
 
-GoodMail signs in with a Fastmail **API token** for now (OAuth comes later). Create one under
-*Settings → Privacy & Security → Integrations → API tokens* and give it the **Email** and **Masked Email** scopes.
-The token is kept in the Keychain on your device only.
+GoodMail signs in with a Fastmail **API token** for now (OAuth comes later). Create one in Fastmail under
+*Settings → Privacy & Security → Connected apps & API tokens → Manage API tokens*
+(https://app.fastmail.com/settings/security/tokens) and give it the **Email**, **Email submission** and **Masked Email**
+scopes. Without Email submission you can read, triage and write drafts, but not send. The token is kept in the Keychain
+on your device only.
 
 ## License
 
