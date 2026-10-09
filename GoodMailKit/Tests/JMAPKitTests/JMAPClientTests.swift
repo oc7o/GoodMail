@@ -140,6 +140,29 @@ struct JMAPClientTests {
         #expect(transport.requests.count == 3)
     }
 
+    @Test func replacedTokenIsUsedForRequestsAndPush() async throws {
+        transport.enqueue(fixture: "session")
+        transport.enqueue(fixture: "mailbox_get")
+        let client = JMAPClient(token: "old", transport: transport, retryDelay: { _ in .zero })
+        _ = try await client.call(MailboxGet(accountId: "u1234"))
+
+        await client.setToken("new")
+        transport.enqueue(fixture: "session")
+        transport.enqueue(fixture: "mailbox_get")
+        _ = try await client.call(MailboxGet(accountId: "u1234"))
+        let pushed = StubStream()
+        pushed.finish()
+        transport.enqueue(pushed)
+        for try await _ in client.pushEvents() {}
+
+        let tokens = transport.requests.map { $0.value(forHTTPHeaderField: "Authorization") }
+        // The session is fetched again, as the new token may come with other scopes.
+        #expect(tokens == ["Bearer old", "Bearer old", "Bearer new", "Bearer new", "Bearer new"])
+        #expect(transport.requests.map { $0.url?.path() } == [
+            "/jmap/session", "/jmap/api/", "/jmap/session", "/jmap/api/", "/jmap/event/",
+        ])
+    }
+
     @Test func createsMaskedEmail() async throws {
         transport.enqueue(fixture: "session")
         transport.enqueue(fixture: "masked_email_set")

@@ -36,6 +36,11 @@ public struct Email: QueryableObject, Equatable, Encodable {
     public let listUnsubscribe: [String]?
     /// `List-Unsubscribe-Post` (RFC 8058); `List-Unsubscribe=One-Click` enables one-click unsubscribe.
     public let listUnsubscribePost: String?
+    /// Fastmail's `X-Delivered-To`: the address each delivery was made to, which names the masked address or
+    /// alias even when the message reached it through Bcc or a list. One entry per header field, topmost first.
+    public let deliveredTo: [[EmailAddress]]?
+    /// `List-Id` (RFC 2919).
+    public let listId: String?
 
     enum CodingKeys: String, CodingKey {
         case id, blobId, threadId, mailboxIds, keywords, size, receivedAt
@@ -43,6 +48,13 @@ public struct Email: QueryableObject, Equatable, Encodable {
         case hasAttachment, preview, bodyValues, textBody, htmlBody, attachments
         case listUnsubscribe = "header:List-Unsubscribe:asURLs"
         case listUnsubscribePost = "header:List-Unsubscribe-Post:asText"
+        case deliveredTo = "header:X-Delivered-To:asAddresses:all"
+        case listId = "header:List-Id:asText"
+    }
+
+    /// Every address of `deliveredTo`.
+    public var deliveredToAddresses: [EmailAddress] {
+        (deliveredTo ?? []).flatMap(\.self)
     }
 
     public func has(_ keyword: Keyword) -> Bool {
@@ -112,6 +124,7 @@ public struct Email: QueryableObject, Equatable, Encodable {
             "messageId", "inReplyTo", "references", "sender", "replyTo",
             "bodyValues", "textBody", "htmlBody", "attachments",
             CodingKeys.listUnsubscribe.rawValue, CodingKeys.listUnsubscribePost.rawValue,
+            CodingKeys.deliveredTo.rawValue, CodingKeys.listId.rawValue,
         ]
     }
 
@@ -246,8 +259,7 @@ public struct EmailGet: MethodCall {
 }
 
 extension Email: SettableObject {
-    /// Untyped until compose lands: only `update` and `destroy` are used so far.
-    public typealias Create = JSONValue
+    public typealias Create = EmailCreate
 
     /// The email as it will look once the server has applied `patch` to its keywords and mailboxes.
     public func applying(_ patch: PatchObject) -> Email {

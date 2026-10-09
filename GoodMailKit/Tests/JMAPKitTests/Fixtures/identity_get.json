@@ -1,0 +1,54 @@
+{
+  "sessionState": "cyrus-0;p-5;vfs-0",
+  "methodResponses": [
+    ["Identity/get", {
+      "accountId": "u1234",
+      "state": "7",
+      "notFound": [],
+      "list": [
+        {
+          "id": "I1",
+          "name": "Alex Berg",
+          "email": "user@fastmail.com",
+          "replyTo": null,
+          "bcc": null,
+          "textSignature": "-- \nAlex",
+          "htmlSignature": "<div>Alex</div>",
+          "mayDelete": false,
+          "showInCompose": true,
+          "isAutoConfigured": true,
+          "saveSentToMailboxId": null,
+          "saveOnSend": true,
+          "addBccOnSMTP": false,
+          "useForAutoReply": false,
+          "enableExternalSMTP": false,
+          "smtpServer": "",
+          "smtpPort": 465,
+          "smtpSSL": "ssl",
+          "smtpUser": "",
+          "smtpRemoteService": null,
+          "popLinkId": null,
+          "warnings": []
+        },
+        {
+          "id": "I2",
+          "email": "*@berg.example",
+          "replyTo": [{"name": null, "email": "replies@berg.example"}],
+          "bcc": [{"name": "Archive", "email": "archive@berg.example"}],
+          "textSignature": "",
+          "htmlSignature": "",
+          "mayDelete": true,
+          "showInCompose": false
+        },
+        {
+          "id": "I3",
+          "name": null,
+          "email": "fjord.k3x9@fastmail.com",
+          "textSignature": null,
+          "htmlSignature": null,
+          "showInCompose": true
+        }
+      ]
+    }, "c0"]
+  ]
+}
