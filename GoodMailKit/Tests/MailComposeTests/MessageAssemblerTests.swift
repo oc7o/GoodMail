@@ -125,6 +125,17 @@ struct MessageAssemblerTests {
         #expect(body.contentIDs == ["sig@x"])
     }
 
+    /// The identity's signature is the user's own: its links go out as entered (addendum, item 2), in both parts.
+    @Test func signatureLinksAreSentAsEntered() {
+        let draft = MessageDraft(from: Self.me, body: AttributedString("Hi"))
+        let signature = Signature(
+            html: "<a href=\"https://ref.example/join?utm_source=sig&amp;ref=alex\">join me</a>",
+            text: "join me https://ref.example/join?utm_source=sig&ref=alex")
+        let body = MessageAssembler.assemble(draft, options: AssemblyOptions(signature: signature))
+        #expect(body.html.contains("<a href=\"https://ref.example/join?utm_source=sig&amp;ref=alex\">join me</a>"))
+        #expect(body.text.hasSuffix("join me https://ref.example/join?utm_source=sig&ref=alex"))
+    }
+
     @Test func noSignatureWhenTheDraftOrSendDoesNotWantOne() {
         var draft = MessageDraft(from: Self.me, body: AttributedString("Hi"))
         #expect(!MessageAssembler.assemble(draft, options: AssemblyOptions()).html.contains("signature"))

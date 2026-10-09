@@ -52,10 +52,11 @@ public enum MessageAssembler {
         var html: [String] = []
         var text: [String] = []
         var contentIDs: [String] = []
+        var knownContentIDs: Set<String> = []
         var trackers = 0
         func add(_ sanitized: OutgoingHTMLSanitizer.Result?) {
             guard let sanitized else { return }
-            for id in sanitized.contentIDs where !contentIDs.contains(id) { contentIDs.append(id) }
+            for id in sanitized.contentIDs where knownContentIDs.insert(id).inserted { contentIDs.append(id) }
             trackers += sanitized.removedTrackers
         }
 
@@ -66,7 +67,10 @@ public enum MessageAssembler {
         }
 
         if draft.includesSignature, let signature = options.signature, !signature.isEmpty {
-            let sanitized = nonBlank(signature.html).map { OutgoingHTMLSanitizer.sanitize($0) }
+            // The user's own words: its links go out as entered, like the text alternative's.
+            let sanitized = nonBlank(signature.html).map {
+                OutgoingHTMLSanitizer.sanitize($0, options: .init(cleansLinks: false))
+            }
             let signatureText = nonBlank(signature.text).map(unifiedLineBreaks) ?? sanitized?.text ?? ""
             html.append("<div class=\"signature\">\(sanitized?.html ?? Self.html(fromPlainText: signatureText))</div>")
             text.append(startsWithDelimiter(signatureText) ? signatureText : "-- \n" + signatureText)
