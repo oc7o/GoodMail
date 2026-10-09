@@ -37,7 +37,9 @@ struct MailView: View {
         }
         .task { await model.start() }
         .onChange(of: scenePhase) { _, phase in
-            if phase == .active { Task { await model.refresh() } }
+            guard phase == .active else { return }
+            model.resumePush()
+            Task { await model.refresh() }
         }
         .alert(
             "Something Went Wrong",

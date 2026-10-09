@@ -45,6 +45,8 @@ public final class MailModel {
     }
 
     public static let pageSize = 50
+    /// The pushed types a refresh catches up on; Masked Email is pushed and reloaded separately.
+    private static let pushedMailTypes = ["Email", "Mailbox", "Thread", "EmailDelivery"]
 
     public let client: JMAPClient
     private let sync: MailSync
@@ -81,8 +83,20 @@ public final class MailModel {
     private var pinnedThreadIDs: [String] = []
     private var isLoadingMore = false
     @ObservationIgnored private var backgroundTask: Task<Void, Never>?
-    @ObservationIgnored private var flushTask: Task<Void, Never>?
-    @ObservationIgnored private var needsAnotherFlush = false
+    @ObservationIgnored private var pushTask: Task<Void, Never>?
+    /// The wait before push reconnects after a failure; cancelling it reconnects at once.
+    @ObservationIgnored private var pushRetry: Task<Void, Never>?
+    /// How long push waits before reconnecting after `failures` failed attempts in a row.
+    @ObservationIgnored var pushRetryDelay: (_ failures: Int) -> Duration = { failures in
+        .seconds(min(1 << min(failures, 6), 60)) * Double.random(in: 0.9...1.1)
+    }
+    /// How long a connection must last for the backoff to start over once it ends.
+    @ObservationIgnored var stablePushConnection: Duration = .seconds(60)
+    /// How often `stop()` was called, so that a `start()` under way can tell it was stopped meanwhile.
+    @ObservationIgnored private var stops = 0
+    private let refreshes = SingleFlight()
+    private let flushes = SingleFlight()
+    private let maskedEmailLoads = SingleFlight()
 
     public private(set) var maskedEmails: [MaskedEmail] = [] {
         didSet {
@@ -99,9 +113,11 @@ public final class MailModel {
     public private(set) var connectionProblem: String?
     /// Emails with changes the server hasn't received yet.
     public private(set) var pendingChangeCount = 0
+    /// Whether the server pushes its changes as they happen, so that polling can slow down.
+    public private(set) var isPushConnected = false
 
-    /// - Parameter syncsInBackground: Keep polling for changes, backfilling older mail and prefetching
-    ///   bodies for as long as the model lives.
+    /// - Parameter syncsInBackground: Until `stop()`, take in changes as the server pushes them (polling
+    ///   as a fallback), backfill older mail and prefetch bodies.
     public init(
         client: JMAPClient, store: MailStore, syncsInBackground: Bool = true, onUnauthorized: @escaping () -> Void
     ) {
@@ -112,25 +128,49 @@ public final class MailModel {
     }
 
     public func start() async {
+        let stops = self.stops
+        // stop() cancels what it finds under way, but this mustn't go on to start more.
+        var isStopped: Bool { self.stops != stops }
         mailboxes = (try? await store.mailboxes()) ?? []
         savedSearches = (try? await store.savedSearches()) ?? []
         maskedEmails = (try? await store.maskedEmails()) ?? []
         selectInboxIfNeeded()
         await updatePendingChangeCount()
         username = try? await client.session().username
+        guard !isStopped else { return }
         await refresh()
         selectInboxIfNeeded()
+        guard !isStopped else { return }
         await loadMaskedEmails()
-        if syncsInBackground { startBackgroundSync() }
+        guard syncsInBackground, !isStopped else { return }
+        startBackgroundSync()
+        startPush()
     }
 
+    /// Ends background syncing and push, and cancels refreshes and Masked Email loads under way.
     public func stop() {
+        stops += 1
         backgroundTask?.cancel()
         backgroundTask = nil
+        stopPush()
+        refreshes.cancel()
+        maskedEmailLoads.cancel()
     }
 
     /// Sends queued changes, then brings mailboxes and stored mail up to date with the server.
+    ///
+    /// Only one refresh runs at a time; callers arriving meanwhile wait for it, and it then makes one more
+    /// pass so that a change announced after its look at the server isn't missed.
     public func refresh() async {
+        await requestRefresh().value
+    }
+
+    @discardableResult
+    private func requestRefresh() -> Task<Void, Never> {
+        refreshes.start { await self.refreshOnce() }
+    }
+
+    private func refreshOnce() async {
         await flushPendingChanges()
         await loadMailboxes()
         do {
@@ -167,7 +207,9 @@ public final class MailModel {
             while !Task.isCancelled {
                 guard let hasMoreWork = await self?.performBackgroundWork() else { return }
                 try? await Task.sleep(for: hasMoreWork ? .milliseconds(500) : .seconds(20))
-                if ContinuousClock.now - lastRefresh >= .seconds(60) {
+                // While changes are pushed, polling only backs up a connection that died unnoticed.
+                let interval: Duration = self?.isPushConnected == true ? .seconds(300) : .seconds(60)
+                if ContinuousClock.now - lastRefresh >= interval {
                     await self?.refresh()
                     lastRefresh = .now
                 }
@@ -185,6 +227,84 @@ public final class MailModel {
         } catch {
             return false
         }
+    }
+
+    // MARK: Push
+
+    /// Takes in changes as the server pushes them, reconnecting whenever the connection fails or ends.
+    private func startPush() {
+        stopPush()
+        pushTask = Task { [weak self, client] in
+            var failures = 0
+            while !Task.isCancelled {
+                var failure: (any Error)?
+                var connectedAt: ContinuousClock.Instant?
+                do {
+                    let accounts = try await client.session().primaryAccounts
+                    for try await event in client.pushEvents(types: Self.pushedMailTypes + ["MaskedEmail"]) {
+                        // Events already buffered still arrive after cancelling.
+                        guard !Task.isCancelled, let self else { return }
+                        if event == .connected { connectedAt = .now }
+                        receive(event, accounts: accounts)
+                    }
+                } catch {
+                    failure = error
+                }
+                let lasted = connectedAt.map { ContinuousClock.now - $0 }
+                guard !Task.isCancelled,
+                      let retry = self?.pushEnded(by: failure, connectedFor: lasted, failures: &failures)
+                else { return }
+                await retry.value
+            }
+        }
+    }
+
+    private func receive(_ event: PushEvent, accounts: [String: String]) {
+        switch event {
+        case .connected:
+            isPushConnected = true
+            // Changes made while disconnected are only pushed by a server that knows which ones this client missed.
+            requestRefresh()
+        case .stateChange(let change):
+            let mailTypes = accounts[Capability.mail].flatMap { change.changed[$0] } ?? [:]
+            if mailTypes.keys.contains(where: Self.pushedMailTypes.contains) { requestRefresh() }
+            if let account = accounts[Capability.maskedEmail], change.changed[account]?["MaskedEmail"] != nil {
+                requestMaskedEmailLoad()
+            }
+        }
+    }
+
+    /// Returns the wait before reconnecting, or `nil` when the token was rejected and pushing is over.
+    ///
+    /// Only a connection that lasted lets the backoff start over: one that a proxy, say, ends right after accepting
+    /// it would otherwise have the app connect and catch up every second. Connection trouble isn't reported from
+    /// here; refreshing and polling notice it anyway.
+    private func pushEnded(
+        by error: (any Error)?, connectedFor duration: Duration?, failures: inout Int
+    ) -> Task<Void, Never>? {
+        isPushConnected = false
+        if case JMAPError.unauthorized? = error {
+            report(JMAPError.unauthorized)
+            return nil
+        }
+        if let duration, duration >= stablePushConnection { failures = 0 }
+        let delay = pushRetryDelay(failures)
+        failures += 1
+        pushRetry = Task { try? await Task.sleep(for: delay) }
+        return pushRetry
+    }
+
+    /// Reconnects push right away if it is waiting to retry after a failure, as when the app returns to the
+    /// foreground and the network may well be back.
+    public func resumePush() {
+        pushRetry?.cancel()
+    }
+
+    private func stopPush() {
+        pushTask?.cancel()
+        pushTask = nil
+        pushRetry?.cancel()
+        isPushConnected = false
     }
 
     // MARK: Mailboxes
@@ -547,20 +667,7 @@ public final class MailModel {
     /// Only one flush runs at a time; callers arriving meanwhile wait for it, and it then makes one
     /// more pass so that a change queued after its last look at the outbox isn't left behind.
     private func flushPendingChanges() async {
-        if let flushTask {
-            needsAnotherFlush = true
-            return await flushTask.value
-        }
-        let task = Task {
-            repeat {
-                needsAnotherFlush = false
-                await flushOnce()
-            } while needsAnotherFlush
-            // Cleared in here rather than by the awaiting caller, so no caller can find a finished task.
-            flushTask = nil
-        }
-        flushTask = task
-        await task.value
+        await flushes.start { await self.flushOnce() }.value
     }
 
     private func flushOnce() async {
@@ -597,7 +704,17 @@ public final class MailModel {
 
     // MARK: Masked Email
 
+    /// One load at a time, like `refresh()`, so an older answer never replaces a newer one.
     public func loadMaskedEmails() async {
+        await requestMaskedEmailLoad().value
+    }
+
+    @discardableResult
+    private func requestMaskedEmailLoad() -> Task<Void, Never> {
+        maskedEmailLoads.start { await self.loadMaskedEmailsOnce() }
+    }
+
+    private func loadMaskedEmailsOnce() async {
         do {
             maskedEmails = try await client.maskedEmails()
             try? await store.replaceMaskedEmails(maskedEmails)

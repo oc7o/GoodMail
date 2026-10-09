@@ -10,7 +10,7 @@ final class StubTransport: HTTPTransport {
         var headers: [String: String] = [:]
     }
 
-    private let state = Mutex<(replies: [Reply], requests: [URLRequest])>(([], []))
+    private let state = Mutex<(replies: [Reply], streams: [StubStream], requests: [URLRequest])>(([], [], []))
 
     var requests: [URLRequest] { state.withLock { $0.requests } }
 
@@ -22,6 +22,10 @@ final class StubTransport: HTTPTransport {
         enqueue(Reply(status: status, body: Fixtures.data(name)))
     }
 
+    func enqueue(_ stream: StubStream) {
+        state.withLock { $0.streams.append(stream) }
+    }
+
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let reply = state.withLock { state in
             state.requests.append(request)
@@ -31,6 +35,51 @@ final class StubTransport: HTTPTransport {
         let response = HTTPURLResponse(
             url: request.url!, statusCode: reply.status, httpVersion: "HTTP/1.1", headerFields: reply.headers)!
         return (reply.body, response)
+    }
+
+    func stream(_ request: URLRequest) async throws -> (HTTPURLResponse, AsyncThrowingStream<Data, any Error>) {
+        let stream = state.withLock { state in
+            state.requests.append(request)
+            return state.streams.isEmpty ? nil : state.streams.removeFirst()
+        }
+        guard let stream else { throw URLError(.notConnectedToInternet) }
+        let response = HTTPURLResponse(
+            url: request.url!, statusCode: stream.status, httpVersion: "HTTP/1.1", headerFields: stream.headers)!
+        return (response, stream.body)
+    }
+}
+
+/// A streamed response whose body the test writes while the client reads it.
+final class StubStream: Sendable {
+    let status: Int
+    let headers: [String: String]
+    let body: AsyncThrowingStream<Data, any Error>
+    private let continuation: AsyncThrowingStream<Data, any Error>.Continuation
+    private let cancelled = Mutex(false)
+
+    /// Whether the reader went away before the body ended, which is how a request gets cancelled.
+    var wasCancelled: Bool { cancelled.withLock { $0 } }
+
+    init(status: Int = 200, headers: [String: String] = ["Content-Type": "text/event-stream"], sending chunks: String...) {
+        self.status = status
+        self.headers = headers
+        (body, continuation) = AsyncThrowingStream.makeStream()
+        continuation.onTermination = { [weak self] termination in
+            if case .cancelled = termination { self?.cancelled.withLock { $0 = true } }
+        }
+        chunks.forEach(send)
+    }
+
+    func send(_ chunk: String) {
+        send(Data(chunk.utf8))
+    }
+
+    func send(_ chunk: Data) {
+        continuation.yield(chunk)
+    }
+
+    func finish(throwing error: (any Error)? = nil) {
+        continuation.finish(throwing: error)
     }
 }
 
@@ -46,4 +95,14 @@ extension URLRequest {
     var jsonBody: JSONValue? {
         httpBody.flatMap { try? JSONDecoder().decode(JSONValue.self, from: $0) }
     }
+}
+
+/// Polls `condition` until it holds or `timeout` passes, for effects that land asynchronously.
+func eventually(timeout: Duration = .seconds(5), _ condition: () -> Bool) async -> Bool {
+    let deadline = ContinuousClock.now + timeout
+    while !condition() {
+        guard ContinuousClock.now < deadline else { return false }
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    return true
 }

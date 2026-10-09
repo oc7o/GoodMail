@@ -4,7 +4,8 @@ import Synchronization
 
 /// An in-memory stand-in for Fastmail with sample mail, for running the app without an account.
 ///
-/// It understands just the JMAP calls the app makes. The app uses it when launched with `-demo YES`.
+/// It understands just the JMAP calls the app makes, and pushes its state changes to event-source
+/// connections (RFC 8620 §7.3). The app uses it when launched with `-demo YES`.
 public final class DemoTransport: HTTPTransport {
     private typealias Object = [String: JSONValue]
 
@@ -15,10 +16,38 @@ public final class DemoTransport: HTTPTransport {
         let kind: Kind
     }
 
+    /// An open event-source response.
+    private struct EventStream {
+        let continuation: AsyncThrowingStream<Data, any Error>.Continuation
+        /// The types to push, or `nil` for all of them.
+        let types: Set<String>?
+        let closesAfterState: Bool
+        var lastEvent = ContinuousClock.now
+        var pinger: Task<Void, Never>?
+    }
+
+    /// What the store has for an event stream, handed over once its lock is released (see `pushLock`).
+    private enum Push {
+        case event(Data, AsyncThrowingStream<Data, any Error>.Continuation)
+        case end(EventStream, (any Error)?)
+
+        func deliver() {
+            switch self {
+            case .event(let event, let continuation):
+                continuation.yield(event)
+            case .end(let stream, let error):
+                stream.pinger?.cancel()
+                stream.continuation.finish(throwing: error)
+            }
+        }
+    }
+
     private struct Store {
         var emails: [Object]
         var maskedEmails: [Object]
         var state = 1
+        var deliveryState = 1
+        var maskedEmailState = 1
         var changes: [Change] = []
         /// Changes up to this state have been forgotten, like a server that pruned its history.
         var oldestKnownState = 0
@@ -26,6 +55,26 @@ public final class DemoTransport: HTTPTransport {
         var rejectedEmailIDs: Set<String> = []
         var updateRequestCount = 0
         var downloadCount = 0
+        /// Types whose state changed since the last push.
+        var unpushedTypes: Set<String> = []
+        var eventStreams: [Int: EventStream] = [:]
+        var eventStreamConnections = 0
+        var outbox: [Push] = []
+
+        /// What `Foo/get` returns as `state` for each type; EmailDelivery exists only for push (RFC 8621 §1.5).
+        var typeStates: [String: String] {
+            Self.typeStates(mail: state, delivery: deliveryState, maskedEmail: maskedEmailState)
+        }
+
+        /// Encodes the state of every type, so a reconnecting client's `Last-Event-ID` shows what it missed.
+        var eventID: String { "\(state).\(deliveryState).\(maskedEmailState)" }
+
+        static func typeStates(mail: Int, delivery: Int, maskedEmail: Int) -> [String: String] {
+            [
+                "Email": String(mail), "Thread": String(mail), "Mailbox": String(mail),
+                "EmailDelivery": String(delivery), "MaskedEmail": String(maskedEmail),
+            ]
+        }
 
         func knows(blobId: String) -> Bool {
             emails.contains { email in
@@ -39,6 +88,70 @@ public final class DemoTransport: HTTPTransport {
         mutating func record(_ id: String, _ kind: Change.Kind) {
             state += 1
             changes.append(Change(state: state, id: id, kind: kind))
+            unpushedTypes.formUnion(["Email", "Thread", "Mailbox"])
+            if kind == .created {
+                deliveryState += 1
+                unpushedTypes.insert("EmailDelivery")
+            }
+        }
+
+        mutating func recordMaskedEmailChange() {
+            maskedEmailState += 1
+            unpushedTypes.insert("MaskedEmail")
+        }
+
+        /// The current states of the types that changed since the event `eventID`; all of them for an id that
+        /// isn't one of ours.
+        func typeStates(changedSince eventID: String) -> [String: String] {
+            let seen = eventID.split(separator: ".").compactMap { Int($0) }
+            let old = seen.count == 3 ? Self.typeStates(mail: seen[0], delivery: seen[1], maskedEmail: seen[2]) : [:]
+            return typeStates.filter { old[$0.key] != $0.value }
+        }
+
+        /// Pushes the states of the types changed since the last push.
+        mutating func pushStateChange() {
+            guard !unpushedTypes.isEmpty else { return }
+            let changed = typeStates.filter { unpushedTypes.contains($0.key) }
+            unpushedTypes = []
+            for id in eventStreams.keys { push(changed, to: id) }
+        }
+
+        /// Sends a `state` event with the types the stream asked for, if any.
+        mutating func push(_ states: [String: String], to id: Int) {
+            guard let stream = eventStreams[id] else { return }
+            let states = states.filter { stream.types?.contains($0.key) ?? true }
+            guard !states.isEmpty else { return }
+            let change: JSONValue = [
+                "@type": "StateChange",
+                "changed": [DemoTransport.accountId: .object(states.mapValues(JSONValue.string))],
+            ]
+            send(DemoTransport.event("state", id: eventID, data: change), to: id)
+            if stream.closesAfterState { close(id) }
+        }
+
+        /// Pings the stream if nothing went out for `seconds`; returns when to look again, or `nil` once it's closed.
+        mutating func ping(_ id: Int, every seconds: Int) -> ContinuousClock.Instant? {
+            guard let stream = eventStreams[id] else { return nil }
+            if stream.lastEvent + .seconds(seconds) <= .now {
+                send(DemoTransport.event("ping", data: ["interval": .number(Double(seconds))]), to: id)
+            }
+            return eventStreams[id]?.lastEvent.advanced(by: .seconds(seconds))
+        }
+
+        mutating func send(_ event: Data, to id: Int) {
+            guard let continuation = eventStreams[id]?.continuation else { return }
+            outbox.append(.event(event, continuation))
+            eventStreams[id]?.lastEvent = .now
+        }
+
+        mutating func close(_ id: Int, throwing error: (any Error)? = nil) {
+            guard let stream = eventStreams.removeValue(forKey: id) else { return }
+            outbox.append(.end(stream, error))
+        }
+
+        mutating func takeOutbox() -> [Push] {
+            defer { outbox = [] }
+            return outbox
         }
     }
 
@@ -55,15 +168,26 @@ public final class DemoTransport: HTTPTransport {
     ]
 
     private let store = Mutex(Store(emails: DemoData.emails, maskedEmails: DemoData.maskedEmails))
+    /// Held while the store's outbox is filled and delivered, so every stream gets its events in order.
+    ///
+    /// Delivering under `store`'s lock instead would deadlock: yielding takes a runtime lock of the consumer's
+    /// task, which cancelling the consumer holds while it runs `onTermination`, which takes `store`'s lock.
+    private let pushLock = Mutex(())
 
     public init() {}
 
     // MARK: Simulating the outside world
 
-    /// While offline, every request fails like a dropped connection.
+    /// While offline, every request fails like a dropped connection, and so do the open event streams.
     public var isOffline: Bool {
         get { store.withLock { $0.isOffline } }
-        set { store.withLock { $0.isOffline = newValue } }
+        set {
+            update { store in
+                store.isOffline = newValue
+                guard newValue else { return }
+                for id in store.eventStreams.keys { store.close(id, throwing: URLError(.networkConnectionLost)) }
+            }
+        }
     }
 
     /// Emails whose `Email/set` updates are refused with a `forbidden` SetError.
@@ -82,9 +206,19 @@ public final class DemoTransport: HTTPTransport {
         store.withLock { $0.downloadCount }
     }
 
+    /// How many event-source connections are open.
+    public var openEventStreams: Int {
+        store.withLock { $0.eventStreams.count }
+    }
+
+    /// How many event-source connections have been opened in total.
+    public var eventStreamConnections: Int {
+        store.withLock { $0.eventStreamConnections }
+    }
+
     /// Delivers a new plain-text message, as if someone had just sent it.
     public func deliver(id: String, threadId: String, from: String, subject: String, text: String, to mailboxId: String = "inbox") {
-        store.withLock { store in
+        update { store in
             store.emails.append(DemoData.email(
                 id, thread: threadId, in: mailboxId, hoursAgo: 0, from: (from, "\(from.lowercased())@example.com"),
                 subject: subject, text: text))
@@ -94,15 +228,37 @@ public final class DemoTransport: HTTPTransport {
 
     /// Permanently deletes an email, as another client would.
     public func destroyEmail(id: String) {
-        store.withLock { store in
+        update { store in
             store.emails.removeAll { $0["id"] == .string(id) }
             store.record(id, .destroyed)
+        }
+    }
+
+    /// Changes a masked email's state (e.g. `disabled`), as another client would.
+    public func setMaskedEmailState(id: String, to state: String) {
+        update { store in
+            guard let index = store.maskedEmails.firstIndex(where: { $0["id"] == .string(id) }) else { return }
+            store.maskedEmails[index]["state"] = .string(state)
+            store.recordMaskedEmailChange()
         }
     }
 
     /// Makes every state handed out so far too old for `Email/changes`.
     public func forgetChangeHistory() {
         store.withLock { $0.oldestKnownState = $0.state }
+    }
+
+    /// Changes the server's data, then pushes the new state of every type that changed.
+    private func update<Result: Sendable>(_ body: (inout Store) -> Result) -> Result {
+        pushLock.withLock { _ in
+            let (result, outbox) = store.withLock { store in
+                let result = body(&store)
+                store.pushStateChange()
+                return (result, store.takeOutbox())
+            }
+            for push in outbox { push.deliver() }
+            return result
+        }
     }
 
     // MARK: HTTP
@@ -150,7 +306,7 @@ public final class DemoTransport: HTTPTransport {
                     results[source] ?? .null, path: path.split(separator: "/")[...])
                 arguments[key] = nil
             }
-            switch store.withLock({ perform(name, arguments, in: &$0) }) {
+            switch update({ perform(name, arguments, in: &$0) }) {
             case .result(let result):
                 results[id] = .object(result)
                 responses.append([.string(name), .object(result), .string(id)])
@@ -176,6 +332,60 @@ public final class DemoTransport: HTTPTransport {
         default:
             return .null
         }
+    }
+
+    // MARK: Push
+
+    /// Opens the event source (RFC 8620 §7.3); any other URL streams its `send(_:)` response as one chunk.
+    ///
+    /// Nothing is pushed on connecting: the RFC asks for that only when the client's `Last-Event-ID` shows it
+    /// missed changes.
+    public func stream(_ request: URLRequest) async throws -> (HTTPURLResponse, AsyncThrowingStream<Data, any Error>) {
+        let url = request.url!
+        guard url.path().hasSuffix("/event/") else {
+            let (body, response) = try await send(request)
+            return (response, AsyncThrowingStream { $0.yield(body); $0.finish() })
+        }
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func parameter(_ name: String) -> String? { query.first { $0.name == name }?.value }
+        let types = parameter("types").flatMap { $0 == "*" ? nil : Set($0.split(separator: ",").map(String.init)) }
+        let closesAfterState = parameter("closeafter") == "state"
+        let pingSeconds = max(parameter("ping").flatMap { Int($0) } ?? 0, 0)
+        let lastEventID = request.value(forHTTPHeaderField: "Last-Event-ID")
+        let (events, continuation) = AsyncThrowingStream<Data, any Error>.makeStream()
+        let isOpen = update { store in
+            guard !store.isOffline else { return false }
+            store.eventStreamConnections += 1
+            let id = store.eventStreamConnections
+            continuation.onTermination = { [weak self] _ in self?.closeEventStream(id) }
+            store.eventStreams[id] = EventStream(
+                continuation: continuation, types: types, closesAfterState: closesAfterState,
+                pinger: pingSeconds > 0 ? Task { await self.ping(id, every: pingSeconds) } : nil)
+            if let lastEventID { store.push(store.typeStates(changedSince: lastEventID), to: id) }
+            return true
+        }
+        guard isOpen else { throw URLError(.notConnectedToInternet) }
+        let headers = ["Content-Type": "text/event-stream", "Cache-Control": "no-cache"]
+        return (HTTPURLResponse(url: url, statusCode: 200, httpVersion: "HTTP/1.1", headerFields: headers)!, events)
+    }
+
+    /// Sends `ping` events while the stream is open, each `seconds` after the event before.
+    private func ping(_ id: Int, every seconds: Int) async {
+        var due = ContinuousClock.now + .seconds(seconds)
+        while (try? await Task.sleep(until: due, clock: .continuous)) != nil {
+            guard let next = update({ $0.ping(id, every: seconds) }) else { return }
+            due = next
+        }
+    }
+
+    /// Runs as `onTermination`, so it must only take `store`'s lock (see `pushLock`).
+    private func closeEventStream(_ id: Int) {
+        store.withLock { $0.eventStreams.removeValue(forKey: id) }?.pinger?.cancel()
+    }
+
+    private static func event(_ name: String, id: String? = nil, data: JSONValue) -> Data {
+        let json = String(decoding: try! JSONEncoder().encode(data), as: UTF8.self)
+        return Data("event: \(name)\n\(id.map { "id: \($0)\n" } ?? "")data: \(json)\n\n".utf8)
     }
 
     // MARK: Methods
@@ -234,7 +444,8 @@ public final class DemoTransport: HTTPTransport {
             if !notUpdated.isEmpty { result["notUpdated"] = .object(notUpdated) }
             return .result(result)
         case "MaskedEmail/get":
-            return .result(base.merging(["list": .array(store.maskedEmails.map(JSONValue.object))]) { $1 })
+            let list = JSONValue.array(store.maskedEmails.map(JSONValue.object))
+            return .result(base.merging(["state": .string(String(store.maskedEmailState)), "list": list]) { $1 })
         case "MaskedEmail/set":
             return .result(setMaskedEmails(arguments, &store))
         default:
@@ -372,7 +583,8 @@ public final class DemoTransport: HTTPTransport {
     }
 
     private func setMaskedEmails(_ arguments: Object, _ store: inout Store) -> Object {
-        var result: Object = ["accountId": .string(Self.accountId), "newState": "demo"]
+        let before = store.maskedEmails
+        var result: Object = ["accountId": .string(Self.accountId), "oldState": .string(String(store.maskedEmailState))]
         if case .object(let creates)? = arguments["create"] {
             var created: Object = [:]
             for (creationId, value) in creates {
@@ -400,6 +612,8 @@ public final class DemoTransport: HTTPTransport {
             }
             result["updated"] = .object(updates.mapValues { _ in .null })
         }
+        if store.maskedEmails != before { store.recordMaskedEmailChange() }
+        result["newState"] = .string(String(store.maskedEmailState))
         return result
     }
 
