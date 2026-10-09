@@ -219,17 +219,46 @@ final class BlobStore: Sendable {
     /// nothing, if there is no complete blob.
     func export(key: String, kind: Kind, into handle: FileHandle) async throws -> Bool {
         try await writer.read { db in
-            guard try Bool.fetchOne(
-                db, sql: "SELECT EXISTS (SELECT 1 FROM blob WHERE key = ? AND kind = ? AND complete)",
-                arguments: [key, kind.rawValue])!
-            else { return false }
-            let chunks = try Self.chunks(of: key, db)
-            while let chunk = try chunks.next() {
-                try chunk.withUnsafeData(atIndex: 0) { bytes in
-                    if let bytes { try handle.write(contentsOf: bytes) }
-                }
+            guard try Self.isComplete(key, kind: kind, db) else { return false }
+            try Self.write(chunksOf: key, to: handle, db)
+            return true
+        }
+    }
+
+    /// Writes the complete blob at `key` to a new file at `url`, replacing what is there. Returns `false`,
+    /// leaving `url` alone, if there is no complete blob. A copy that fails halfway is removed.
+    func export(key: String, kind: Kind, to url: URL) async throws -> Bool {
+        try await writer.read { db in
+            // The file is replaced only within the read that copies the chunks, so an eviction can't come
+            // between finding the blob and copying it.
+            guard try Self.isComplete(key, kind: kind, db) else { return false }
+            guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            do {
+                let handle = try FileHandle(forWritingTo: url)
+                defer { try? handle.close() }
+                try Self.write(chunksOf: key, to: handle, db)
+            } catch {
+                try? FileManager.default.removeItem(at: url)
+                throw error
             }
             return true
+        }
+    }
+
+    private static func isComplete(_ key: String, kind: Kind, _ db: Database) throws -> Bool {
+        try Bool.fetchOne(
+            db, sql: "SELECT EXISTS (SELECT 1 FROM blob WHERE key = ? AND kind = ? AND complete)",
+            arguments: [key, kind.rawValue])!
+    }
+
+    private static func write(chunksOf key: String, to handle: FileHandle, _ db: Database) throws {
+        let chunks = try Self.chunks(of: key, db)
+        while let chunk = try chunks.next() {
+            try chunk.withUnsafeData(atIndex: 0) { bytes in
+                if let bytes { try handle.write(contentsOf: bytes) }
+            }
         }
     }
 
@@ -322,7 +351,7 @@ final class BlobStore: Sendable {
 /// Streams one blob into the blob file, 1 MiB per transaction.
 ///
 /// Call ``append(_:)`` in order and then ``finish(evictingBeyond:)`` or ``abort()``; calls must not overlap.
-/// Until it finishes, the blob is invisible to readers.
+/// Until it finishes, the blob is invisible to readers. Once a call failed, only ``abort()`` is left.
 ///
 /// A newer write of the same blob, or its deletion, stops this writer: its next call throws
 /// ``MailStoreError/writerClosed``. When two downloads of the same attachment race, the loser can look in
@@ -370,7 +399,16 @@ public final class BlobWriter: Sendable {
             return chunks
         }
         guard !chunks.isEmpty else { return }
-        try await store.append(chunks, key: key, token: token)
+        do {
+            try await store.append(chunks, key: key, token: token)
+        } catch {
+            // These chunks have left the buffer without reaching the file. Going on would leave a gap.
+            state.withLock { state in
+                state.isClosed = true
+                state.buffer = Data()
+            }
+            throw error
+        }
     }
 
     /// Writes what is left and makes the blob visible. For a received attachment, `limit` then evicts the
@@ -385,7 +423,7 @@ public final class BlobWriter: Sendable {
         try await store.finish(key: key, kind: kind, token: token, lastChunk: lastChunk, evictingBeyond: limit)
     }
 
-    /// Deletes everything written so far. Safe to call more than once, and after a failed `finish`.
+    /// Deletes everything written so far. Safe to call more than once, and after any failed call.
     public func abort() async {
         state.withLock { state in
             state.isClosed = true

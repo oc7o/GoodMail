@@ -52,19 +52,14 @@ extension MailStore {
     }
 
     /// Writes the cached attachment to a new file at `url`, replacing what is there, one chunk at a time.
-    /// Throws ``MailStoreError/attachmentNotCached(_:)`` if it isn't cached.
+    /// Throws ``MailStoreError/attachmentNotCached(_:)``, leaving whatever is at `url` alone, if it isn't
+    /// cached. A copy that fails halfway is removed.
     public func exportAttachment(blobId: String, to url: URL) async throws {
-        guard FileManager.default.createFile(atPath: url.path, contents: nil) else {
-            throw CocoaError(.fileWriteUnknown)
+        guard try await blobs.export(key: blobId, kind: .receivedAttachment, to: url) else {
+            throw MailStoreError.attachmentNotCached(blobId)
         }
-        do {
-            let handle = try FileHandle(forWritingTo: url)
-            defer { try? handle.close() }
-            try await exportAttachment(blobId: blobId, into: handle)
-        } catch {
-            try? FileManager.default.removeItem(at: url)
-            throw error
-        }
+        // The copy is complete; failing to move the attachment up in the eviction order doesn't undo that.
+        try? await blobs.markUsed(key: blobId)
     }
 
     /// Writes the cached attachment to `handle` from its current offset, one chunk at a time. Throws
@@ -73,7 +68,7 @@ extension MailStore {
         guard try await blobs.export(key: blobId, kind: .receivedAttachment, into: handle) else {
             throw MailStoreError.attachmentNotCached(blobId)
         }
-        try await blobs.markUsed(key: blobId)
+        try? await blobs.markUsed(key: blobId)
     }
 
     /// Bytes taken by cached attachments.

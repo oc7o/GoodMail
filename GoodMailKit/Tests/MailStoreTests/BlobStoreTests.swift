@@ -74,6 +74,55 @@ struct BlobStoreTests {
         #expect(!FileManager.default.fileExists(atPath: missing.path))
     }
 
+    /// Say the user confirmed replacing a file in the save panel, and the attachment was evicted meanwhile.
+    @Test func anExportWithNothingToExportLeavesTheFileThereAlone() async throws {
+        let folder = StoreFolder()
+        defer { folder.remove() }
+        let key = StoreFixtures.randomKey()
+        let store = try MailStore(url: folder.storeURL) { key }
+        let file = folder.url.appending(path: "Report.pdf")
+        let original = Data("the user's own report".utf8)
+        try original.write(to: file)
+        let download = try await store.beginAttachment(blobId: "unfinished", type: "application/pdf")
+        try await download.append(StoreFixtures.randomData((1 << 20) + 10))
+
+        for blobId in ["nope", "unfinished"] {
+            await #expect(throws: MailStoreError.attachmentNotCached(blobId)) {
+                try await store.exportAttachment(blobId: blobId, to: file)
+            }
+            #expect(try Data(contentsOf: file) == original)
+        }
+
+        let data = StoreFixtures.randomData((1 << 20) + 10)
+        try await store.storeAttachment(data, blobId: "cached", type: "application/pdf")
+        try await store.exportAttachment(blobId: "cached", to: file)
+        #expect(try Data(contentsOf: file) == data)
+    }
+
+    @Test func aWriterWhoseWriteFailedCanOnlyBeAborted() async throws {
+        let data = StoreFixtures.randomData((2 << 20) + 1000)
+        let writer = try await store.beginAttachment(blobId: "b1", type: "application/pdf")
+        try await writer.append(data[..<(1 << 20)])
+        // The second chunk's transaction fails, as it would with a full disk.
+        try await store.blobs.writer.write { db in
+            try db.execute(sql: """
+                CREATE TRIGGER failSecondChunk BEFORE INSERT ON chunk WHEN NEW.seq = 1
+                BEGIN SELECT RAISE(ABORT, 'disk full'); END
+                """)
+        }
+        await #expect(throws: DatabaseError.self) { try await writer.append(data[(1 << 20)..<(2 << 20)]) }
+        try await store.blobs.writer.write { db in try db.execute(sql: "DROP TRIGGER failSecondChunk") }
+
+        // Going on would store the attachment with a 1 MiB gap.
+        await #expect(throws: MailStoreError.writerClosed) { try await writer.append(data[(2 << 20)...]) }
+        await #expect(throws: MailStoreError.writerClosed) { try await writer.finish(evictingBeyond: nil) }
+        #expect(try await store.cachedAttachment(blobId: "b1") == nil)
+        #expect(try await store.isAttachmentCached(blobId: "b1") == false)
+
+        await writer.abort()
+        #expect(try await store.blobRowCounts() == (0, 0))
+    }
+
     @Test func abortingDeletesWhatWasWritten() async throws {
         let writer = try await store.beginAttachment(blobId: "b1", type: "image/jpeg")
         try await writer.append(StoreFixtures.randomData(2_500_000))
