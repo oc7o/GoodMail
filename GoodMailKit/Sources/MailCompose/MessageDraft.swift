@@ -69,9 +69,9 @@ public struct MessageDraft: Codable, Sendable, Equatable, Identifiable {
         return "\(UUID().uuidString.lowercased())@\(domain)"
     }
 
-    /// The domain part of `messageID`.
+    /// The domain part of `messageID`, which must be From's (C7).
     public var messageIDDomain: String? {
-        messageID.split(separator: "@").last.map(String.init)
+        messageID.lastIndex(of: "@").map { String(messageID[messageID.index(after: $0)...]) }
     }
 
     // MARK: Codable

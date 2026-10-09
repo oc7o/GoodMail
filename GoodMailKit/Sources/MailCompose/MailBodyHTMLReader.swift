@@ -140,10 +140,10 @@ public enum MailBodyHTMLReader {
                 piece = ""
             }
             for character in text {
-                if style.preservesWhitespace, character.isNewline {
+                if style.preservesWhitespace, character == "\n" || character == "\r" || character == "\r\n" {
                     flush(&self)
                     pendingBreaks += 1
-                } else if !style.preservesWhitespace, character.isWhitespace, character != "\u{00A0}" {
+                } else if !style.preservesWhitespace, HTMLNode.collapsible.contains(character) {
                     // Collapsible: dropped at the start of a line and after another collapsible space.
                     let atLineStart = (!hasContent && piece.isEmpty) || pendingBreaks > 0
                     if atLineStart || trailingCollapsibleSpace { continue }

@@ -34,9 +34,12 @@ struct HTMLNode {
         }
     }
 
+    /// Text of HTML's collapsible whitespace only; a no-break space is content.
     var isWhitespace: Bool {
-        if case .text(let text) = content { text.allSatisfy(\.isWhitespace) } else { false }
+        if case .text(let text) = content { text.allSatisfy(HTMLNode.collapsible.contains) } else { false }
     }
+
+    static let collapsible: Set<Character> = [" ", "\t", "\n", "\r", "\r\n", "\u{0C}"]
 
     static func parse(_ html: String) -> [HTMLNode] {
         struct Open {

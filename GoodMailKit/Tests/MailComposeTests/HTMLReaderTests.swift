@@ -20,7 +20,8 @@ struct HTMLReaderTests {
         return [
             Fixture.formattedBody(), mixed, colours, link,
             AttributedString(""), AttributedString("\n\n"), AttributedString("  spaced   out  \n\ttab\t"),
-            AttributedString("<html> & \"quotes\" 'too'"),
+            AttributedString("<html> & \"quotes\" 'too'"), AttributedString("10\u{2009}km\u{3000}wide \u{2003}em"),
+            AttributedString(" \n"),
         ]
     }
 
