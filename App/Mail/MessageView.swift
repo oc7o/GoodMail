@@ -10,9 +10,12 @@ struct MessageView: View {
     let isExpanded: Bool
     let toggle: () -> Void
 
+    @Environment(MailAccount.self) private var account
+    @Environment(\.compose) private var compose
     @State private var policy = RemoteContentPolicy.blockAll
     @State private var rendered: RenderedMessage?
     @State private var height: CGFloat = 40
+    @State private var unsubscribeOffer: UnsubscribeOffer?
 
     private struct RenderKey: Equatable {
         let isExpanded: Bool
@@ -21,11 +24,21 @@ struct MessageView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            Button(action: toggle) { header }
-                .buttonStyle(.plain)
+            HStack(alignment: .top, spacing: 0) {
+                Button(action: toggle) { header }
+                    .buttonStyle(.plain)
+                if isExpanded {
+                    actions
+                        .padding([.top, .trailing], 10)
+                }
+            }
             if isExpanded {
                 if let masked = model.maskedEmail(for: email) {
                     MaskedEmailBadge(model: model, masked: masked)
+                        .padding([.horizontal, .bottom], 12)
+                }
+                if email.offersUnsubscribe, let unsubscribeOffer {
+                    MessageUnsubscribeRow(email: email, offer: unsubscribeOffer)
                         .padding([.horizontal, .bottom], 12)
                 }
                 if let rendered {
@@ -35,6 +48,7 @@ struct MessageView: View {
                         await model.inlineImage(cid: cid, in: email).map { ($0.data, $0.type) }
                     }
                     .frame(height: height)
+                    .environment(\.openURL, mailtoAction)
                 }
                 attachments
             }
@@ -45,6 +59,12 @@ struct MessageView: View {
         .task(id: RenderKey(isExpanded: isExpanded, policy: policy)) {
             guard isExpanded else { return }
             rendered = MessageRenderer.render(email.messageParts, policy: policy)
+        }
+        // Asked for again each time the message opens: an earlier request changes what the row says.
+        .task(id: isExpanded) {
+            guard isExpanded, email.offersUnsubscribe else { return }
+            let offer = await MessageUnsubscribeRow.offer(for: email, in: account)
+            if !Task.isCancelled { unsubscribeOffer = offer }
         }
     }
 
@@ -61,6 +81,11 @@ struct MessageView: View {
                     Text(sender?.displayName ?? "(No Sender)")
                         .fontWeight(.semibold)
                         .lineLimit(1)
+                    if email.has(.draft) {
+                        Text("Draft")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.red)
+                    }
                     Spacer(minLength: 8)
                     if let date = email.receivedAt {
                         Text(isExpanded ? date.formatted(date: .abbreviated, time: .shortened) : date.listTimestamp)
@@ -84,6 +109,32 @@ struct MessageView: View {
         }
         .padding(12)
         .contentShape(.rect)
+    }
+
+    /// Reply, Reply All and Forward for this message; Edit Draft for a draft (§5.8).
+    @ViewBuilder private var actions: some View {
+        if email.has(.draft) {
+            Button("Edit Draft", systemImage: "square.and.pencil") { compose(.draft(emailID: email.id)) }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        } else {
+            Menu {
+                MessageActions(emailID: email.id)
+            } label: {
+                Label("Reply", systemImage: "arrowshape.turn.up.left")
+            }
+            .menuStyle(.button)
+            .buttonStyle(.borderless)
+            .labelStyle(.iconOnly)
+            .fixedSize()
+            .help("Reply, Reply All or Forward")
+        }
+    }
+
+    /// `mailto:` links open the composer, replying from the address this message came to (C8, D31); every other
+    /// link opens as before.
+    private var mailtoAction: OpenURLAction {
+        .mailto(compose, sourceEmailID: email.id)
     }
 
     private var recipients: String {
@@ -124,30 +175,41 @@ struct MessageView: View {
         email.bodyValues?.values.contains { $0.isTruncated } ?? false
     }
 
+    /// The files of the message, from the account's attachment store: Quick Look, Save…, Share (D23).
     @ViewBuilder private var attachments: some View {
-        let files = (email.attachments ?? []).filter { !($0.disposition == "inline" && $0.cid != nil) }
+        let files = email.fileAttachments
         if !files.isEmpty {
             Divider()
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack {
-                    ForEach(Array(files.enumerated()), id: \.offset) { _, file in
-                        Label {
-                            Text(file.name ?? "Attachment")
-                            if let size = file.size {
-                                Text(Int64(size), format: .byteCount(style: .file))
-                                    .foregroundStyle(.secondary)
-                            }
-                        } icon: {
-                            Image(systemName: "paperclip")
-                        }
-                        .font(.subheadline)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 6)
-                        .background(.quaternary, in: .capsule)
-                    }
-                }
-                .padding(12)
-            }
+            AttachmentStrip(parts: files, actions: account.attachments)
+        }
+    }
+}
+
+extension OpenURLAction {
+    /// `mailto:` links open GoodMail's composer, which picks the sender by the message the link was in (C8, D31);
+    /// every other link opens as it would anyway.
+    @MainActor static func mailto(_ compose: ComposeAction, sourceEmailID: String?) -> OpenURLAction {
+        OpenURLAction { url in
+            guard url.scheme?.lowercased() == "mailto", let link = MailtoLink(url) else { return .systemAction }
+            compose(.mailto(link, sourceEmailID: sourceEmailID))
+            return .handled
+        }
+    }
+}
+
+/// Reply, Reply All, Forward and Forward as Attachment for one message.
+struct MessageActions: View {
+    let emailID: String
+    @Environment(\.compose) private var compose
+
+    var body: some View {
+        Button("Reply", systemImage: "arrowshape.turn.up.left") { compose(.reply(emailID: emailID, all: false)) }
+        Button("Reply All", systemImage: "arrowshape.turn.up.left.2") { compose(.reply(emailID: emailID, all: true)) }
+        Button("Forward", systemImage: "arrowshape.turn.up.right") {
+            compose(.forward(emailID: emailID, asAttachment: false))
+        }
+        Button("Forward as Attachment", systemImage: "paperclip") {
+            compose(.forward(emailID: emailID, asAttachment: true))
         }
     }
 }
@@ -159,5 +221,10 @@ extension Email {
             guard let id = part.partId, let value = bodyValues?[id]?.value else { return nil }
             return MessagePart(kind: part.type == "text/html" ? .html : .plainText, content: value)
         }
+    }
+
+    /// Attached files, without the images the body shows inline.
+    var fileAttachments: [EmailBodyPart] {
+        (attachments ?? []).filter { !($0.disposition == "inline" && $0.cid != nil) }
     }
 }

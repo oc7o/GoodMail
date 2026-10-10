@@ -3,7 +3,8 @@
 An open-source, privacy-first mail client for [Fastmail](https://www.fastmail.com), native on iOS and macOS (SwiftUI).
 
 > Status: early development. M1 is done: you can read, triage and search mail, online and from the
-> encrypted local copy, save searches, and manage Masked Email. You cannot compose yet.
+> encrypted local copy, save searches, and manage Masked Email. M2's composing works too: rich text, replies and
+> forwards, drafts, attachments, sending from masked addresses, an offline Outbox with Undo Send, and unsubscribe.
 
 ## Goals
 
@@ -79,6 +80,13 @@ cd GoodMailKit && swift test   # run the package tests
 Debug builds can run without a Fastmail account: pass the launch argument `-demo YES` (in Xcode under
 *Product → Scheme → Edit Scheme → Run → Arguments*) to get an in-memory account with sample mail.
 Nothing in it touches the network except the sample newsletter's image, and only after you press *Load Images*.
+
+### Device checks
+
+The package tests and an offscreen walkthrough of the demo account cover most of the app, but some things only show
+on a real Mac or iPhone: menu shortcuts, compose windows coming back after a relaunch, the iOS editor and its keyboard
+toolbar, sending in the background, Quick Look, the document scanner, Continuity Camera and the Contacts permission.
+The M2 device checklist lists these checks; they are done by hand before a release.
 
 ### Code signing
 

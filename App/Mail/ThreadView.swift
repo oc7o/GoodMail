@@ -7,9 +7,11 @@ struct ThreadView: View {
     let model: MailModel
     let threadID: String
 
+    @Environment(\.compose) private var compose
     @State private var emails: [Email]?
     @State private var expanded: Set<String> = []
     @State private var error: String?
+    @State private var unsubscribing: Email?
 
     var body: some View {
         ScrollView {
@@ -42,6 +44,10 @@ struct ThreadView: View {
         #if os(iOS)
         .navigationBarTitleDisplayMode(.inline)
         #endif
+        .focusedSceneValue(\.replyTarget, replyTarget.map { ReplyTarget(emailID: $0.id, compose: compose) })
+        .sheet(item: $unsubscribing) { email in
+            UnsubscribeSheet(email: email)
+        }
         // Runs again when a message joins the conversation while it is open.
         .task(id: model.thread(id: threadID)?.emails.count) { await load() }
     }
@@ -68,8 +74,48 @@ struct ThreadView: View {
         if self.emails != emails { self.emails = emails }
     }
 
+    /// The message Reply, Reply All and Forward act on: the newest that isn't a draft.
+    private var replyTarget: Email? {
+        emails?.last { !$0.has(.draft) }
+    }
+
+    /// The newest message of a mailing list, unless it is in Junk (§2.6).
+    private var listMessage: Email? {
+        let junk = model.mailbox(.junk)?.id
+        return emails?.last { email in
+            email.offersUnsubscribe && !(junk.map { email.mailboxIds?[$0] == true } ?? false)
+        }
+    }
+
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         let summary = model.thread(id: threadID)
+        let target = replyTarget?.id
+        #if os(iOS)
+        // An iPhone's bar has no room for three more buttons: one menu at the bottom, as in Mail.
+        ToolbarItem(placement: .bottomBar) {
+            Menu {
+                if let target { MessageActions(emailID: target) }
+            } label: {
+                Label("Reply", systemImage: "arrowshape.turn.up.left")
+            }
+            .disabled(target == nil)
+        }
+        #else
+        ToolbarItemGroup {
+            Button("Reply", systemImage: "arrowshape.turn.up.left") {
+                if let target { compose(.reply(emailID: target, all: false)) }
+            }
+            .disabled(target == nil)
+            Button("Reply All", systemImage: "arrowshape.turn.up.left.2") {
+                if let target { compose(.reply(emailID: target, all: true)) }
+            }
+            .disabled(target == nil)
+            Button("Forward", systemImage: "arrowshape.turn.up.right") {
+                if let target { compose(.forward(emailID: target, asAttachment: false)) }
+            }
+            .disabled(target == nil)
+        }
+        #endif
         ToolbarItemGroup {
             if model.canArchive {
                 Button("Archive", systemImage: "archivebox") {
@@ -103,6 +149,17 @@ struct ThreadView: View {
                 Task { await model.toggleFlag(threadID: threadID) }
             }
             .keyboardShortcut("l", modifiers: [.shift, .command])
+            Menu("More", systemImage: "ellipsis.circle") {
+                if let target {
+                    Button("Forward as Attachment", systemImage: "paperclip") {
+                        compose(.forward(emailID: target, asAttachment: true))
+                    }
+                }
+                if let listMessage {
+                    Button("Unsubscribe…", systemImage: "list.bullet.rectangle") { unsubscribing = listMessage }
+                }
+            }
+            .disabled(target == nil && listMessage == nil)
         }
     }
 }
