@@ -86,7 +86,7 @@ Nothing in it touches the network except the sample newsletter's image, and only
 The package tests and an offscreen walkthrough of the demo account cover most of the app, but some things only show
 on a real Mac or iPhone: menu shortcuts, compose windows coming back after a relaunch, the iOS editor and its keyboard
 toolbar, sending in the background, Quick Look, the document scanner, Continuity Camera and the Contacts permission.
-The M2 device checklist lists these checks; they are done by hand before a release.
+[Docs/M2-DeviceChecklist.md](Docs/M2-DeviceChecklist.md) lists these checks; they are done by hand before a release.
 
 ### Code signing
 
