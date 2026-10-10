@@ -1,0 +1,368 @@
+import DemoAccount
+import Foundation
+import JMAPKit
+import MailStore
+import Synchronization
+import Testing
+@testable import GoodMailCore
+
+/// Received attachments against the demo account: the flight confirmation of e3 (180 KiB, three 64 KiB chunks)
+/// and the invoice of e5.
+@MainActor
+struct AttachmentCenterTests {
+    let transport = AttachmentCenterTestsTransport()
+    let store: MailStore
+    let root = TemporaryFilesTests.Root()
+    let files: TemporaryFiles
+    let center: AttachmentCenter
+
+    static let confirmationSize = 184_320
+
+    init() throws {
+        store = try MailStore()
+        files = root.files()
+        center = AttachmentCenter(
+            client: JMAPClient(token: "demo", transport: transport, maxRetries: 0), store: store, files: files)
+    }
+
+    static func part(blobId: String? = "e3-file0", name: String? = "Flight confirmation.pdf", size: Int? = 184_320)
+        -> EmailBodyPart
+    {
+        var json: [String: Any] = ["type": "application/pdf", "disposition": "attachment"]
+        json["blobId"] = blobId
+        json["name"] = name
+        json["size"] = size
+        return try! JMAPCoding.makeDecoder().decode(EmailBodyPart.self, from: JSONSerialization.data(withJSONObject: json))
+    }
+
+    /// Waits for what the download does in the background, giving up after five seconds.
+    func eventually(_ condition: () async -> Bool) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(5)
+        while ContinuousClock.now < deadline {
+            if await condition() { return true }
+            try? await Task.sleep(for: .milliseconds(2))
+        }
+        return false
+    }
+
+    // MARK: Opening
+
+    @Test func openingDownloadsOnceIntoTheCacheAndHandsOutASafeCopy() async throws {
+        let part = Self.part(name: "../../Flight\u{202E}fdp.exe")
+        #expect(!(await center.isCached(part)))
+
+        let url = try await center.previewURL(for: part)
+
+        #expect(transport.server.downloadCount == 1)
+        #expect(await center.isCached(part))
+        #expect(try await store.cachedAttachment(blobId: "e3-file0")?.count == Self.confirmationSize)
+        #expect(url.lastPathComponent == "Flightfdp.exe")
+        #expect(url.deletingLastPathComponent().deletingLastPathComponent().standardizedFileURL
+                == root.url.standardizedFileURL)
+        let copy = try Data(contentsOf: url)
+        #expect(copy.count == Self.confirmationSize)
+        #expect(copy.prefix(5) == Data("%PDF-".utf8))
+        #if os(macOS)
+        #expect(getxattr(url.path, "com.apple.quarantine", nil, 0, 0, 0) > 0)
+        #endif
+        #expect(center.downloads.isEmpty)
+    }
+
+    @Test func openingAgainNeedsNoDownload() async throws {
+        let first = try await center.previewURL(for: Self.part())
+        transport.server.isOffline = true
+
+        let second = try await center.previewURL(for: Self.part())
+
+        #expect(transport.server.downloadCount == 1)
+        #expect(first != second)
+        #expect(try Data(contentsOf: second) == Data(contentsOf: first))
+    }
+
+    @Test func releasingDeletesTheCopy() async throws {
+        let url = try await center.previewURL(for: Self.part())
+
+        center.release(url)
+
+        #expect(await eventually { !FileManager.default.fileExists(atPath: url.deletingLastPathComponent().path) })
+        #expect(await center.isCached(Self.part()))
+    }
+
+    @Test func purgingDeletesEveryCopy() async throws {
+        _ = try await center.previewURL(for: Self.part())
+        _ = try await center.previewURL(for: Self.part(blobId: "e5-file0", name: "Invoice-2041.pdf", size: 61_440))
+
+        files.purgeAllNow()
+
+        #expect(root.contents.isEmpty)
+    }
+
+    @Test func dataCachesWhatItDownloads() async throws {
+        let invoice = Self.part(blobId: "e5-file0", name: "Invoice-2041.pdf", size: 61_440)
+
+        let data = try await center.data(for: invoice)
+        transport.server.isOffline = true
+
+        #expect(data.count == 61_440)
+        #expect(try await center.data(for: invoice) == data)
+        #expect(try Data(contentsOf: try await center.previewURL(for: invoice)) == data)
+        #expect(transport.server.downloadCount == 1)
+    }
+
+    @Test func simultaneousOpensShareOneDownload() async throws {
+        transport.holdsDownloads = true
+        let first = Task { try await center.previewURL(for: Self.part()) }
+        let second = Task { try await center.data(for: Self.part()) }
+        #expect(await eventually { center.progress(blobId: "e3-file0")?.received == 65_536 })
+
+        transport.releaseDownloads()
+
+        let url = try await first.value
+        #expect(try await second.value == Data(contentsOf: url))
+        #expect(transport.server.downloadCount == 1)
+    }
+
+    @Test func anOpenGoesOnWhenPrefetchingCachedTheSameAttachmentMeanwhile() async throws {
+        // Prefetching downloads small attachments whole and stores them in one step, which stops the writer of a
+        // download of the same attachment that is under way.
+        let prefetched = try await JMAPClient(token: "demo", transport: transport, maxRetries: 0)
+            .download(blobId: "e3-file0", type: "application/pdf")
+        transport.holdsDownloads = true
+        let opening = Task { try await center.previewURL(for: Self.part()) }
+        let sharing = Task { try await center.data(for: Self.part()) }
+        #expect(await eventually { center.progress(blobId: "e3-file0")?.received == 65_536 })
+
+        try await store.storeAttachment(prefetched, blobId: "e3-file0", type: "application/pdf", evictingBeyond: nil)
+        transport.releaseDownloads()
+
+        #expect(try Data(contentsOf: try await opening.value) == prefetched)
+        #expect(try await sharing.value == prefetched)
+        #expect(center.downloads.isEmpty)
+        #expect(try await store.cachedAttachment(blobId: "e3-file0") == prefetched)
+    }
+
+    // MARK: Progress and failures
+
+    @Test func progressIsReportedAndCancellingLeavesNothingCached() async throws {
+        transport.holdsDownloads = true
+        let opening = Task { try await center.previewURL(for: Self.part()) }
+
+        #expect(await eventually {
+            center.progress(blobId: "e3-file0") == .init(received: 65_536, expected: Self.confirmationSize)
+        })
+        center.cancelDownload(blobId: "e3-file0")
+
+        await #expect(throws: (any Error).self) { try await opening.value }
+        #expect(center.progress(blobId: "e3-file0") == nil)
+        #expect(!(await center.isCached(Self.part())))
+        #expect(try await store.attachmentCacheBytes() == 0)
+        #expect(root.contents.isEmpty)
+
+        // Nothing left over gets in the way of the next try.
+        transport.holdsDownloads = false
+        _ = try await center.previewURL(for: Self.part())
+        #expect(transport.server.downloadCount == 2)
+        #expect(await center.isCached(Self.part()))
+    }
+
+    @Test func aBrokenDownloadCachesNothing() async throws {
+        transport.failsDownloads = true
+
+        await #expect(throws: JMAPError.self) { try await center.previewURL(for: Self.part()) }
+
+        #expect(!(await center.isCached(Self.part())))
+        #expect(try await store.attachmentCacheBytes() == 0)
+        #expect(center.downloads.isEmpty)
+        #expect(root.contents.isEmpty)
+    }
+
+    @Test func aDownloadShorterThanAnnouncedCachesNothing() async throws {
+        transport.truncatesDownloads = true
+
+        await #expect(throws: AttachmentDownloadError.incomplete(name: "Flight confirmation.pdf")) {
+            try await center.data(for: Self.part())
+        }
+        #expect(!(await center.isCached(Self.part())))
+    }
+
+    @Test func missingBlobsAreReported() async throws {
+        await #expect(throws: JMAPError.http(status: 404, problemType: nil)) {
+            try await center.previewURL(for: Self.part(blobId: "e3-file9"))
+        }
+        await #expect(throws: AttachmentDownloadError.notDownloadable(name: "Flight confirmation.pdf")) {
+            try await center.data(for: Self.part(blobId: nil))
+        }
+        #expect(center.downloads.isEmpty)
+    }
+
+    // MARK: Saving
+
+    /// A folder of its own holding a file of the user's, which saving the confirmation replaces.
+    final class SaveFolder {
+        static let ownContent = Data("the user's own file".utf8)
+
+        let url = FileManager.default.temporaryDirectory
+            .appending(path: "AttachmentCenterTests-\(UUID().uuidString)", directoryHint: .isDirectory)
+        var file: URL { url.appending(path: "Flight confirmation.pdf") }
+
+        init() throws {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            try Self.ownContent.write(to: file)
+        }
+
+        deinit {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            try? FileManager.default.removeItem(at: url)
+        }
+
+        var contents: [String] {
+            (try? FileManager.default.contentsOfDirectory(atPath: url.path).sorted()) ?? []
+        }
+    }
+
+    /// Exports as usual, after noting the folders of the copies that are about to replace a file.
+    func notingStagedFolders(in seen: TemporaryFilesTests.SeenFolders) {
+        let files = files, export = center.exportCached
+        center.exportCached = { blobId, handle in
+            seen.add(files.replacementFolders)
+            try await export(blobId, handle)
+        }
+    }
+
+    @Test func savingPutsTheAttachmentInTheFilesPlace() async throws {
+        let folder = try SaveFolder()
+        let seen = TemporaryFilesTests.SeenFolders()
+        notingStagedFolders(in: seen)
+
+        transport.failsDownloads = true
+        await #expect(throws: (any Error).self) { try await center.write(Self.part(), to: folder.file) }
+        #expect(try Data(contentsOf: folder.file) == SaveFolder.ownContent)
+
+        transport.failsDownloads = false
+        try await center.write(Self.part(), to: folder.file)
+        #expect(try Data(contentsOf: folder.file) == (try await store.cachedAttachment(blobId: "e3-file0")))
+        #if os(macOS)
+        #expect(getxattr(folder.file.path, "com.apple.quarantine", nil, 0, 0, 0) > 0)
+        #endif
+
+        let fresh = folder.url.appending(path: "Copy.pdf")
+        try await center.write(Self.part(), to: fresh)
+        #expect(try Data(contentsOf: fresh) == Data(contentsOf: folder.file))
+        #expect(transport.server.downloadCount == 2)
+
+        // Each save went through a copy of its own, which is gone again.
+        #expect(folder.contents == ["Copy.pdf", "Flight confirmation.pdf"])
+        #expect(seen.folders.count == 2)
+        #expect(seen.folders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        #expect(files.replacementFolders.isEmpty)
+        #expect(root.contents.isEmpty)
+    }
+
+    @Test func aSaveThatBreaksOffHalfwayLeavesTheFileAsItWas() async throws {
+        let folder = try SaveFolder()
+        _ = try await center.data(for: Self.part())
+        let seen = TemporaryFilesTests.SeenFolders()
+        let files = files
+        center.exportCached = { _, handle in
+            try handle.write(contentsOf: Data("%PDF-1.7 and then the disk was full".utf8))
+            seen.add(files.replacementFolders)
+            throw CocoaError(.fileWriteOutOfSpace)
+        }
+
+        await #expect(throws: CocoaError(.fileWriteOutOfSpace)) { try await center.write(Self.part(), to: folder.file) }
+
+        #expect(try Data(contentsOf: folder.file) == SaveFolder.ownContent)
+        #expect(folder.contents == ["Flight confirmation.pdf"])
+        #expect(seen.folders.count == 1)
+        #expect(seen.folders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        #expect(files.replacementFolders.isEmpty)
+    }
+
+    @Test func aSaveThatCantTakeTheFilesPlaceLeavesItAsItWas() async throws {
+        let folder = try SaveFolder()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: folder.url.path)
+        let seen = TemporaryFilesTests.SeenFolders()
+        notingStagedFolders(in: seen)
+
+        let error = await #expect(throws: CocoaError.self) { try await center.write(Self.part(), to: folder.file) }
+
+        #expect(error?.code == .fileWriteNoPermission)
+        #expect(try Data(contentsOf: folder.file) == SaveFolder.ownContent)
+        #expect(folder.contents == ["Flight confirmation.pdf"])
+        #expect(seen.folders.count == 1)
+        #expect(seen.folders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        #expect(files.replacementFolders.isEmpty)
+        #expect(await center.isCached(Self.part()))
+    }
+}
+
+/// The demo account, whose downloads can stop after their first chunk until released, break off there, or end
+/// early without an error.
+final class AttachmentCenterTestsTransport: HTTPTransport {
+    private struct State {
+        var holdsDownloads = false
+        var failsDownloads = false
+        var truncatesDownloads = false
+        var gate = AsyncStream<Void>.makeStream()
+    }
+
+    let server = DemoTransport()
+    private let state = Mutex(State())
+
+    var holdsDownloads: Bool {
+        get { state.withLock { $0.holdsDownloads } }
+        set { state.withLock { $0.holdsDownloads = newValue } }
+    }
+
+    var failsDownloads: Bool {
+        get { state.withLock { $0.failsDownloads } }
+        set { state.withLock { $0.failsDownloads = newValue } }
+    }
+
+    var truncatesDownloads: Bool {
+        get { state.withLock { $0.truncatesDownloads } }
+        set { state.withLock { $0.truncatesDownloads = newValue } }
+    }
+
+    /// Lets held downloads go on; later ones are held again while `holdsDownloads` is set.
+    func releaseDownloads() {
+        let gate = state.withLock { state in
+            defer { state.gate = AsyncStream<Void>.makeStream() }
+            return state.gate
+        }
+        gate.continuation.finish()
+    }
+
+    func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
+        try await server.send(request)
+    }
+
+    func stream(_ request: URLRequest) async throws -> (HTTPURLResponse, AsyncThrowingStream<Data, any Error>) {
+        let (response, body) = try await server.stream(request)
+        let (holds, fails, truncates, gate) = state.withLock {
+            ($0.holdsDownloads, $0.failsDownloads, $0.truncatesDownloads, $0.gate.stream)
+        }
+        guard request.url?.path().contains("/download/") == true, holds || fails || truncates else {
+            return (response, body)
+        }
+        let (chunks, continuation) = AsyncThrowingStream<Data, any Error>.makeStream()
+        let producer = Task {
+            var isFirst = true
+            do {
+                for try await chunk in body {
+                    continuation.yield(chunk)
+                    guard isFirst else { continue }
+                    isFirst = false
+                    if fails { throw URLError(.networkConnectionLost) }
+                    if truncates { break }
+                    if holds { for await _ in gate {} }
+                }
+                continuation.finish()
+            } catch {
+                continuation.finish(throwing: error)
+            }
+        }
+        continuation.onTermination = { _ in producer.cancel() }
+        return (response, chunks)
+    }
+}

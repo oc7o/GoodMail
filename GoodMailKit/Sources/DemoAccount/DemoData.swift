@@ -69,18 +69,62 @@ enum DemoData {
 
     /// Header fields of demo emails beyond those their properties make, topmost first, as delivered to Fastmail.
     ///
-    /// The newsletter's DKIM signature covers both List-Unsubscribe fields, and Fastmail's topmost
-    /// Authentication-Results pairs a `dkim=pass` with it through `header.d` and the first 8 characters of `b=`.
+    /// The newsletter has the layout Fastmail gives every message: its internal hops, the Authentication-Results
+    /// fields it wrote (several, the DKIM verdict not in the topmost one), the Received field with which its MX
+    /// accepted the message from the list's server, then what came with the message. That includes a
+    /// Fastmail-looking verdict, which anybody can write, so it doesn't count. Fastmail's `dkim=pass` pairs with
+    /// the newsletter's DKIM signature, which covers both List-Unsubscribe fields, through `header.d` and the
+    /// first 8 characters of `b=`.
     static let headers: [String: [DemoHeader]] = [
         "e4": [
+            DemoHeader("Received", """
+                from phl-compute-04.internal (phl-compute-04.internal [10.202.2.44])\r
+                \t by phl-imap-12 (Cyrus 3.13.0-alpha0-1288-gd1f3c3c4b-fm-20260924.001) with LMTPA;\r
+                \t Fri, 09 Oct 2026 08:12:40 -0400
+                """),
             DemoHeader("X-Delivered-To", "fjord.k3x9@fastmail.com"),
+            DemoHeader("Received", """
+                from phl-mx-03 ([10.202.2.202])\r
+                  by phl-compute-04.internal (LMTPProxy); Fri, 09 Oct 2026 08:12:40 -0400
+                """),
+            DemoHeader("Received", """
+                from phl-mx-03.messagingengine.com (localhost [127.0.0.1])\r
+                \tby phl-mx-03.messagingengine.com (Authentication Milter) with ESMTP\r
+                \tid 5F2C81A0091; Fri, 09 Oct 2026 08:12:40 -0400
+                """),
             DemoHeader("Authentication-Results", """
-                mx.messagingengine.com;\r
+                phl-mx-03.messagingengine.com;\r
+                    x-csa=none;\r
+                    x-me-sender=none;\r
+                    x-ptr=pass smtp.helo=mail.fjord-outdoor.example policy.ptr=mail.fjord-outdoor.example
+                """),
+            DemoHeader("Authentication-Results", """
+                phl-mx-03.messagingengine.com;\r
+                    bimi=skipped (DMARC Policy is not at enforcement)
+                """),
+            DemoHeader("Authentication-Results", """
+                phl-mx-03.messagingengine.com;\r
+                    arc=none (no signatures found);\r
                     dkim=pass (2048-bit rsa key sha256) header.d=fjord-outdoor.example\r
-                    header.i=@fjord-outdoor.example header.b=Xq3vL0f8 header.a=rsa-sha256\r
-                    header.s=fm2;\r
+                      header.i=@fjord-outdoor.example header.b=Xq3vL0f8 header.a=rsa-sha256\r
+                      header.s=fm2 x-bits=2048;\r
+                    dmarc=pass policy.published-domain-policy=none policy.applied-disposition=none\r
+                      (p=none,d=none,d.eval=none) header.from=fjord-outdoor.example;\r
+                    iprev=pass smtp.remote-ip=203.0.113.25 (mail.fjord-outdoor.example);\r
                     spf=pass smtp.mailfrom=bounce@fjord-outdoor.example\r
-                    smtp.helo=mail.fjord-outdoor.example
+                      smtp.helo=mail.fjord-outdoor.example
+                """),
+            DemoHeader("Received", """
+                from mail.fjord-outdoor.example (mail.fjord-outdoor.example [203.0.113.25])\r
+                \t(using TLSv1.3 with cipher TLS_AES_256_GCM_SHA384 (256/256 bits)\r
+                \t key-exchange X25519 server-signature RSA-PSS (2048 bits) server-digest SHA256)\r
+                \t(No client certificate requested)\r
+                \tby phl-mx-03.messagingengine.com (Postfix) with ESMTPS\r
+                \tfor <fjord.k3x9@fastmail.com>; Fri,  9 Oct 2026 08:12:39 -0400 (EDT)
+                """),
+            DemoHeader("Authentication-Results", """
+                phl-mx-01.messagingengine.com;\r
+                    dkim=pass header.d=fastmail.com header.b=Fk7Rq2Lm
                 """),
             DemoHeader("DKIM-Signature", """
                 v=1; a=rsa-sha256; c=relaxed/relaxed; d=fjord-outdoor.example;\r

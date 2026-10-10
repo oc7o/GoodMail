@@ -111,6 +111,19 @@ public struct MessageIDLookup: Sendable, Equatable {
 /// The header fields that decide how to unsubscribe from a list (RFC 2369, RFC 8058), each field in the order of
 /// the message, topmost first.
 public struct UnsubscribeHeaders: Sendable, Equatable {
+    /// A header field as the message has it (RFC 8621 §4.1.3 `EmailHeader`).
+    public struct Field: Decodable, Sendable, Equatable {
+        /// With the capitalization of the message.
+        public var name: String
+        /// Raw: everything after the colon, folding included.
+        public var value: String
+
+        public init(name: String, value: String) {
+            self.name = name
+            self.value = value
+        }
+    }
+
     /// The URLs of each `List-Unsubscribe` field; empty for a field that couldn't be parsed.
     public var listUnsubscribe: [[String]]
     public var listUnsubscribePost: [String]
@@ -118,16 +131,20 @@ public struct UnsubscribeHeaders: Sendable, Equatable {
     public var dkimSignatures: [String]
     public var authenticationResults: [String]
     public var listId: String?
+    /// Every header field of the message, topmost first. Whether an Authentication-Results field is the
+    /// receiving server's verdict or came with the message shows only in its position among the Received fields.
+    public var headers: [Field]
 
     public init(
         listUnsubscribe: [[String]], listUnsubscribePost: [String], dkimSignatures: [String],
-        authenticationResults: [String], listId: String?
+        authenticationResults: [String], listId: String?, headers: [Field] = []
     ) {
         self.listUnsubscribe = listUnsubscribe
         self.listUnsubscribePost = listUnsubscribePost
         self.dkimSignatures = dkimSignatures
         self.authenticationResults = authenticationResults
         self.listId = listId
+        self.headers = headers
     }
 }
 
@@ -293,7 +310,7 @@ extension JMAPClient {
         return try await call(EmailGet(accountId: accountId, ids: .ids(ids), properties: properties)).list
     }
 
-    /// The list headers of an email, or `nil` if it doesn't exist.
+    /// The list headers of an email, and all its header fields, or `nil` if it doesn't exist.
     public func unsubscribeHeaders(emailID: String) async throws -> UnsubscribeHeaders? {
         let accountId = try await accountId(for: Capability.mail)
         let response = try await call(GetRequest<ListHeaders>(
@@ -302,7 +319,8 @@ extension JMAPClient {
         return UnsubscribeHeaders(
             listUnsubscribe: (email.listUnsubscribe ?? []).map { $0 ?? [] },
             listUnsubscribePost: email.listUnsubscribePost ?? [], dkimSignatures: email.dkimSignatures ?? [],
-            authenticationResults: email.authenticationResults ?? [], listId: email.listId)
+            authenticationResults: email.authenticationResults ?? [], listId: email.listId,
+            headers: email.headers ?? [])
     }
 }
 
@@ -342,6 +360,7 @@ private struct ListHeaders: JMAPObject {
     let dkimSignatures: [String]?
     let authenticationResults: [String]?
     let listId: String?
+    let headers: [UnsubscribeHeaders.Field]?
 
     enum CodingKeys: String, CodingKey, CaseIterable {
         case id
@@ -350,6 +369,7 @@ private struct ListHeaders: JMAPObject {
         case dkimSignatures = "header:DKIM-Signature:all"
         case authenticationResults = "header:Authentication-Results:asText:all"
         case listId = "header:List-Id:asText"
+        case headers
     }
 
     static let properties = CodingKeys.allCases.map(\.rawValue)
