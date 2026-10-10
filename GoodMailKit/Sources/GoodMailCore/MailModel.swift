@@ -558,6 +558,8 @@ public final class MailModel {
             threads = listed
             hasMoreThreads = hasMoreStored || (serverTotal ?? 0) > serverLoaded
         } catch {
+            // A read cancelled because the list it was for has been replaced (another mailbox, say) is no error.
+            guard !Task.isCancelled, !(error is CancellationError) else { return }
             errorMessage = error.localizedDescription
         }
     }

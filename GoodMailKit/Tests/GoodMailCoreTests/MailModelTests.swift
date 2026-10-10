@@ -84,6 +84,16 @@ struct MailModelTests {
         #expect(model.threads.isEmpty)
     }
 
+    @Test func aListReadCancelledBecauseTheListChangedIsNoError() async {
+        let model = await started()
+
+        let load = Task { await model.loadThreads(debounce: false) }
+        load.cancel()
+        await load.value
+
+        #expect(model.errorMessage == nil)
+    }
+
     @Test func unreadFilterShowsOnlyUnreadConversations() async {
         let model = await started()
         model.showsUnreadOnly = true
