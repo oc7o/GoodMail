@@ -248,7 +248,8 @@ struct LinkEditor: View {
     static let allowedSchemes: Set<String> = ["http", "https", "mailto", "tel"]
 
     /// What the user typed as a link: kept as entered when it has an allowed scheme; otherwise an address gets
-    /// `mailto:`, a phone number `tel:` and anything else `https://`.
+    /// `mailto:`, a phone number `tel:` and anything else `https://`, unless that would put a user name in front of
+    /// the host (`list@example.com?subject=Hi` is no web address).
     static func url(from entry: String) -> URL? {
         let trimmed = entry.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !trimmed.contains(where: \.isWhitespace) || isPhoneNumber(trimmed) else { return nil }
@@ -263,7 +264,8 @@ struct LinkEditor: View {
         if isPhoneNumber(trimmed) {
             return URL(string: "tel:" + trimmed.filter { $0.isNumber || $0 == "+" })
         }
-        guard let url = URL(string: "https://" + trimmed), let host = url.host(), host.contains(".") else { return nil }
+        guard let url = URL(string: "https://" + trimmed), url.user() == nil, let host = url.host(), host.contains(".")
+        else { return nil }
         return url
     }
 
@@ -272,10 +274,14 @@ struct LinkEditor: View {
         return digits.count >= 3 && text.allSatisfy { $0.isNumber || " +-()/".contains($0) }
     }
 
+    /// The link as the field shows it: an address or a phone number without its scheme when `url(from:)` makes
+    /// exactly this link of it again, the whole link otherwise (a subject, several recipients), so confirming the
+    /// editor unchanged never changes the link.
     static func displayString(_ url: URL) -> String {
         let string = url.absoluteString
         for scheme in ["mailto:", "tel:"] where string.lowercased().hasPrefix(scheme) {
-            return String(string.dropFirst(scheme.count))
+            let short = String(string.dropFirst(scheme.count))
+            if Self.url(from: short) == url { return short }
         }
         return string
     }
