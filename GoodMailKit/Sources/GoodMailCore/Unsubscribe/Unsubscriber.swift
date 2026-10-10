@@ -28,9 +28,12 @@ public struct UnsubscribeOffer: Sendable, Equatable {
         self.previous = previous
     }
 
-    /// When the last request was made, unless it failed: the date of "Unsubscribe requested on 9 Oct".
+    /// When the last request was made, unless it failed or only opened the list's page: the date of "Unsubscribe
+    /// requested on 9 Oct".
     public var previousRequestDate: Date? {
-        guard let previous, !previous.outcome.hasPrefix(Unsubscriber.failedPrefix) else { return nil }
+        guard let previous, previous.outcome != Unsubscriber.pageOpened,
+              !previous.outcome.hasPrefix(Unsubscriber.failedPrefix)
+        else { return nil }
         return previous.requestedAt
     }
 }
@@ -55,6 +58,8 @@ public enum UnsubscribeOutcome: Sendable, Equatable {
 @MainActor
 public final class Unsubscriber {
     nonisolated static let failedPrefix = "failed:"
+    /// The outcome recorded for a list's web page: whether the page took the request, only the page knows.
+    nonisolated static let pageOpened = "opened"
 
     private let client: JMAPClient
     private let store: MailStore
@@ -182,7 +187,8 @@ public final class Unsubscriber {
 
     private func record(_ outcome: UnsubscribeOutcome, method: String, for offer: UnsubscribeOffer) async {
         let recorded = switch outcome {
-        case .requested, .openPage: "requested"
+        case .requested: "requested"
+        case .openPage: Self.pageOpened
         case .requestedButRedirected: "redirected"
         case .mailQueued: "queued"
         case .refusedTarget: Self.failedPrefix + "not a public address"

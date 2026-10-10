@@ -247,7 +247,14 @@ struct UnsubscriberTests {
         #expect(await unsubscriber.unsubscribe(offer, using: .web(Self.oneClickURL), from: nil) { _ in }
                 == .openPage(Self.oneClickURL))
         #expect(oneClick.requests.isEmpty)
-        #expect(try await store.unsubscription(listKey: offer.listKey)?.method == "web")
+        let record = try #require(try await store.unsubscription(listKey: offer.listKey))
+        #expect(record.method == "web")
+        #expect(record.outcome == "opened")
+
+        // Only the page knows whether it took the request, so the next offer claims none.
+        let next = try await self.offer(unsubscriber)
+        #expect(next.previous?.method == "web")
+        #expect(next.previousRequestDate == nil)
     }
 
     // MARK: Records
