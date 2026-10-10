@@ -15,6 +15,7 @@ struct MessageView: View {
     @State private var policy = RemoteContentPolicy.blockAll
     @State private var rendered: RenderedMessage?
     @State private var height: CGFloat = 40
+    @State private var unsubscribeOffer: UnsubscribeOffer?
 
     private struct RenderKey: Equatable {
         let isExpanded: Bool
@@ -36,8 +37,8 @@ struct MessageView: View {
                     MaskedEmailBadge(model: model, masked: masked)
                         .padding([.horizontal, .bottom], 12)
                 }
-                if email.offersUnsubscribe {
-                    MessageUnsubscribeRow(email: email)
+                if email.offersUnsubscribe, let unsubscribeOffer {
+                    MessageUnsubscribeRow(email: email, offer: unsubscribeOffer)
                         .padding([.horizontal, .bottom], 12)
                 }
                 if let rendered {
@@ -58,6 +59,12 @@ struct MessageView: View {
         .task(id: RenderKey(isExpanded: isExpanded, policy: policy)) {
             guard isExpanded else { return }
             rendered = MessageRenderer.render(email.messageParts, policy: policy)
+        }
+        // Asked for again each time the message opens: an earlier request changes what the row says.
+        .task(id: isExpanded) {
+            guard isExpanded, email.offersUnsubscribe else { return }
+            let offer = await MessageUnsubscribeRow.offer(for: email, in: account)
+            if !Task.isCancelled { unsubscribeOffer = offer }
         }
     }
 

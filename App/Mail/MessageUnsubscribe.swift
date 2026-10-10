@@ -3,34 +3,32 @@ import JMAPKit
 import MailPrivacy
 import SwiftUI
 
-/// The mailing-list row of a message (§2.6, §5.7): the ways its list offers to unsubscribe, asked for from
-/// Fastmail when the message is shown, and what came of the last request. Not for Junk or phishing.
+/// The mailing-list row of a message (§2.6, §5.7): the ways its list offers to unsubscribe and what came of the last
+/// request. The view that shows it asks for `offer` with `offer(for:in:)` and keeps it: a row that loaded its own
+/// offer would be an empty view until then, and SwiftUI doesn't run the `.task` of an empty view inside a stack.
 struct MessageUnsubscribeRow: View {
     let email: Email
+    let offer: UnsubscribeOffer
 
     @Environment(MailAccount.self) private var account
-    @State private var offer: UnsubscribeOffer?
 
     var body: some View {
-        Group {
-            if let offer {
-                let mail = account.mail
-                let mask = offer.maskedAddress.map { mask in mail.maskedEmails.first { $0.id == mask.id } ?? mask }
-                let sender = mail.sender(for: email)?.address
-                let senderNeedsIdentity = Self.needsSendingIdentity(sender, in: mail)
-                UnsubscribeControl(
-                    listName: offer.listName, methods: offer.methods, maskedAddress: mask?.email,
-                    isMaskDisabled: mask?.state == .disabled, previousDate: offer.previousRequestDate,
-                    // Nothing asks for identity consent while GoodMail may not create identities (Q3).
-                    mailtoNeedsIdentityConsent: MaskedSendPolicy.createsIdentities && senderNeedsIdentity,
-                    mailtoSenderMissing: !MaskedSendPolicy.createsIdentities && senderNeedsIdentity,
-                    perform: { method in await perform(method, offer: offer, sender: sender) },
-                    disableMask: mask.map { mask in { await disable(mask, offer: offer) } })
-            }
-        }
-        .task(id: email.id) { offer = await Self.offer(for: email, in: account) }
+        let mail = account.mail
+        let mask = offer.maskedAddress.map { mask in mail.maskedEmails.first { $0.id == mask.id } ?? mask }
+        let sender = mail.sender(for: email)?.address
+        let senderNeedsIdentity = Self.needsSendingIdentity(sender, in: mail)
+        UnsubscribeControl(
+            listName: offer.listName, methods: offer.methods, maskedAddress: mask?.email,
+            isMaskDisabled: mask?.state == .disabled, previousDate: offer.previousRequestDate,
+            // Nothing asks for identity consent while GoodMail may not create identities (Q3).
+            mailtoNeedsIdentityConsent: MaskedSendPolicy.createsIdentities && senderNeedsIdentity,
+            mailtoSenderMissing: !MaskedSendPolicy.createsIdentities && senderNeedsIdentity,
+            perform: { method in await perform(method, sender: sender) },
+            disableMask: mask.map { mask in { await disable(mask) } })
     }
 
+    /// Asks Fastmail each time, since its verdicts decide whether one-click is offered (D26); `nil` for Junk,
+    /// phishing, or a list that offers no way GoodMail can use.
     static func offer(for email: Email, in account: MailAccount) async -> UnsubscribeOffer? {
         guard email.listUnsubscribe?.isEmpty == false else { return nil }
         let mail = account.mail
@@ -44,7 +42,7 @@ struct MessageUnsubscribeRow: View {
         return mail.senderOptions().first { $0.id == sender.email.lowercased() }?.needsSendingIdentity == true
     }
 
-    private func perform(_ method: ListUnsubscribe.Method, offer: UnsubscribeOffer, sender: EmailAddress?) async -> String? {
+    private func perform(_ method: ListUnsubscribe.Method, sender: EmailAddress?) async -> String? {
         let outbox = account.mail.outbox
         let outcome = await account.unsubscriber.unsubscribe(offer, using: method, from: sender) { draft in
             try await outbox.send(draft)
@@ -52,7 +50,7 @@ struct MessageUnsubscribeRow: View {
         return Self.status(of: outcome)
     }
 
-    private func disable(_ mask: MaskedEmail, offer: UnsubscribeOffer) async {
+    private func disable(_ mask: MaskedEmail) async {
         await account.mail.setMaskedEmailState(.disabled, id: mask.id)
         await account.unsubscriber.recordMaskDisabled(offer)
     }
@@ -80,7 +78,11 @@ struct MessageUnsubscribeRow: View {
 /// The unsubscribe row on its own, for the reading pane's More menu and the list's context menu (§5.7).
 struct UnsubscribeSheet: View {
     let email: Email
+
+    @Environment(MailAccount.self) private var account
     @Environment(\.dismiss) private var dismiss
+    @State private var offer: UnsubscribeOffer?
+    @State private var isLoading = true
 
     var body: some View {
         NavigationStack {
@@ -88,8 +90,9 @@ struct UnsubscribeSheet: View {
                 Text(email.subject?.nonEmpty ?? "(No Subject)")
                     .font(.headline)
                     .lineLimit(2)
-                MessageUnsubscribeRow(email: email)
+                offerContent
                     .padding(12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .background(.background.secondary, in: .rect(cornerRadius: 12))
                 Spacer(minLength: 0)
             }
@@ -103,12 +106,30 @@ struct UnsubscribeSheet: View {
                     Button("Done") { dismiss() }
                 }
             }
+            .task(id: email.id) {
+                offer = await MessageUnsubscribeRow.offer(for: email, in: account)
+                isLoading = false
+            }
         }
         #if os(macOS)
         .frame(width: 460, height: 220)
         #else
         .presentationDetents([.height(260), .medium])
         #endif
+    }
+
+    @ViewBuilder private var offerContent: some View {
+        if let offer {
+            MessageUnsubscribeRow(email: email, offer: offer)
+        } else if isLoading {
+            ProgressView()
+                .controlSize(.small)
+                .frame(maxWidth: .infinity)
+        } else {
+            Text("This list doesn't offer a way to unsubscribe that GoodMail can use.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+        }
     }
 }
 
