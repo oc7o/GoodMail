@@ -60,6 +60,40 @@ struct OutboxFailureTests {
         #expect(try await account.row(id) == nil)
     }
 
+    @Test func aLostAnswerWhoseMessageWentOutMeanwhileIsFinalized() async throws {
+        await account.start()
+        account.transport.beforeNext("EmailSubmission/set") { [server] in server.loseNextResponse() }
+        let id = try await send()
+        #expect(try await account.row(id)?.state == .submitting)
+
+        await account.advance(20)
+
+        #expect(try await account.row(id) == nil)
+        #expect(server.sentMessages.count == 1)
+        #expect(account.transport.calls(to: "EmailSubmission/set") == 1)
+        #expect(outbox.items.isEmpty)
+    }
+
+    @Test func aLostAnswerToARefusedSubmissionIsSentOnceMore() async throws {
+        await account.start()
+        account.transport.beforeNext("EmailSubmission/set") { [server] in
+            server.failNextSubmission(methodError: "invalidArguments")
+            server.loseNextResponse()
+        }
+        let id = try await send()
+        let messageID = try #require(try await account.row(id)).messageID
+        #expect(try await account.copies(of: messageID).count == 1)
+
+        await account.settle()
+
+        // The stray email of the lost attempt is gone, and the message went again, once.
+        #expect(try await account.row(id)?.state == .held)
+        #expect(account.transport.calls(to: "EmailSubmission/set") == 2)
+        #expect(try await account.copies(of: messageID).values.map { $0 } == [["sent": true]])
+        await account.advance(17)
+        #expect(server.sentMessages.count == 1)
+    }
+
     @Test func aBusyAnswerAfterTheWorkIsVerifiedAndNeverSentAgain() async throws {
         let account = try OutboxTestAccount(maxRetries: 3)
         await account.start()

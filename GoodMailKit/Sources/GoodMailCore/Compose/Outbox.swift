@@ -705,7 +705,7 @@ public final class Outbox {
                     record.localDelay = true
                     record.notBefore = until
                 }
-                return requestFlushSoon()
+                return requestFlush()
             case .failed(let failure)?:
                 return await fail(id, failure)
             case .blobsNotFound(let missing)? where attempt == 0:
@@ -831,7 +831,7 @@ public final class Outbox {
                 }
                 notices.append(.canceled(subject))
             } else {
-                requestFlushSoon()
+                requestFlush()
             }
         case .held(let submission):
             await submitted(id, submission: submission, context: context)
@@ -1153,10 +1153,6 @@ public final class Outbox {
         }
     }
 
-    /// Has the flush that just ran look again shortly, for a message that can go on right away.
-    private func requestFlushSoon() {
-        Task { self.requestFlush() }
-    }
 
     // MARK: Uploads
 

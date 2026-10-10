@@ -274,6 +274,9 @@ struct ComposeTests {
         #expect(Set((sent.attachments ?? []).compactMap(\.blobId)) == ["e5-file0", "e5-logo"])
         #expect(sent.attachments?.first { $0.blobId == "e5-logo" }?.cid == "logo@northwind.example")
         #expect(account.server.downloadCount == 0)
+        #expect(try await account.serverEmail("e5")?.has(.forwarded) == false)
+        await account.advance(17)
+        #expect(try await account.serverEmail("e5")?.has(.forwarded) == true)
     }
 
     @Test func forwardAsAttachmentAttachesTheWholeOriginal() async throws {
