@@ -264,6 +264,28 @@ struct OutboxTests {
         }
     }
 
+    @Test func savingAMessageOnItsWayToFastmailLeavesItAlone() async throws {
+        await account.start()
+        let composer = try await account.composeToMaya()
+        await composer.saveNow()
+        let draft = composer.draft
+        account.server.advanceClock(by: 1)
+        try await composer.send()
+        await account.settle()
+        // The synced store now has the held message in Sent, where no draft is.
+        account.server.advanceClock(by: 1)
+        await model.refresh()
+        let calls = ["Email/set", "Email/query"].map { account.transport.calls(to: $0) }
+
+        try await outbox.save(draft, toServer: true)
+
+        #expect(try await account.row(composer.id)?.state == .held)
+        #expect(["Email/set", "Email/query"].map { account.transport.calls(to: $0) } == calls)
+        #expect(await outbox.cancel(composer.id) == .backToDrafts)
+        await account.advance(20)
+        #expect(account.server.sentMessages.isEmpty)
+    }
+
     // MARK: The token (D18)
 
     @Test func replacingTheTokenKeepsDraftsAndLearnsWhatTheNewOneMay() async throws {

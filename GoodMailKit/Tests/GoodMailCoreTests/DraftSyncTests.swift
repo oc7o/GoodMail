@@ -106,6 +106,72 @@ struct DraftSyncTests {
         #expect(account.transport.arguments(of: "Email/set").filter(\.creates).count == creates + 2)
     }
 
+    /// A saved draft, then a save whose answer is lost: its copy replaced the first one on the server.
+    private func draftWithALostSave() async throws -> (Composer, messageID: String) {
+        let (composer, first) = try await savedDraft()
+        server.advanceClock(by: 2)
+        composer.body = AttributedString("Make it one")
+        account.transport.beforeNext("Email/set") { [server] in server.loseNextResponse() }
+        await composer.saveNow()
+        let messageID = composer.draft.messageID
+        #expect(try await account.serverEmail(first) == nil)
+        #expect(try await account.copies(of: messageID).count == 1)
+        return (composer, messageID)
+    }
+
+    @Test func theCopyOfASaveWhoseAnswerWasLostGoesOnceTheMessageIsSent() async throws {
+        await account.start()
+        let (composer, messageID) = try await draftWithALostSave()
+
+        try await composer.send()
+        await account.settle()
+        #expect(try await account.row(composer.id)?.state == .held)
+        await account.advance(17)
+
+        #expect(try await account.row(composer.id) == nil)
+        #expect(server.sentMessages.map(\.messageId) == [messageID])
+        #expect(try await account.copies(of: messageID).values.map { $0 } == [["sent": true]])
+    }
+
+    @Test func theCopyOfASaveWhoseAnswerWasLostStaysOwnAfterASubmitThatNeverLeft() async throws {
+        await account.start()
+        let (composer, messageID) = try await draftWithALostSave()
+        account.transport.failNext("EmailSubmission/set", with: .notConnectedToInternet)
+
+        try await composer.send()
+        await account.settle()
+        #expect(try await account.row(composer.id)?.state == .queued)
+        await account.advance(30)
+
+        // Still this composition's own copy, not another device's version to fork from.
+        let row = try #require(try await account.row(composer.id))
+        #expect(row.state == .held && row.messageID == messageID && row.record.notice == nil)
+        await account.advance(17)
+        #expect(server.sentMessages.map(\.messageId) == [messageID])
+        #expect(try await account.copies(of: messageID).values.map { $0 } == [["sent": true]])
+    }
+
+    @Test func theCopyOfASaveWhoseAnswerWasLostStaysOwnAfterASendThatFailedBeforeAsking() async throws {
+        await account.start()
+        let (composer, messageID) = try await draftWithALostSave()
+        // From an address that is none of the user's: it fails before anything is asked of Fastmail.
+        var draft = composer.draft
+        draft.from = EmailAddress(email: "nobody@fastmail.com")
+        try await outbox.send(draft)
+        await account.settle()
+        #expect(outbox.items.map(\.state) == [.failed(.senderNotAllowed("nobody@fastmail.com"))])
+
+        server.advanceClock(by: 2)
+        composer.body = AttributedString("Make it half past")
+        await composer.saveNow()
+
+        let row = try #require(try await account.row(composer.id))
+        let current = try #require(row.serverEmailID)
+        #expect(row.state == .editing && row.messageID == messageID)
+        #expect(row.record.notice == nil && composer.notices.isEmpty)
+        #expect(try await account.copies(of: messageID) == [current: ["drafts": true]])
+    }
+
     @Test func copiesAreFoundWhenTheServerIgnoresTheHeaderFilter() async throws {
         await account.start()
         server.ignoresHeaderFilter = true
@@ -217,6 +283,50 @@ struct DraftSyncTests {
         #expect(try await account.copies(of: messageID).values.map { $0 } == [["sent": true]])
     }
 
+    @Test func aDraftSentElsewhereIsSentOnlyOnceKeptAsANewMessage() async throws {
+        let (composer, messageID) = try await sentElsewhere()
+        composer.body = AttributedString("Wait, one more thing: bring the tickets")
+
+        #expect(composer.problems.first == .sentElsewhere)
+        await #expect(throws: SendProblem.sentElsewhere) { try await composer.send() }
+        await #expect(throws: SendProblem.sentElsewhere) { try await outbox.send(composer.draft) }
+        await account.settle()
+        #expect(try await account.row(composer.id)?.state == .editing)
+        #expect(await model.composer(id: composer.id) === composer)
+
+        await composer.keepAsNewMessage()
+        #expect(composer.problems.isEmpty)
+        try await composer.send()
+        await account.settle()
+        await account.advance(17)
+
+        let sent = try #require(server.sentMessages.first)
+        #expect(server.sentMessages.count == 1 && sent.messageId != messageID)
+        let text = try await account.serverEmail(sent.emailId)?.bodyValues?["text"]?.value
+        #expect(text?.hasPrefix("Wait, one more thing: bring the tickets") == true)
+    }
+
+    // MARK: Deleting (D11)
+
+    @Test func anEditWhileTheDraftIsDeletedDoesNotBringItBack() async throws {
+        await account.start()
+        let (composer, copy) = try await savedDraft()
+        let creates = account.transport.arguments(of: "Email/set").filter(\.creates).count
+        // The move to Trash waits.
+        account.transport.hold("Email/set")
+
+        let discard = Task { await composer.discard() }
+        #expect(await eventually { account.transport.heldRequests == 1 })
+        composer.body = AttributedString("Typed while deleting")
+        account.transport.release("Email/set")
+        #expect(await discard.value == .discarded)
+        await account.advance(6)
+
+        #expect(try await account.row(composer.id) == nil)
+        #expect(account.transport.arguments(of: "Email/set").filter(\.creates).count == creates)
+        #expect(try await account.serverEmail(copy)?.mailboxIds == ["trash": true])
+    }
+
     // MARK: Uploads (C28)
 
     @Test func aServerSaveWaitsForARunningUpload() async throws {
@@ -302,6 +412,20 @@ struct DraftSyncTests {
         await account.settle()
 
         #expect(try await account.serverEmail("e15")?.mailboxIds == ["trash": true])
+    }
+
+    @Test func deletingADraftOpenedFromTheServerRightAfterEditingItMovesItToTrash() async throws {
+        await account.start()
+        let composer = try await model.compose(.draft(emailID: "e15"))
+        // Deleted within the second before the edit is saved on the device.
+        composer.body = AttributedString("Never mind")
+
+        #expect(await composer.discard() == .discarded)
+        await account.advance(6)
+
+        #expect(try await account.serverEmail("e15")?.mailboxIds == ["trash": true])
+        #expect(try await account.row(composer.id) == nil)
+        #expect(account.transport.arguments(of: "Email/set").filter(\.creates).isEmpty)
     }
 }
 

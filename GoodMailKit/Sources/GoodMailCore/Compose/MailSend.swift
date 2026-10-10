@@ -261,13 +261,26 @@ struct MailSend: Sendable {
     }
 
     /// The read-only check before every submission (D14): has the composition been sent elsewhere?
-    func preCheck(_ row: StoredDraft, mailboxes: SendMailboxes) async throws -> PreCheck {
+    ///
+    /// Also returns the composition's own drafts other than its server copy, such as one made by a save whose
+    /// answer was lost; they go with the server copy once the message is submitted (§2.2, D33). They are
+    /// recorded as its own here, since the stamp they are known by is forgotten once an outcome is known.
+    func preCheck(_ row: StoredDraft, mailboxes: SendMailboxes) async throws -> (PreCheck, strays: [String]) {
         let record = row.record
         let copies = try await copies(of: row.messageID, since: record.createdAt.addingTimeInterval(-600), mailboxes: mailboxes)
-        let foreign = copies.filter { $0.id != row.serverEmailID && !record.isOwn($0) }
-        if foreign.contains(where: { !$0.isDraft && $0.mailboxIds[mailboxes.sent] == true }) { return .sentElsewhere }
-        if foreign.contains(where: \.isDraft) { return .otherVersion }
-        return .clear
+        let others = copies.filter { $0.id != row.serverEmailID }
+        let strays = others.filter { record.isOwn($0) && $0.isDraft }.map(\.id)
+        if strays.contains(where: { !record.ownEmailIDs.contains($0) }) {
+            try await store.updateOutbox(id: row.id) { _, record in
+                for stray in strays { record.addOwn(stray) }
+            }
+        }
+        let foreign = others.filter { !record.isOwn($0) }
+        if foreign.contains(where: { !$0.isDraft && $0.mailboxIds[mailboxes.sent] == true }) {
+            return (.sentElsewhere, strays)
+        }
+        if foreign.contains(where: \.isDraft) { return (.otherVersion, strays) }
+        return (.clear, strays)
     }
 
     enum SubmitOutcome: Equatable {
@@ -287,14 +300,24 @@ struct MailSend: Sendable {
         case notSent(JMAPError)
         /// No usable answer that may have come after the server acted: verify before anything else (D14).
         case unknown
+
+        /// Nothing is on its way: the message is queued again, or is about to fail.
+        var isNotSent: Bool {
+            switch self {
+            case .held, .released, .unknown: false
+            case .holdRefused, .failed, .blobsNotFound, .busy, .notSent: true
+            }
+        }
     }
 
     /// Persists `submitting` (D14), then creates the message and its submission in one request that is never
-    /// repeated by itself, destroying nothing (D33). Returns `nil` if the row isn't queued any more, as when
-    /// the user cancelled meanwhile.
+    /// repeated by itself, destroying nothing (D33). Returns `nil` if the row isn't queued as `version` any
+    /// more, as when the user cancelled meanwhile, or sent it again with other content.
+    ///
+    /// Once Fastmail holds it, the previous server copy and `strays` (from the pre-check) are to be destroyed.
     func submit(
         _ id: String, draft: MessageDraft, identity: Identity, blobIDs: [UUID: String], holdFor: Int?,
-        context: SendContext
+        context: SendContext, version: OutboxRecord.SendVersion, strays: [String]
     ) async throws -> SubmitOutcome? {
         try MessageBuilder.checkMessageID(of: draft)
         let envelope = try MessageBuilder.envelope(for: draft, holdFor: holdFor)
@@ -309,7 +332,7 @@ struct MailSend: Sendable {
             return .failed(.tooLarge(limit: limit))
         }
         let claimed = try await store.updateOutbox(id: id) { row, record in
-            guard row.state == .queued else { return }
+            guard row.state == .queued, version.matches(row, record) else { return }
             row.state = .submitting
             record.begin(.send, at: start, stamp: stamp)
             record.wait = nil
@@ -344,10 +367,11 @@ struct MailSend: Sendable {
             let now = clock.now
             let held = submission.undoStatus == .pending || (submission.undoStatus == nil && holdFor != nil)
             let info = OutboxRecord.Submission(
-                id: submission.id, emailID: emailID, submittedAt: start, heldAt: now, sendAt: submission.sendAt)
+                id: submission.id, emailID: emailID, submittedAt: start, heldAt: now, sendAt: submission.sendAt,
+                movedToSent: result.movedToSent)
             _ = try await store.updateOutbox(id: id) { row, record in
                 record.addOwn(emailID)
-                record.destroyLater([row.serverEmailID].compactMap { $0 }.filter { $0 != emailID })
+                record.destroyLater(([row.serverEmailID].compactMap { $0 } + strays).filter { $0 != emailID })
                 row.serverEmailID = emailID
                 row.serverRevision = row.revision
                 row.state = .held
@@ -408,9 +432,11 @@ struct MailSend: Sendable {
         let submissions = try await client.submissions(forEmailIDs: candidates.map(\.id))
         if let pending = submissions.first(where: { $0.undoStatus == .pending && $0.emailId != nil }),
            let emailID = pending.emailId {
+            let email = candidates.first { $0.id == emailID }
             let info = OutboxRecord.Submission(
                 id: pending.id, emailID: emailID, submittedAt: record.lastAttempt?.startedAt ?? now, heldAt: now,
-                sendAt: pending.sendAt)
+                sendAt: pending.sendAt,
+                movedToSent: email.map { !$0.isDraft && $0.mailboxIds[mailboxes.sent] == true })
             let strays = candidates.map(\.id).filter { $0 != emailID }
             _ = try await store.updateOutbox(id: id) { row, record in
                 record.addOwn(emailID)
@@ -470,8 +496,10 @@ struct MailSend: Sendable {
         case .final: return .released
         case .canceled: return .canceled
         case nil:
-            // Fastmail deletes a submission once it is released or cancelled: the email tells which.
-            guard let email else { return .released }
+            // Fastmail deletes a submission once it is released or cancelled: the email tells which, unless the
+            // submission never moved it to Sent. Then it looks the same either way, and counts as sent, so that
+            // it is never offered for sending again.
+            guard let email, submission.movedToSent != false else { return .released }
             return email.has(.draft) && email.mailboxIds?[mailboxes.drafts] == true ? .canceled : .released
         }
     }

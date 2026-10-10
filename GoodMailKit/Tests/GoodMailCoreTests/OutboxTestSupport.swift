@@ -60,6 +60,7 @@ final class OutboxTestTransport: HTTPTransport {
         var calls: [String: Int] = [:]
         var bodies: [Data] = []
         var beforeNext: [(name: String, action: @Sendable () -> Void)] = []
+        var afterNext: [(name: String, rewrite: @Sendable (JSONValue) -> JSONValue)] = []
         var failures: [(name: String, code: URLError.Code)] = []
         var eventSourceURLs: [URL] = []
     }
@@ -100,6 +101,11 @@ final class OutboxTestTransport: HTTPTransport {
         state.withLock { $0.beforeNext.append((name, action)) }
     }
 
+    /// Changes the answer to the next request calling `name` on its way back, as `rewrite` returns it.
+    func afterNext(_ name: String, _ rewrite: @escaping @Sendable (JSONValue) -> JSONValue) {
+        state.withLock { $0.afterNext.append((name, rewrite)) }
+    }
+
     /// The next request calling `name` fails with `code` without reaching the server.
     func failNext(_ name: String, with code: URLError.Code) {
         state.withLock { $0.failures.append((name, code)) }
@@ -129,20 +135,24 @@ final class OutboxTestTransport: HTTPTransport {
 
     func send(_ request: URLRequest) async throws -> (Data, HTTPURLResponse) {
         let names = Self.names(of: request)
-        let (held, actions, failure) = state.withLock { state -> (String?, [@Sendable () -> Void], URLError.Code?) in
+        let (held, actions, rewrites, failure) = state.withLock { state in
             for name in names { state.calls[name, default: 0] += 1 }
             if names != [Self.upload], let body = request.httpBody { state.bodies.append(body) }
             var actions: [@Sendable () -> Void] = []
+            var rewrites: [@Sendable (JSONValue) -> JSONValue] = []
             var failure: URLError.Code?
             for name in names {
                 if let index = state.beforeNext.firstIndex(where: { $0.name == name }) {
                     actions.append(state.beforeNext.remove(at: index).action)
                 }
+                if let index = state.afterNext.firstIndex(where: { $0.name == name }) {
+                    rewrites.append(state.afterNext.remove(at: index).rewrite)
+                }
                 if failure == nil, let index = state.failures.firstIndex(where: { $0.name == name }) {
                     failure = state.failures.remove(at: index).code
                 }
             }
-            return (names.first(where: state.held.contains), actions, failure)
+            return (names.first(where: state.held.contains), actions, rewrites, failure)
         }
         if let failure { throw URLError(failure) }
         if let held {
@@ -156,7 +166,11 @@ final class OutboxTestTransport: HTTPTransport {
             }
         }
         for action in actions { action() }
-        return try await server.send(request)
+        let (data, response) = try await server.send(request)
+        guard !rewrites.isEmpty, let answer = try? JSONDecoder().decode(JSONValue.self, from: data) else {
+            return (data, response)
+        }
+        return (try JSONEncoder().encode(rewrites.reduce(answer) { $1($0) }), response)
     }
 
     func stream(_ request: URLRequest) async throws -> (HTTPURLResponse, AsyncThrowingStream<Data, any Error>) {

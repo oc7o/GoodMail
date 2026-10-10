@@ -15,6 +15,8 @@ public enum SendProblem: Error, Equatable, Sendable, LocalizedError {
     /// asks the user for consent for exactly this address and tries again with it.
     case needsSendingIdentity(String)
     case attachmentDataLost([String]), inlineForwardIncomplete
+    /// Another device sent this message: Close it, or Keep as New Message to send it again (§2.3).
+    case sentElsewhere
 
     public var errorDescription: String? {
         switch self {
@@ -41,6 +43,8 @@ public enum SendProblem: Error, Equatable, Sendable, LocalizedError {
             "Attach \(names.joined(separator: ", ")) again: the data is no longer on this device."
         case .inlineForwardIncomplete:
             "The original isn't complete on this device. Forward it as an attachment instead."
+        case .sentElsewhere:
+            "This message was sent from another device. Keep it as a new message to send it again."
         }
     }
 
@@ -195,7 +199,9 @@ public final class Composer: Identifiable {
         // property is set once: setting one again here would run its observer and count as an edit.
         let settings = restoredRevision == nil && origin == nil
             ? Self.settings(for: draft.from, directory: directory, bcc: draft.bcc, automaticBcc: [], messageID: draft.messageID)
-            : SenderSettings(replyTo: draft.replyTo, bcc: draft.bcc, automaticBcc: [], messageID: draft.messageID)
+            : SenderSettings(
+                replyTo: draft.replyTo, bcc: draft.bcc, automaticBcc: Self.identityBcc(in: draft, directory: directory),
+                messageID: draft.messageID)
         self.model = model
         id = draft.id
         kind = draft.kind
@@ -240,9 +246,11 @@ public final class Composer: Identifiable {
     public var problems: [SendProblem] {
         guard let model else { return [.cannotSend(.unknown)] }
         let lost = attachments.filter { lostAttachmentIDs.contains($0.id) }.map(\.name)
-        return SendCheck.problems(
+        let problems = SendCheck.problems(
             for: draft, availability: model.sendAvailability, account: model.account,
             directory: model.senderDirectory, policy: model.outbox.maskedSending, lostAttachments: lost)
+        // Sending now would only find it sent already, and lose what was written since (§2.3).
+        return notices.contains(.sentElsewhere) ? [.sentElsewhere] + problems : problems
     }
 
     /// A warning about the sender: a disabled or deleted masked address (D22), a From other than the address the
@@ -455,12 +463,15 @@ public final class Composer: Identifiable {
             isClosed = true
             model.composerClosed(id)
         }
+        // Closed before the draft goes, so that an edit arriving meanwhile can't save it again.
         if notices.contains(.sentElsewhere), !keptAsNew {
+            isClosed = true
             _ = await model.outbox.discard(id)
             return
         }
         guard hasEdits, mode == .editing else { return }
         if isEmptyNewMessage {
+            isClosed = true
             _ = await model.outbox.discard(id)
             return
         }
@@ -473,12 +484,14 @@ public final class Composer: Identifiable {
         guard let model else { return .discarded }
         autosave?.cancel()
         autosave = nil
+        // Closed first, so that an edit arriving while the server copy goes to Trash can't save it again.
+        isClosed = true
+        defer { model.composerClosed(id) }
         let outcome = await model.outbox.discard(id)
-        if outcome == .discarded, !hasEdits, let origin {
+        // A server draft this composer opened has no row of its own until the first save.
+        if outcome == .discarded, let origin {
             await model.outbox.discardServerDraft(origin.emailID)
         }
-        isClosed = true
-        model.composerClosed(id)
         return outcome
     }
 
@@ -518,7 +531,7 @@ public final class Composer: Identifiable {
 
     @discardableResult
     func saveLocally() async -> Bool {
-        guard let model, hasEdits else { return false }
+        guard let model, hasEdits, !isClosed else { return false }
         let edits = edits
         do {
             guard let revision = try await model.outbox.saveLocally(draft, origin: origin) else { return false }
@@ -607,6 +620,14 @@ public final class Composer: Identifiable {
             messageID = MessageDraft.newMessageID(domain: domain)
         }
         return SenderSettings(replyTo: identity?.replyTo ?? [], bcc: bcc, automaticBcc: added, messageID: messageID)
+    }
+
+    /// The Bcc addresses of a saved draft that its From identity adds by itself: they go with that identity
+    /// when From changes, as in a new composition (D20).
+    private static func identityBcc(in draft: MessageDraft, directory: SenderDirectory) -> [EmailAddress] {
+        guard let from = draft.from?.email, !directory.isMasked(from) else { return [] }
+        let added = directory.identity(for: from)?.bcc ?? []
+        return added.filter { address in draft.bcc.contains { $0.email.lowercased() == address.email.lowercased() } }
     }
 }
 

@@ -45,6 +45,25 @@ struct OutboxRecord: Codable, Sendable, Equatable {
         /// How often the release was checked and found still pending.
         var checks = 0
         var nextCheckAt: Date?
+        /// `false` when the submission's own update of the email failed, so that the email still looks like a
+        /// draft in Drafts whether it goes out or not; `nil` when not known.
+        var movedToSent: Bool?
+    }
+
+    /// The Send a flush pass works on. Cancel and Send don't wait for a pass, which may wait minutes for
+    /// uploads, so the pass leaves the message alone once that Send was cancelled or replaced meanwhile.
+    struct SendVersion: Equatable, Sendable {
+        let revision: Int64
+        let queueID: UUID?
+
+        init(_ row: StoredDraft) {
+            revision = row.revision
+            queueID = row.record.queueID
+        }
+
+        func matches(_ row: StoredDraft, _ record: OutboxRecord) -> Bool {
+            row.revision == revision && record.queueID == queueID
+        }
     }
 
     /// Why a queued message waits.
@@ -87,6 +106,8 @@ struct OutboxRecord: Codable, Sendable, Equatable {
     var saveFailure: String?
     /// When to look again whether a submission whose answer was lost went through.
     var verifyAt: Date?
+    /// Identifies the current Send of the message; each Send and Retry gets a new one (`SendVersion`).
+    var queueID: UUID?
 
     init(createdAt: Date) {
         self.createdAt = createdAt
@@ -145,13 +166,14 @@ struct OutboxRecord: Codable, Sendable, Equatable {
         discardRequested = false
         failure = nil
         verifyAt = nil
+        queueID = nil
     }
 
     // Fields added later decode with their defaults.
     private enum CodingKeys: String, CodingKey {
         case createdAt, serverMessageID, serverSavedAt, ownEmailIDs, pendingDestroy, lastAttempt, submission
         case notBefore, attempts, wait, localDelay, cancelRequested, discardRequested, consentedSendingIdentity
-        case failure, notice, trashOnFirstSave, saveFailure, verifyAt
+        case failure, notice, trashOnFirstSave, saveFailure, verifyAt, queueID
     }
 
     init(from decoder: any Decoder) throws {
@@ -175,6 +197,7 @@ struct OutboxRecord: Codable, Sendable, Equatable {
         trashOnFirstSave = try container.decodeIfPresent(String.self, forKey: .trashOnFirstSave)
         saveFailure = try container.decodeIfPresent(String.self, forKey: .saveFailure)
         verifyAt = try container.decodeIfPresent(Date.self, forKey: .verifyAt)
+        queueID = try container.decodeIfPresent(UUID.self, forKey: .queueID)
     }
 }
 

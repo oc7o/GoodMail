@@ -241,6 +241,26 @@ struct ComposeTests {
         #expect(sent.messageId != first)
     }
 
+    @Test func aRestoredDraftLeavesItsIdentitysBccBehindOnAMask() async throws {
+        await account.start()
+        let archive = EmailAddress(email: "archive@berg.example")
+        let boss = EmailAddress(email: "boss@berg.example")
+        await model.outboxCreatedIdentity(Identity(
+            id: "ident-9", name: "Alex Work", email: "work@berg.example", bcc: [archive], mayDelete: true))
+        let composer = try await model.compose(.new(to: [maya], subject: "Hi", from: EmailAddress(email: "work@berg.example")))
+        composer.bcc.append(boss)
+        #expect(composer.bcc == [archive, boss])
+        await composer.close()
+        await account.settle()
+
+        let restored = try #require(await model.composer(id: composer.id))
+        #expect(restored.bcc == [archive, boss])
+        restored.from = EmailAddress(email: "fjord.k3x9@fastmail.com")
+        #expect(restored.bcc == [boss])
+        restored.from = EmailAddress(name: "Alex Work", email: "work@berg.example")
+        #expect(restored.bcc == [boss, archive])
+    }
+
     @Test func mailtoLinkInTheNewsletterIsAnsweredFromItsMask() async throws {
         await account.start()
         let url = try #require(URL(string: "mailto:unsubscribe@fjord-outdoor.example?subject=unsubscribe%208f2a11&cc=x@y.example"))

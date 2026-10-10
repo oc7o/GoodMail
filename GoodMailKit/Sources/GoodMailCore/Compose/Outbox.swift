@@ -370,7 +370,8 @@ public final class Outbox {
     /// then sorts out conflicts with other devices.
     private func saveToServer(_ id: String, context: SendContext) async {
         serverSaveRequests.remove(id)
-        guard let row = try? await store.draft(id: id) else { return }
+        // A message on its way has no draft to save, and its server copy is the message itself.
+        guard let row = try? await store.draft(id: id), row.state == .editing || row.state == .failed else { return }
         // A copy moved to Trash elsewhere must not be destroyed by replacing it.
         if await checkServerCopy(row, context: context) { return }
         // Sent from another device: nothing is saved under its Message-ID until the user keeps it as new.
@@ -446,8 +447,10 @@ public final class Outbox {
         let waitsLocally = !(host?.account?.holdsOnServer ?? true)
         let consent = consentedSendingIdentity
         let messageID = draft.messageID
+        let queueID = UUID()
         let row = try await store.updateOutbox(id: id) { row, record in
-            guard row.state == .editing || row.state == .failed else { return }
+            // Another device sent it: only Keep as New Message (a new Message-ID) makes it sendable again.
+            guard row.state == .editing || row.state == .failed, record.notice != .sentElsewhere else { return }
             if row.content != content {
                 row.content = content
                 row.revision += 1
@@ -456,6 +459,7 @@ public final class Outbox {
             row.state = .queued
             row.queuedAt = now
             record.resetSending()
+            record.queueID = queueID
             record.consentedSendingIdentity = consent
             record.notice = nil
             if waitsLocally {
@@ -463,6 +467,7 @@ public final class Outbox {
                 record.notBefore = now.addingTimeInterval(Self.undoWindow)
             }
         }
+        if row?.record.notice == .sentElsewhere { throw SendProblem.sentElsewhere }
         await steps.assembly.forget(draft.id)
         await reload()
         if row?.state == .queued { requestFlush() }
@@ -471,26 +476,26 @@ public final class Outbox {
     /// Takes a message out of the outbox (Undo, Cancel), by state (§2.2).
     public func cancel(_ id: UUID) async -> CancelOutcome {
         let key = id.uuidString
-        guard let row = try? await store.draft(id: key) else { return .alreadySent }
-        switch row.state {
-        case .editing:
-            return .backToDrafts
-        case .queued, .failed:
-            let changed = try? await store.updateOutbox(id: key) { row, record in
-                guard row.state == .queued || row.state == .failed else { return }
+        // One transaction decides by the state it finds, so an answer to the submission arriving meanwhile
+        // can't make the cancel miss (§2.2).
+        let row = try? await store.updateOutbox(id: key) { row, record in
+            switch row.state {
+            case .queued, .failed:
                 row.state = .editing
                 row.queuedAt = nil
                 record.resetSending()
+            case .submitting:
+                record.cancelRequested = true
+            case .editing, .held:
+                break
             }
-            await reload()
-            if changed?.state == .editing { return .backToDrafts }
-            // It went out meanwhile.
-            return changed == nil ? .alreadySent : await cancel(id)
+        }
+        guard let row else { return .alreadySent }
+        await reload()
+        switch row.state {
+        case .editing, .queued, .failed:
+            return .backToDrafts
         case .submitting:
-            _ = try? await store.updateOutbox(id: key) { row, record in
-                if row.state == .submitting { record.cancelRequested = true }
-            }
-            await reload()
             requestFlush()
             return .requested
         case .held:
@@ -504,26 +509,26 @@ public final class Outbox {
     public func discard(_ id: UUID) async -> DiscardOutcome {
         let key = id.uuidString
         await steps.assembly.forget(id)
-        guard let row = try? await store.draft(id: key) else { return .discarded }
-        switch row.state {
-        case .editing, .queued, .failed:
-            let claimed = try? await store.updateOutbox(id: key) { row, record in
-                guard row.state == .editing || row.state == .queued || row.state == .failed else { return }
+        // Decided in one transaction, like `cancel(_:)`.
+        let row = try? await store.updateOutbox(id: key) { row, record in
+            switch row.state {
+            case .editing, .queued, .failed:
                 row.state = .editing
                 record.discardRequested = true
+            case .submitting:
+                record.cancelRequested = true
+                record.discardRequested = true
+            case .held:
+                break
             }
-            guard claimed?.record.discardRequested == true, claimed?.state == .editing else {
-                return claimed == nil ? .discarded : await discard(id)
-            }
+        }
+        guard let row else { return .discarded }
+        switch row.state {
+        case .editing, .queued, .failed:
             await discardLocally(key)
             await reload()
             return .discarded
         case .submitting:
-            _ = try? await store.updateOutbox(id: key) { row, record in
-                guard row.state == .submitting else { return }
-                record.cancelRequested = true
-                record.discardRequested = true
-            }
             await reload()
             requestFlush()
             return .requested
@@ -543,19 +548,18 @@ public final class Outbox {
         }
     }
 
-    /// Queues a failed message again.
+    /// Queues a failed message again, as a new Send.
     public func retry(_ id: UUID) {
         let key = id.uuidString
         Task {
             let now = clock.now
+            let queueID = UUID()
             _ = try? await store.updateOutbox(id: key) { row, record in
                 guard row.state == .failed else { return }
                 row.state = .queued
                 row.queuedAt = now
-                record.failure = nil
-                record.notBefore = nil
-                record.attempts = 0
-                record.wait = nil
+                record.resetSending()
+                record.queueID = queueID
             }
             await reload()
             requestFlush()
@@ -643,42 +647,59 @@ public final class Outbox {
     /// The send protocol for a queued message (§2.2): validate, find the sending identity, upload, check that
     /// no other device sent it, then submit.
     private func sendQueued(_ id: String, context: SendContext) async {
-        guard let row = try? await store.draft(id: id), row.state == .queued, var draft = MailSend.draft(from: row) else {
-            return
-        }
+        guard let queued = try? await store.draft(id: id), queued.state == .queued, var draft = MailSend.draft(from: queued)
+        else { return }
+        // Cancel and Send don't wait for this pass: from here on it acts on this Send only.
+        let version = OutboxRecord.SendVersion(queued)
+        if let failure = SendCheck.queuedFailure(for: draft) { return await fail(id, failure, version: version) }
+        guard let identity = await sendingIdentity(
+            id, draft: draft, record: queued.record, context: context, version: version)
+        else { return }
+        guard var blobIDs = await uploadAll(id, draft: draft, version: version) else { return }
+        // Uploads may have taken minutes: the message is looked at again as it is now.
+        guard let row = try? await store.draft(id: id), row.state == .queued, version.matches(row, row.record)
+        else { return }
         var record = row.record
-        if let failure = SendCheck.queuedFailure(for: draft) { return await fail(id, failure) }
-        guard let identity = await sendingIdentity(id, draft: draft, record: record, context: context) else { return }
-        guard var blobIDs = await uploadAll(id, draft: draft) else { return }
 
         let account = host?.account ?? context.account
         if !record.localDelay, account?.holdsOnServer == false {
             // Fastmail can't hold it: the Undo window passes on this device first (D12).
             let until = clock.now.addingTimeInterval(Self.undoWindow)
-            _ = try? await store.updateOutbox(id: id) { _, record in
+            _ = try? await store.updateOutbox(id: id) { row, record in
+                guard row.state == .queued, version.matches(row, record) else { return }
                 record.localDelay = true
                 record.notBefore = until
             }
             return
         }
 
+        let strays: [String]
         do {
-            switch try await steps.preCheck(row, mailboxes: context.mailboxes) {
+            let (verdict, found) = try await steps.preCheck(row, mailboxes: context.mailboxes)
+            strays = found
+            switch verdict {
             case .clear:
                 break
             case .sentElsewhere:
-                // Its draft here is obsolete too; nothing is sent (C29).
-                _ = try? await store.updateOutbox(id: id) { row, record in
-                    record.destroyLater([row.serverEmailID].compactMap { $0 })
+                // Its drafts here are obsolete too, and nothing is sent (C29). Out of the queue first, so that
+                // neither Cancel nor a new Send changes it while it is finalized.
+                let claimed = try? await store.updateOutbox(id: id) { row, record in
+                    guard row.state == .queued, version.matches(row, record) else { return }
+                    record.destroyLater([row.serverEmailID].compactMap { $0 } + strays)
                     row.serverEmailID = nil
+                    row.state = .submitting
                 }
+                guard claimed?.state == .submitting else { return }
                 return await finalize(id, context: context, notice: .sentElsewhere(draft.subject))
             case .otherVersion:
-                draft = await fork(id, draft: draft, droppingServerCopy: false) ?? draft
+                guard let forked = await fork(id, draft: draft, droppingServerCopy: false, version: version) else {
+                    return
+                }
+                draft = forked
                 record = (try? await store.draft(id: id))?.record ?? record
             }
         } catch {
-            return await notSent(id, SendError.jmap(error))
+            return await notSent(id, SendError.jmap(error), version: version)
         }
 
         let holdFor = record.localDelay ? nil : Self.holdSeconds
@@ -686,47 +707,61 @@ public final class Outbox {
             let outcome: MailSend.SubmitOutcome?
             do {
                 outcome = try await steps.submit(
-                    id, draft: draft, identity: identity, blobIDs: blobIDs, holdFor: holdFor, context: context)
+                    id, draft: draft, identity: identity, blobIDs: blobIDs, holdFor: holdFor, context: context,
+                    version: version, strays: strays)
             } catch {
-                return await fail(id, .refused(type: "invalidMessage", description: error.localizedDescription))
+                // After its claim, only the store failed: what became of the request is verified as if its answer
+                // was lost. Before it, the message couldn't be built.
+                if (try? await store.draft(id: id))?.state == .submitting {
+                    let at = clock.now
+                    _ = try? await store.updateOutbox(id: id) { _, record in record.verifyAt = at }
+                    return
+                }
+                return await fail(
+                    id, .refused(type: "invalidMessage", description: error.localizedDescription), version: version)
             }
+            // C23: remembered for the account, whatever becomes of this message.
+            if case .holdRefused? = outcome { await host?.outboxRefusedHold() }
+            // Nothing went out: a Cancel or Delete asked for while it was sending takes effect now.
+            if outcome?.isNotSent == true, await honourRequestedCancel(id) { return }
             switch outcome {
             case nil:
                 return
             case .held(let submission)?:
                 return await submitted(id, submission: submission, context: context)
             case .released?:
-                return await finalize(id, context: context, notice: nil)
+                let canceled = (try? await store.draft(id: id))?.record.cancelRequested == true
+                return await finalize(id, context: context, notice: canceled ? .alreadySent(draft.subject) : nil)
             case .holdRefused(let submittedAt)?:
-                // C23: remembered for the account; this message waits out the rest of its Undo window here.
-                await host?.outboxRefusedHold()
+                // This message waits out the rest of its Undo window here.
                 let until = submittedAt.addingTimeInterval(Self.undoWindow)
-                _ = try? await store.updateOutbox(id: id) { _, record in
+                _ = try? await store.updateOutbox(id: id) { row, record in
+                    guard row.state == .queued, version.matches(row, record) else { return }
                     record.localDelay = true
                     record.notBefore = until
                 }
                 return requestFlush()
             case .failed(let failure)?:
-                return await fail(id, failure)
+                return await fail(id, failure, version: version)
             case .blobsNotFound(let missing)? where attempt == 0:
                 for attachment in draft.attachments {
                     switch attachment.source {
                     case .server(let blobId) where missing.contains(blobId):
-                        return await fail(id, .attachmentUnavailable(attachment.name))
+                        return await fail(id, .attachmentUnavailable(attachment.name), version: version)
                     case .local where blobIDs[attachment.id].map(missing.contains) == true:
                         try? await store.markOutgoingAttachmentExpired(id: attachment.id.uuidString)
                     default:
                         break
                     }
                 }
-                guard let uploaded = await uploadAll(id, draft: draft) else { return }
+                guard let uploaded = await uploadAll(id, draft: draft, version: version) else { return }
                 blobIDs = uploaded
             case .blobsNotFound?:
-                return await fail(id, .refused(type: SetError.blobNotFound, description: nil))
+                return await fail(id, .refused(type: SetError.blobNotFound, description: nil), version: version)
             case .busy?:
-                return await backOff(id, .busy)
+                return await backOff(id, .busy, version: version)
             case .notSent(let error)?:
-                return await notSent(id, error)
+                return await notSent(id, error, version: version)
             case .unknown?:
                 // Verified by the next flush, never by repeating the request (D14).
                 let at = clock.now
@@ -734,6 +769,24 @@ public final class Outbox {
                 return
             }
         }
+    }
+
+    /// A Cancel or Delete asked for while the message was being sent, once it is certain that nothing went out:
+    /// it is a draft again, or deleted (§2.2). Returns whether there was one.
+    private func honourRequestedCancel(_ id: String) async -> Bool {
+        let row = try? await store.updateOutbox(id: id) { row, record in
+            guard row.state == .queued, record.cancelRequested else { return }
+            let discarding = record.discardRequested
+            row.state = .editing
+            row.queuedAt = nil
+            record.resetSending()
+            record.discardRequested = discarding
+        }
+        guard let row, row.state == .editing else { return false }
+        let subject = header(of: row)?.subject ?? ""
+        if row.record.discardRequested { await discardLocally(id) }
+        notices.append(.canceled(subject))
+        return true
     }
 
     /// A submission Fastmail holds: destroy the earlier versions at once (D33), and honour a cancel asked for
@@ -762,10 +815,11 @@ public final class Outbox {
     /// The identity to submit with, creating one for a masked address when that is allowed and the user agreed
     /// for exactly this address (D21). `nil` when the message can't go now; its row says why.
     private func sendingIdentity(
-        _ id: String, draft: MessageDraft, record: OutboxRecord, context: SendContext
+        _ id: String, draft: MessageDraft, record: OutboxRecord, context: SendContext,
+        version: OutboxRecord.SendVersion
     ) async -> Identity? {
         guard let from = draft.from?.email else {
-            await fail(id, .refused(type: "noSender", description: nil))
+            await fail(id, .refused(type: "noSender", description: nil), version: version)
             return nil
         }
         var directory = context.directory
@@ -774,20 +828,20 @@ public final class Outbox {
         }
         guard !directory.identities.isEmpty else {
             // Not known yet, which says nothing about this address: try again later.
-            await backOff(id, host?.isOnline == false ? .connection : .busy)
+            await backOff(id, host?.isOnline == false ? .connection : .busy, version: version)
             return nil
         }
         switch directory.sendingIdentity(for: from, consent: record.consentedSendingIdentity, policy: maskedSending) {
         case .identity(let identity):
             return identity
         case .notAllowed(let address):
-            await fail(id, .senderNotAllowed(address))
+            await fail(id, .senderNotAllowed(address), version: version)
         case .missingForMask(let address):
-            await fail(id, .needsSendingIdentity(address))
+            await fail(id, .needsSendingIdentity(address), version: version)
         case .create(let address):
             // An identity may exist by now: made elsewhere, or by an attempt whose answer was lost.
             guard let reloaded = await host?.outboxReloadIdentities() else {
-                await backOff(id, .connection)
+                await backOff(id, .connection, version: version)
                 return nil
             }
             if let identity = reloaded.identity(for: address) { return identity }
@@ -796,9 +850,9 @@ public final class Outbox {
                 await host?.outboxCreatedIdentity(identity)
                 return identity
             } catch is SetError {
-                await fail(id, .identityRefused(address))
+                await fail(id, .identityRefused(address), version: version)
             } catch {
-                await notSent(id, SendError.jmap(error))
+                await notSent(id, SendError.jmap(error), version: version)
             }
         }
         return nil
@@ -819,19 +873,16 @@ public final class Outbox {
         let subject = MailSend.draft(from: row)?.subject ?? ""
         switch outcome {
         case .notSent:
-            if record.discardRequested {
-                await discardLocally(id)
-                notices.append(.canceled(subject))
-            } else if record.cancelRequested {
+            if await honourRequestedCancel(id) { return }
+            // Sent again at once the first time; after that like to a busy server, so that one that keeps
+            // failing this way isn't asked every few seconds (§3.10).
+            if record.attempts == 0 {
                 _ = try? await store.updateOutbox(id: id) { row, record in
-                    guard row.state == .queued else { return }
-                    row.state = .editing
-                    row.queuedAt = nil
-                    record.resetSending()
+                    if row.state == .queued { record.attempts = 1 }
                 }
-                notices.append(.canceled(subject))
-            } else {
                 requestFlush()
+            } else {
+                await backOff(id, .busy)
             }
         case .held(let submission):
             await submitted(id, submission: submission, context: context)
@@ -949,6 +1000,12 @@ public final class Outbox {
             await moveToTrash(left, context: context)
         }
         if let trashed = row.record.trashOnFirstSave { await moveToTrash([trashed], context: context) }
+        if let submission = row.record.submission, submission.movedToSent == false {
+            // It went out from Drafts still looking like a draft, which would invite sending it again.
+            let patch = PatchObject.move(from: context.mailboxes.drafts, to: context.mailboxes.sent)
+                .merging(.setKeyword(.draft, false))
+            await host?.enqueueTriage([submission.emailID: patch])
+        }
         if let draft, let original = draft.original?.emailID {
             let keyword: Email.Keyword? = switch draft.kind {
             case .reply, .replyAll: .answered
@@ -1004,7 +1061,8 @@ public final class Outbox {
     /// started once the copy existed. Returns whether it dealt with the row.
     private func checkServerCopy(_ row: StoredDraft, context: SendContext) async -> Bool {
         let record = row.record
-        guard let copyID = row.serverEmailID, let savedAt = record.serverSavedAt,
+        guard row.state == .editing || row.state == .failed,
+              let copyID = row.serverEmailID, let savedAt = record.serverSavedAt,
               let synced = host?.lastSyncStartedAt, synced > savedAt
         else { return false }
         if let stored = try? await store.emails(ids: [copyID]).first,
@@ -1081,22 +1139,30 @@ public final class Outbox {
     }
 
     /// Gives the draft a new Message-ID on its From domain, keeping another device's version as it is (D10).
-    /// Returns the draft as forked.
-    private func fork(_ id: String, draft: MessageDraft, droppingServerCopy: Bool) async -> MessageDraft? {
+    /// Returns the draft as forked, or `nil` if it wasn't: with `version`, when the message is no longer queued
+    /// as that Send.
+    private func fork(
+        _ id: String, draft: MessageDraft, droppingServerCopy: Bool, version: OutboxRecord.SendVersion? = nil
+    ) async -> MessageDraft? {
         var draft = draft
         draft.messageID = MessageDraft.newMessageID(domain: draft.from.flatMap { AddressParser.domain(of: $0.email) }
             ?? draft.messageIDDomain ?? "invalid")
         let messageID = draft.messageID
-        let composer = host?.openComposer(draft.id)
+        // A message being sent has no composer; a draft's open composer has the latest content.
+        let composer = version == nil ? host?.openComposer(draft.id) : nil
         composer?.adopt(messageID: messageID)
         guard let content = try? MailSend.encode(composer?.draft ?? draft) else { return nil }
-        _ = try? await store.updateOutbox(id: id) { row, record in
+        let row = try? await store.updateOutbox(id: id) { row, record in
+            if let version {
+                guard row.state == .queued, version.matches(row, record) else { return }
+            }
             row.content = content
             row.messageID = messageID
             row.serverRevision = nil
             if droppingServerCopy { row.serverEmailID = nil }
             record.notice = .otherVersionKept
         }
+        guard row?.messageID == messageID else { return nil }
         composer?.receive(.otherVersionKept)
         return draft
     }
@@ -1113,40 +1179,41 @@ public final class Outbox {
 
     // MARK: Failures and backoff
 
-    private func fail(_ id: String, _ failure: OutboxFailure) async {
+    /// With `version`, only while the message is still that Send. An earlier request whose outcome is still
+    /// unknown, such as a save whose answer was lost, stays recorded: its copy is this draft's own.
+    private func fail(_ id: String, _ failure: OutboxFailure, version: OutboxRecord.SendVersion? = nil) async {
         _ = try? await store.updateOutbox(id: id) { row, record in
-            guard row.state == .queued || row.state == .submitting else { return }
+            guard row.state == .queued || row.state == .submitting, version?.matches(row, record) ?? true else { return }
             row.state = .failed
             record.failure = failure
             record.notBefore = nil
             record.wait = nil
-            record.lastAttempt = nil
         }
     }
 
     /// A request that certainly didn't run (C2): the message keeps waiting, or fails for good.
-    private func notSent(_ id: String, _ error: JMAPError) async {
+    private func notSent(_ id: String, _ error: JMAPError, version: OutboxRecord.SendVersion? = nil) async {
         if SendError.lacksSubmissionScope(error) {
             await host?.outboxLostSubmissionScope()
-            return await fail(id, .tokenLacksSubmission)
+            return await fail(id, .tokenLacksSubmission, version: version)
         }
         switch error {
         case .unauthorized:
             host?.outboxTokenRejected()
         case _ where SendError.isNoConnection(error):
-            await backOff(id, .connection)
+            await backOff(id, .connection, version: version)
         case _ where error.isTemporary:
-            await backOff(id, .busy)
+            await backOff(id, .busy, version: version)
         default:
-            await fail(id, .refused(type: "request", description: error.localizedDescription))
+            await fail(id, .refused(type: "request", description: error.localizedDescription), version: version)
         }
     }
 
     /// The next try after 30 s, doubling up to 5 minutes; a returning network flushes at once anyway.
-    private func backOff(_ id: String, _ wait: OutboxRecord.Wait) async {
+    private func backOff(_ id: String, _ wait: OutboxRecord.Wait, version: OutboxRecord.SendVersion? = nil) async {
         let now = clock.now
         _ = try? await store.updateOutbox(id: id) { row, record in
-            guard row.state == .queued else { return }
+            guard row.state == .queued, version?.matches(row, record) ?? true else { return }
             record.attempts += 1
             record.notBefore = now.addingTimeInterval(min(30 * pow(2, Double(record.attempts - 1)), 300))
             record.wait = wait
@@ -1237,7 +1304,9 @@ public final class Outbox {
 
     /// Uploads everything the message still needs, waiting for uploads that already run. Returns the blob of
     /// every local attachment, or `nil` when the message has to wait (offline, busy) or failed.
-    private func uploadAll(_ id: String, draft: MessageDraft) async -> [UUID: String]? {
+    private func uploadAll(
+        _ id: String, draft: MessageDraft, version: OutboxRecord.SendVersion
+    ) async -> [UUID: String]? {
         startUploads(id)
         await uploadTasks[id]?.value
         let now = clock.now
@@ -1245,7 +1314,7 @@ public final class Outbox {
         var blobIDs: [UUID: String] = [:]
         for attachment in draft.attachments where attachment.source == .local {
             guard let row = stored.first(where: { $0.id == attachment.id.uuidString }) else {
-                await fail(id, .attachmentDataLost(attachment.name))
+                await fail(id, .attachmentDataLost(attachment.name), version: version)
                 return nil
             }
             if let blobID = row.blobID, !Self.needsUpload(row, at: now) || !row.hasBytes {
@@ -1253,13 +1322,13 @@ public final class Outbox {
                 continue
             }
             guard row.hasBytes else {
-                await fail(id, .attachmentDataLost(attachment.name))
+                await fail(id, .attachmentDataLost(attachment.name), version: version)
                 return nil
             }
             if case .failed(let message) = uploadStates[attachment.id] {
-                await fail(id, .refused(type: "upload", description: message))
+                await fail(id, .refused(type: "upload", description: message), version: version)
             } else {
-                await backOff(id, host?.isOnline == false ? .connection : .busy)
+                await backOff(id, host?.isOnline == false ? .connection : .busy, version: version)
             }
             return nil
         }

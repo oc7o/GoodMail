@@ -126,6 +126,23 @@ struct OutboxFailureTests {
         #expect(try await account.row(id)?.state == .held)
     }
 
+    @Test func aSubmissionThatNeverWentOutIsSentAgainAtOnceThenWithBackoff() async throws {
+        await account.start()
+        for _ in 0..<10 { account.transport.failNext("EmailSubmission/set", with: .timedOut) }
+        let start = account.clock.now
+
+        let id = try await send()
+        #expect(try await account.row(id)?.state == .submitting)
+        for _ in 0..<6 { await account.advance(5) }
+
+        // Verified at 5 s and sent again at once; verified at 10 s and left to wait like for a busy server.
+        #expect(account.transport.calls(to: "EmailSubmission/set") == 2)
+        #expect(outbox.items.map(\.state) == [.waiting(.retry(at: start + 70))])
+        await account.advance(40)
+        #expect(account.transport.calls(to: "EmailSubmission/set") == 3)
+        #expect(server.pendingSubmissionIDs.isEmpty && server.sentMessages.isEmpty)
+    }
+
     @Test func serverUnavailableAfterTheEmailWasMadeRetriesLaterAndCleansUp() async throws {
         await account.start()
         server.failNextSubmission(methodError: MethodError.serverUnavailable)
@@ -177,6 +194,45 @@ struct OutboxFailureTests {
         await account.advance(20)
         #expect(server.sentMessages.count == 1)
         #expect(account.transport.calls(to: "EmailSubmission/set") == 2)
+    }
+
+    @Test func aSubmissionThatLeftItsEmailInDraftsCountsAsSentOnceReleased() async throws {
+        await account.start()
+        account.transport.afterNext("EmailSubmission/set", Self.failingImplicitUpdate)
+        let id = try await send()
+        await account.settle()
+        let submission = try #require(try await account.record(id)?.submission)
+        #expect(submission.movedToSent == false)
+        // Where the email is when the submission's update of it failed: a draft in Drafts.
+        let patch = PatchObject.move(from: "sent", to: "drafts").merging(.setKeyword(.draft, true))
+        #expect(try await account.client.updateEmails([submission.emailID: patch]).isEmpty)
+
+        await account.advance(17)
+
+        // Not taken for a cancel on another device, which would offer to send it again.
+        #expect(try await account.row(id) == nil)
+        #expect(outbox.notices.isEmpty)
+        #expect(server.sentMessages.count == 1)
+        let email = try #require(try await account.serverEmail(submission.emailID))
+        #expect(email.mailboxIds == ["sent": true] && !email.has(.draft))
+    }
+
+    /// The answer to a submission whose implicit `Email/set` couldn't update the email.
+    private static let failingImplicitUpdate: @Sendable (JSONValue) -> JSONValue = { answer in
+        guard case .object(var envelope) = answer, case .array(let responses)? = envelope["methodResponses"] else {
+            return answer
+        }
+        envelope["methodResponses"] = .array(responses.map { response in
+            guard case .array(var call) = response, call.count == 3, call[0] == "Email/set",
+                  case .object(var arguments) = call[1], case .object(let updated)? = arguments["updated"],
+                  !updated.isEmpty
+            else { return response }
+            arguments["updated"] = .object([:])
+            arguments["notUpdated"] = .object(updated.mapValues { _ in ["type": "invalidPatch"] })
+            call[1] = .object(arguments)
+            return .array(call)
+        })
+        return .object(envelope)
     }
 
     @Test func tooLargeFailsAndLeavesTheDraftOnTheServer() async throws {
@@ -264,6 +320,183 @@ struct OutboxFailureTests {
         #expect(try await account.row(id)?.state == .editing)
         #expect(outbox.notices == [.canceled("Lunch")])
         #expect(server.pendingSubmissionIDs.isEmpty && server.sentMessages.isEmpty)
+    }
+
+    /// Sends a message to Maya whose submission request waits until released, and cancels or deletes it while
+    /// the request is out.
+    private func sendThenStopWhileSending(discarding: Bool = false) async throws -> UUID {
+        let composer = try await account.composeToMaya()
+        account.transport.hold("EmailSubmission/set")
+        try await composer.send()
+        #expect(await eventually { account.transport.heldRequests == 1 })
+        #expect(try await account.row(composer.id)?.state == .submitting)
+        if discarding {
+            #expect(await outbox.discard(composer.id) == .requested)
+        } else {
+            #expect(await outbox.cancel(composer.id) == .requested)
+        }
+        #expect(outbox.items.map(\.state) == [.cancelling])
+        return composer.id
+    }
+
+    @Test func cancelWhileSendingHoldsWhenFastmailRefusesTheHold() async throws {
+        await account.start()
+        server.rejectsHoldFor = true
+        let id = try await sendThenStopWhileSending()
+
+        account.transport.release("EmailSubmission/set")
+        await account.settle()
+
+        let row = try #require(try await account.row(id))
+        #expect(row.state == .editing && !row.record.cancelRequested)
+        #expect(outbox.notices == [.canceled("Lunch")])
+        #expect(outbox.items.isEmpty && outbox.undoable == nil)
+        #expect(model.account?.serverHoldUnsupported == true)
+        await account.advance(30)
+        #expect(server.sentMessages.isEmpty)
+        // The email of the refused submission is gone; the draft is saved to Drafts again.
+        let draftCopy = try #require(try await account.row(id)?.serverEmailID)
+        #expect(try await account.copies(of: row.messageID) == [draftCopy: ["drafts": true]])
+    }
+
+    @Test func cancelWhileSendingOfAMessageFastmailRefusesMakesItADraftAgain() async throws {
+        await account.start()
+        let id = try await sendThenStopWhileSending()
+        server.failNextSubmission(methodError: "forbidden")
+
+        account.transport.release("EmailSubmission/set")
+        await account.settle()
+
+        let row = try #require(try await account.row(id))
+        #expect(row.state == .editing && row.record.failure == nil && !row.record.cancelRequested)
+        #expect(outbox.notices == [.canceled("Lunch")] && outbox.items.isEmpty)
+        let draftCopy = try #require(row.serverEmailID)
+        #expect(try await account.copies(of: row.messageID) == [draftCopy: ["drafts": true]])
+        #expect(await model.composer(id: id)?.subject == "Lunch")
+    }
+
+    @Test func deleteWhileSendingOfAMessageFastmailRefusesDeletesIt() async throws {
+        await account.start()
+        let id = try await sendThenStopWhileSending(discarding: true)
+        server.rejectNextSubmission(SetError(type: SetError.forbiddenToSend, description: "Daily limit reached"))
+
+        account.transport.release("EmailSubmission/set")
+        await account.settle()
+
+        #expect(try await account.row(id) == nil)
+        #expect(outbox.notices == [.canceled("Lunch")] && outbox.items.isEmpty)
+        await account.advance(30)
+        #expect(server.sentMessages.isEmpty)
+    }
+
+    @Test func aCancelArrivingWithTheSubmissionsAnswerIsNeverLost() async throws {
+        await account.start()
+        let composer = try await account.composeToMaya()
+        account.transport.hold("EmailSubmission/set")
+        try await composer.send()
+        #expect(await eventually { account.transport.heldRequests == 1 })
+
+        // The cancel goes as far as its first look at the store; then the answer is stored off the main actor
+        // while the main actor is kept busy, so that the cancel carries on only after that.
+        let started = CancelStarted()
+        let cancel = Task {
+            started.value = true
+            return await outbox.cancel(composer.id)
+        }
+        while !started.value { await Task.yield() }
+        account.transport.release("EmailSubmission/set")
+        let busyUntil = ContinuousClock.now + .milliseconds(200)
+        while ContinuousClock.now < busyUntil {}
+        let outcome = await cancel.value
+        await account.settle()
+        await account.advance(20)
+
+        #expect(outcome == .requested || outcome == .backToDrafts)
+        #expect(try await account.row(composer.id)?.state == .editing)
+        #expect(server.sentMessages.isEmpty)
+    }
+
+    @Test func retryIsANewSendWithoutTheFlagsOfTheLastOne() async throws {
+        await account.start()
+        server.rejectNextSubmission(SetError(type: SetError.forbiddenToSend, description: "Daily limit reached"))
+        let id = try await send()
+        await account.settle()
+        #expect(try await account.row(id)?.state == .failed)
+        // As left by a cancel asked for during an earlier try.
+        try await account.store.updateOutbox(id: id.uuidString) { _, record in
+            record.cancelRequested = true
+            record.discardRequested = true
+        }
+
+        outbox.retry(id)
+        #expect(try await eventually { try await account.row(id)?.state == .held })
+        await account.settle()
+
+        #expect(try await account.row(id)?.state == .held)
+        #expect(outbox.notices.isEmpty)
+        await account.advance(17)
+        #expect(server.sentMessages.count == 1)
+    }
+
+    // MARK: A Send changed while its pass waits
+
+    @Test func aMessageSentAgainWhileItsUploadRunsGoesOutAsSentAgain() async throws {
+        await account.start()
+        let composer = try await account.composeToMaya()
+        let id = composer.id
+        // Attached offline, so that the upload starts only once the send needs it.
+        await account.setOnline(false)
+        try await composer.addAttachment(Data("Agenda".utf8), name: "Agenda.txt", typeIdentifier: "public.plain-text")
+        await account.setOnline(true)
+        account.transport.hold(OutboxTestTransport.upload)
+        try await composer.send()
+        #expect(await eventually { account.transport.heldRequests == 1 })
+
+        #expect(await outbox.cancel(id) == .backToDrafts)
+        let reopened = try #require(await model.composer(id: id))
+        reopened.to = [EmailAddress(name: "Lena", email: "lena@example.com")]
+        try await reopened.send()
+        account.transport.release(OutboxTestTransport.upload)
+        await account.settle()
+        await account.advance(17)
+
+        let sent = try #require(server.sentMessages.first)
+        let messageID = try #require(sent.messageId)
+        #expect(server.sentMessages.count == 1)
+        #expect(sent.rcptTo == ["lena@example.com"])
+        #expect(try await account.serverEmail(sent.emailId)?.attachments?.map(\.name) == ["Agenda.txt"])
+        #expect(try await account.copies(of: messageID).values.map { $0 } == [["sent": true]])
+        #expect(try await account.row(id) == nil)
+    }
+
+    @Test func aMessageSentAgainWhileItsPreCheckRunsKeepsItsNewContent() async throws {
+        await account.start()
+        let composer = try await account.composeToMaya()
+        await composer.saveNow()
+        await model.refresh()
+        await account.settle()
+        let id = composer.id
+        let messageID = composer.draft.messageID
+        let draftCopy = try #require(try await account.row(id)?.serverEmailID)
+        let theirs = try #require(server.editDraftOnAnotherDevice(emailID: draftCopy))
+        account.transport.hold("Email/query")
+        try await composer.send()
+        #expect(await eventually { account.transport.heldRequests == 1 })
+
+        #expect(await outbox.cancel(id) == .backToDrafts)
+        let reopened = try #require(await model.composer(id: id))
+        reopened.body = AttributedString("Make it one")
+        try await reopened.send()
+        account.transport.release("Email/query")
+        await account.settle()
+        await account.advance(17)
+
+        // Another device's version is kept, and the one sent is the message as sent again.
+        let sent = try #require(server.sentMessages.first)
+        #expect(server.sentMessages.count == 1)
+        #expect(sent.messageId != messageID)
+        #expect(try await account.serverEmail(sent.emailId)?.bodyValues?["text"]?.value.hasPrefix("Make it one") == true)
+        #expect(try await account.serverEmail(theirs)?.mailboxIds == ["drafts": true])
     }
 
     @Test func undoWhoseAnswerIsLostCountsAsOursOnceTheEmailIsBackInDrafts() async throws {
@@ -486,4 +719,10 @@ struct OutboxFailureTests {
         #expect(account.transport.calls(to: "Identity/set") == 1)
         #expect(model.identities.filter { $0.email == fjord }.count == 1)
     }
+}
+
+/// Whether a task on the main actor has begun.
+@MainActor
+private final class CancelStarted {
+    var value = false
 }
