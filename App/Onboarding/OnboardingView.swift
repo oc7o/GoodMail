@@ -7,7 +7,8 @@ struct OnboardingView: View {
     @State private var isSigningIn = false
     @State private var error: String?
 
-    private static let tokenSettingsURL = URL(string: "https://app.fastmail.com/settings/security/tokens")!
+    static let tokenSettingsURL = URL(string: "https://app.fastmail.com/settings/security/tokens")!
+    static let tokenSettingsPath = "Settings → Privacy & Security → Connected apps & API tokens → Manage API tokens"
 
     var body: some View {
         ScrollView {
@@ -38,12 +39,16 @@ struct OnboardingView: View {
     private var steps: some View {
         VStack(alignment: .leading, spacing: 12) {
             Label {
-                Text("Open **Settings → Privacy & Security → API tokens** in Fastmail and create a new token.")
+                Text("Open **\(Self.tokenSettingsPath)** in Fastmail and create a new token.")
             } icon: {
                 Image(systemName: "1.circle.fill")
             }
             Label {
-                Text("Give it the **Email** and **Masked Email** scopes. Read-only access is not enough.")
+                // One literal, so that Text reads it as markdown.
+                Text("""
+                    Give it the **Email**, **Email submission** and **Masked Email** scopes. Read-only access is not \
+                    enough, and without Email submission you can read and write drafts but not send.
+                    """)
             } icon: {
                 Image(systemName: "2.circle.fill")
             }

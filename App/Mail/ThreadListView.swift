@@ -4,8 +4,10 @@ import SwiftUI
 
 struct ThreadListView: View {
     @Bindable var model: MailModel
+    @Environment(\.compose) private var compose
     @State private var isNamingSearch = false
     @State private var searchName = ""
+    @State private var unsubscribing: Email?
 
     var body: some View {
         List(selection: $model.selectedThreadID) {
@@ -24,6 +26,10 @@ struct ThreadListView: View {
                         Divider()
                         if model.canArchive { archiveButton(for: thread) }
                         if model.canTrash { trashButton(for: thread) }
+                        if let list = listMessage(in: thread) {
+                            Divider()
+                            Button("Unsubscribe…", systemImage: "list.bullet.rectangle") { unsubscribing = list }
+                        }
                     }
                     .onAppear {
                         if thread.id == model.threads.last?.id {
@@ -67,6 +73,10 @@ struct ThreadListView: View {
             }
         }
         .toolbar {
+            ToolbarItem(placement: Self.composePlacement) {
+                Button("New Message", systemImage: "square.and.pencil") { compose(.new()) }
+                    .help("New Message (⌘N)")
+            }
             ToolbarItem {
                 Button("Save Search", systemImage: "bookmark") {
                     searchName = model.searchToSave?.name ?? ""
@@ -83,24 +93,27 @@ struct ThreadListView: View {
             }
             #if os(macOS)
             ToolbarItem {
-                Button("Refresh", systemImage: "arrow.clockwise") {
+                // ⌘R is Reply now; Get New Mail is ⇧⌘N in the Mailbox menu (D30).
+                Button("Get New Mail", systemImage: "arrow.clockwise") {
                     Task { await model.refresh() }
                 }
-                .keyboardShortcut("r")
+                .help("Get New Mail (⇧⌘N)")
             }
             #endif
         }
         .safeAreaBar(edge: .bottom) {
-            if let problem = model.connectionProblem {
-                Label(offlineNotice, systemImage: "wifi.slash")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 8)
-                    .glassEffect()
-                    .padding(.bottom, 8)
-                    .help(problem)
+            let counts = OutboxCounts(model.outbox)
+            let isOffline = !model.isOnline || model.connectionProblem != nil
+            // Online, a triage change waits only for the moment it takes to send it.
+            OutboxPill(waiting: counts.waiting, failed: counts.failed,
+                       pendingChanges: isOffline ? model.pendingChangeCount : 0, isOffline: isOffline) {
+                model.destination = .outbox
             }
+            .padding(.bottom, 8)
+            .help(model.connectionProblem ?? "Show the Outbox")
+        }
+        .sheet(item: $unsubscribing) { email in
+            UnsubscribeSheet(email: email)
         }
         .alert("Save Search", isPresented: $isNamingSearch) {
             TextField("Name", text: $searchName)
@@ -125,11 +138,19 @@ struct ThreadListView: View {
         ]
     }
 
-    private var offlineNotice: String {
-        switch model.pendingChangeCount {
-        case 0: "Offline. Showing saved mail."
-        case 1: "Offline. 1 change waiting to sync."
-        case let count: "Offline. \(count) changes waiting to sync."
+    private static var composePlacement: ToolbarItemPlacement {
+        #if os(iOS)
+        .bottomBar
+        #else
+        .primaryAction
+        #endif
+    }
+
+    /// The newest message of a mailing list in the conversation, if its stored copy tells (§5.7).
+    private func listMessage(in thread: ThreadSummary) -> Email? {
+        let junk = model.mailbox(.junk)?.id
+        return thread.emails.last { email in
+            email.offersUnsubscribe && !(junk.map { email.mailboxIds?[$0] == true } ?? false)
         }
     }
 

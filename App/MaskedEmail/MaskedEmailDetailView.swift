@@ -6,6 +6,8 @@ struct MaskedEmailDetailView: View {
     let model: MailModel
     let masked: MaskedEmail
 
+    @Environment(\.compose) private var compose
+
     @State private var description = ""
     @State private var didCopy = false
 
@@ -49,6 +51,11 @@ struct MaskedEmailDetailView: View {
             Section {
                 Button("Show Mail to This Address", systemImage: "magnifyingglass") {
                     model.showMail(to: masked.email)
+                }
+                if masked.state != .deleted {
+                    Button("New Message from This Address", systemImage: "square.and.pencil") {
+                        compose(.new(from: EmailAddress(email: masked.email)))
+                    }
                 }
                 if masked.state == .enabled || masked.state == .pending {
                     Button("Disable Address", systemImage: "pause.circle") { setState(.disabled) }

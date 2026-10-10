@@ -4,6 +4,7 @@ import SwiftUI
 
 struct MaskedEmailListView: View {
     @Bindable var model: MailModel
+    @Environment(MailAccount.self) private var account
 
     enum StateFilter: String, CaseIterable, Identifiable {
         case active = "Active"
@@ -25,7 +26,6 @@ struct MaskedEmailListView: View {
 
     @State private var search = ""
     @State private var filter = StateFilter.active
-    @State private var isCreating = false
 
     var body: some View {
         List(selection: $model.selectedMaskedEmailID) {
@@ -62,12 +62,10 @@ struct MaskedEmailListView: View {
                 .pickerStyle(.menu)
             }
             ToolbarItem(placement: .primaryAction) {
-                Button("New Masked Email", systemImage: "plus") { isCreating = true }
-                    .keyboardShortcut("n")
+                // ⌘N is New Message now; New Masked Email is ⌃⌘N in the File menu (D30).
+                Button("New Masked Email", systemImage: "plus") { account.isCreatingMaskedEmail = true }
+                    .help("New Masked Email (⌃⌘N)")
             }
-        }
-        .sheet(isPresented: $isCreating) {
-            MaskedEmailEditor(model: model)
         }
         .refreshable { await model.loadMaskedEmails() }
         .task { await model.loadMaskedEmails() }
