@@ -139,6 +139,38 @@ struct RecipientDirectoryTests {
         #expect(await suggest("marta") == ["marta@news.example"])
     }
 
+    @Test func sendersYouOnlyHeardFromDontCrowdOutPeopleYouWroteTo() async throws {
+        // In the store's own order, sixty senders heard from today outweigh one person written to a year ago.
+        var emails = (0..<60).map { index in
+            Self.email(in: "inbox", from: "Jobs Digest \(index) <jobs\(index)@news.example>", to: [Self.me], daysAgo: 0)
+        }
+        emails.append(Self.email(
+            in: "sent", from: "Alex Berg <\(Self.me)>", to: ["Johanna Old <johanna@friend.example>"], daysAgo: 365))
+        try await store.upsert(emails)
+
+        #expect(await suggest("jo") == ["jo@park.example", "johanna@friend.example"])
+    }
+
+    @Test func anAddressInContactsCountsWhateverNameItsMailCarries() async throws {
+        // Only the name on the mail matches, not the card. Bob: name 60 + one received 2 + contact 15. Bobby Brown:
+        // name 60 + one sent 90 days ago 10.
+        contacts.contactEntries.append(
+            ContactEntry(name: "Robert Smith", organization: "Smith & Sons", emails: ["Bob@x.example"]))
+        try await store.upsert([
+            Self.email(in: "inbox", from: "Bobby <bob@x.example>", to: [Self.me], daysAgo: 0),
+            Self.email(in: "sent", from: "Alex Berg <\(Self.me)>", to: ["Bobby Brown <bb@brown.example>"], daysAgo: 90),
+        ])
+
+        let suggestions = await directory().suggestions(for: "bobby", excluding: [], isOwn: { _ in false })
+
+        #expect(suggestions.map(\.address) == [
+            EmailAddress(name: "Robert Smith", email: "Bob@x.example"),
+            EmailAddress(name: "Bobby Brown", email: "bb@brown.example"),
+        ])
+        #expect(suggestions.map(\.source) == [.both, .correspondent])
+        #expect(suggestions.map(\.detail) == ["Smith & Sons", nil])
+    }
+
     @Test func atMostTheLimit() async throws {
         let suggestions = await directory().suggestions(for: "m", excluding: [], isOwn: { _ in false }, limit: 2)
 

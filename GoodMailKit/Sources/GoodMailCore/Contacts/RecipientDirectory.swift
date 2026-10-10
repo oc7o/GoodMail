@@ -24,8 +24,8 @@ public final class RecipientDirectory {
     public private(set) var contactsAccess: Access
     private let store: MailStore
     private let contacts: any ContactsSource
-    /// Every address of the address book, read on first use and again after each change.
-    @ObservationIgnored private var people: [Person]?
+    /// The address book, read on first use and again after each change.
+    @ObservationIgnored private var book: AddressBook?
     /// Counts address-book changes, so that a read that started before the last one is read again.
     @ObservationIgnored private var changeCount = 0
     @ObservationIgnored private var loading: Task<Void, Never>?
@@ -59,42 +59,39 @@ public final class RecipientDirectory {
     ) async -> [AddressSuggestion] {
         let query = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !query.isEmpty, limit > 0 else { return [] }
-        let people = await addressBook()
-        let correspondents = (try? await store.correspondents(matching: query, limit: 50)) ?? []
+        let book = await addressBook()
+        // Every match: the store orders them by weights of its own, so a list cut short there could end before
+        // the people who rank first here, behind senders who are left out below.
+        let correspondents = (try? await store.correspondents(matching: query, limit: .max)) ?? []
         let search = Search(query)
 
         var candidates: [String: Candidate] = [:]
-        for person in people {
+        for person in book.people {
             guard let quality = search.quality(of: person.searchable) else { continue }
             if let known = candidates[person.address], known.quality >= quality { continue }
-            candidates[person.address] = Candidate(
-                address: EmailAddress(name: person.name.isEmpty ? nil : person.name, email: person.email),
-                detail: person.organization, quality: quality, isInContacts: true)
+            candidates[person.address] = Candidate(person, quality: quality)
         }
         for correspondent in correspondents {
+            let contact = book.byAddress[correspondent.address]
+            // Someone you only heard from needs to be in Contacts, whichever name their mail carries.
+            guard correspondent.lastSent != nil || contact != nil else { continue }
             let searchable = Searchable(address: correspondent.address, name: correspondent.name)
             let quality = search.quality(of: searchable) ?? Search.anywhere
-            if var known = candidates[correspondent.address] {
-                known.quality = max(known.quality, quality)
-                known.correspondent = correspondent
-                candidates[correspondent.address] = known
-            } else {
-                candidates[correspondent.address] = Candidate(
-                    address: EmailAddress(name: correspondent.name, email: correspondent.address), detail: nil,
-                    quality: quality, isInContacts: false, correspondent: correspondent)
-            }
+            var candidate = candidates[correspondent.address]
+                ?? contact.map { Candidate($0, quality: quality) }
+                ?? Candidate(correspondent, quality: quality)
+            candidate.quality = max(candidate.quality, quality)
+            candidate.correspondent = correspondent
+            candidates[correspondent.address] = candidate
         }
 
         let excluded = Set(excluding.map { $0.lowercased() })
         return candidates.values
-            .filter { candidate in
-                let address = candidate.key
-                return !excluded.contains(address) && !isOwn(address)
-                    && (candidate.isInContacts || candidate.correspondent?.lastSent != nil)
-            }
-            .sorted { $0.ranksAbove($1) }
+            .filter { !excluded.contains($0.key) && !isOwn($0.key) }
+            .map { (candidate: $0, rank: $0.rank) }
+            .sorted { $0.rank.isAbove($1.rank) }
             .prefix(limit)
-            .map(\.suggestion)
+            .map(\.candidate.suggestion)
     }
 
     // MARK: Address book
@@ -105,16 +102,16 @@ public final class RecipientDirectory {
 
     /// The address book as last read; read now if it never was. Empty without access, which the user can
     /// change in Settings at any time.
-    private func addressBook() async -> [Person] {
+    private func addressBook() async -> AddressBook {
         let access = contacts.access()
         if access != contactsAccess {
             contactsAccess = access
             changeCount += 1
-            people = nil
+            book = nil
         }
-        guard hasAccess else { return [] }
-        if people == nil || loading != nil { await loadContacts() }
-        return people ?? []
+        guard hasAccess else { return AddressBook() }
+        if book == nil || loading != nil { await loadContacts() }
+        return book ?? AddressBook()
     }
 
     /// Reads the address book until no change came in during the read, and watches it from then on.
@@ -124,8 +121,7 @@ public final class RecipientDirectory {
             var changes: Int
             repeat {
                 changes = changeCount
-                let entries = hasAccess ? ((try? await contacts.entries()) ?? []) : []
-                people = entries.flatMap(Person.all)
+                book = AddressBook(hasAccess ? ((try? await contacts.entries()) ?? []) : [])
             } while changes != changeCount
         }
         loading = task
@@ -160,6 +156,21 @@ extension RecipientDirectory {
         var isInContacts: Bool
         var correspondent: Correspondent?
 
+        /// Someone in Contacts goes by the card's name, whichever name matched.
+        init(_ person: Person, quality: Int) {
+            address = EmailAddress(name: person.name.isEmpty ? nil : person.name, email: person.email)
+            detail = person.organization
+            self.quality = quality
+            isInContacts = true
+        }
+
+        init(_ correspondent: Correspondent, quality: Int) {
+            address = EmailAddress(name: correspondent.name, email: correspondent.address)
+            self.quality = quality
+            isInContacts = false
+            self.correspondent = correspondent
+        }
+
         var key: String { address.email.lowercased() }
 
         var score: Double {
@@ -176,11 +187,20 @@ extension RecipientDirectory {
             [correspondent?.lastSent, correspondent?.lastReceived].compactMap { $0 }.max() ?? .distantPast
         }
 
-        func ranksAbove(_ other: Candidate) -> Bool {
-            let (score, otherScore) = (self.score, other.score)
-            if score != otherScore { return score > otherScore }
-            if lastContact != other.lastContact { return lastContact > other.lastContact }
-            return key < other.key
+        /// What the order goes by, worked out once for each candidate rather than at every comparison.
+        var rank: Rank { Rank(score: score, lastContact: lastContact, key: key) }
+
+        struct Rank {
+            let score: Double
+            let lastContact: Date
+            let key: String
+
+            /// The higher score first; ties go to the most recent, then by address.
+            func isAbove(_ other: Rank) -> Bool {
+                if score != other.score { return score > other.score }
+                if lastContact != other.lastContact { return lastContact > other.lastContact }
+                return key < other.key
+            }
         }
 
         var suggestion: AddressSuggestion {
@@ -197,6 +217,20 @@ extension RecipientDirectory {
             let local = address.split(separator: "@").first.map { $0.filter { $0.isLetter || $0.isNumber } } ?? ""
             return local.hasPrefix("noreply") || local.hasPrefix("donotreply")
                 || ["mailerdaemon", "bounce", "bounces"].contains(local)
+        }
+    }
+
+    /// Every address of every card, also by lower-cased address, which is what tells whether someone is in
+    /// Contacts.
+    private struct AddressBook {
+        var people: [Person] = []
+        var byAddress: [String: Person] = [:]
+
+        init() {}
+
+        init(_ entries: [ContactEntry]) {
+            people = entries.flatMap(Person.all)
+            byAddress = Dictionary(people.map { ($0.address, $0) }, uniquingKeysWith: { first, _ in first })
         }
     }
 
