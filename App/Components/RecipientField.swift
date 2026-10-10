@@ -20,8 +20,8 @@ struct ContactsPrompt {
 
 /// A To, Cc or Bcc field: flowing address tokens followed by the text being typed.
 ///
-/// - Comma, semicolon or Return turn the text into tokens; a paste such as "A <a@x>, b@y" is split by
-///   `AddressParser`, and an incomplete last item stays as text.
+/// - Comma, semicolon or Return turn the text into tokens (a comma in a quoted name doesn't); a paste such as
+///   "A <a@x>, b@y" is split by `AddressParser`, and an incomplete last item stays as text.
 /// - Backspace in the empty field selects the last token, a second Backspace removes it.
 /// - Tokens are content, not glass: invalid addresses are red, masked addresses carry a `theatermasks` glyph, and
 ///   each has Copy Address, Edit and Remove (plus Add to Contacts when the app offers it) in its context menu.
@@ -29,28 +29,36 @@ struct ContactsPrompt {
 /// - Suggestions come from `suggestions` as the user types: in the system completion list on the Mac, in a list
 ///   under the field on iOS. While Contacts access is undecided, the last row offers it; with limited access on
 ///   iOS it is the system's `ContactAccessButton`.
+///
+/// Typed text becomes tokens only on a separator, on Return or when the field loses focus, and SwiftUI reports the
+/// lost focus only after the action that took it; a Send button or ⇧⌘D takes none at all. A composer therefore
+/// passes `entry` and, before it sends or closes, commits what is still typed with `committing(_:to:)`, or the
+/// address typed last is left out.
 struct RecipientField: View {
     private let label: LocalizedStringKey
     @Binding private var recipients: [EmailAddress]
+    private let sharedEntry: Binding<String>?
     private let suggestions: (String) async -> [AddressSuggestion]
     private let contactsPrompt: ContactsPrompt?
     private let isMasked: (String) -> Bool
     private let addToContacts: ((EmailAddress) -> Void)?
 
-    @State private var entry = ""
+    @State private var ownEntry = ""
     @State private var suggested: [AddressSuggestion] = []
     @State private var selectedToken: Int?
     @State private var wantsFocus = false
     @State private var isRequestingContacts = false
     @FocusState private var isFocused: Bool
 
+    /// - Parameter entry: the text typed and not yet a token; the field keeps it to itself when it's nil.
     init(
-        _ label: LocalizedStringKey, recipients: Binding<[EmailAddress]>,
+        _ label: LocalizedStringKey, recipients: Binding<[EmailAddress]>, entry: Binding<String>? = nil,
         suggestions: @escaping (String) async -> [AddressSuggestion], contactsPrompt: ContactsPrompt?,
         isMasked: @escaping (String) -> Bool, addToContacts: ((EmailAddress) -> Void)? = nil
     ) {
         self.label = label
         _recipients = recipients
+        sharedEntry = entry
         self.suggestions = suggestions
         self.contactsPrompt = contactsPrompt
         self.isMasked = isMasked
@@ -140,8 +148,17 @@ struct RecipientField: View {
 
     // MARK: Typing
 
+    private var entryBinding: Binding<String> {
+        sharedEntry ?? $ownEntry
+    }
+
+    private var entry: String {
+        get { entryBinding.wrappedValue }
+        nonmutating set { entryBinding.wrappedValue = newValue }
+    }
+
     private var field: some View {
-        TextField(text: $entry, prompt: Text(verbatim: "")) {
+        TextField(text: entryBinding, prompt: Text(verbatim: "")) {
             Text(label)
         }
         .textFieldStyle(.plain)
@@ -184,9 +201,33 @@ struct RecipientField: View {
         character == "," || character == ";" || character.isNewline
     }
 
+    /// Whether `text` holds a comma, semicolon or line break outside quotes and angle brackets, read the way
+    /// `AddressParser` reads it: the comma in `"Berg, Alex" <alex@berg.example>` ends nothing.
+    static func endsAnAddress(_ text: String) -> Bool {
+        var inQuotes = false
+        var inBrackets = false
+        var escaped = false
+        for character in text {
+            if escaped {
+                escaped = false
+            } else if character == "\\" && inQuotes {
+                escaped = true
+            } else if character == "\"" && !inBrackets {
+                inQuotes.toggle()
+            } else if !inQuotes && character == "<" {
+                inBrackets = true
+            } else if !inQuotes && character == ">" {
+                inBrackets = false
+            } else if !inQuotes && !inBrackets && isSeparator(character) {
+                return true
+            }
+        }
+        return false
+    }
+
     private func entryChanged(_ value: String) {
         selectedToken = nil
-        guard value.contains(where: Self.isSeparator) else { return }
+        guard Self.endsAnAddress(value) else { return }
         let (addresses, remainder) = AddressParser.parse(value)
         add(addresses)
         if entry != remainder { entry = remainder }
@@ -194,10 +235,21 @@ struct RecipientField: View {
 
     /// Return, or leaving the field: whatever was typed becomes a token, red if it isn't a valid address.
     private func commitEntry() {
-        guard !entry.trimmingCharacters(in: .whitespaces).isEmpty else { return }
-        let (addresses, remainder) = AddressParser.parse(entry + ",")
-        add(addresses)
-        entry = remainder
+        guard !entry.allSatisfy(\.isWhitespace) else { return }
+        recipients = Self.committing(entry, to: recipients)
+        entry = ""
+    }
+
+    /// `recipients` with `entry` committed as Return commits it: every item becomes an address, red when it isn't
+    /// valid, so a send stops at it instead of leaving it out; addresses already there aren't added again.
+    static func committing(_ entry: String, to recipients: [EmailAddress]) -> [EmailAddress] {
+        guard !entry.allSatisfy(\.isWhitespace) else { return recipients }
+        // The comma ends the last item, unless a quote or bracket is still open; then that item stays whole.
+        var (addresses, unfinished) = AddressParser.parse(entry + ",")
+        if !unfinished.isEmpty {
+            addresses.append(EmailAddress(name: nil, email: String(unfinished.dropLast())))
+        }
+        return adding(addresses, to: recipients)
     }
 
     /// Whether Backspace was used here: the first selects the last token, the next removes the selected one.
@@ -212,10 +264,16 @@ struct RecipientField: View {
     }
 
     private func add(_ addresses: [EmailAddress]) {
+        recipients = Self.adding(addresses, to: recipients)
+    }
+
+    private static func adding(_ addresses: [EmailAddress], to recipients: [EmailAddress]) -> [EmailAddress] {
+        var result = recipients
         var known = Set(recipients.map { $0.email.lowercased() })
         for address in addresses where known.insert(address.email.lowercased()).inserted {
-            recipients.append(address)
+            result.append(address)
         }
+        return result
     }
 
     private func remove(at index: Int) {

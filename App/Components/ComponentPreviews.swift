@@ -143,9 +143,10 @@ enum ComponentSamples {
 
 #Preview("Recipients") {
     @Previewable @State var to = ComponentSamples.recipients
+    @Previewable @State var toEntry = ""
     @Previewable @State var cc: [EmailAddress] = []
     VStack(alignment: .leading, spacing: 12) {
-        RecipientField("To:", recipients: $to, suggestions: { ComponentSamples.suggestions(for: $0) },
+        RecipientField("To:", recipients: $to, entry: $toEntry, suggestions: { ComponentSamples.suggestions(for: $0) },
                        contactsPrompt: ContactsPrompt(access: .notDetermined, request: {}),
                        isMasked: { ComponentSamples.maskedAddresses.contains($0) })
         Divider()
