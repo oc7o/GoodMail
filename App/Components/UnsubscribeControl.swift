@@ -11,10 +11,16 @@ import SwiftUI
 /// a sending identity, the dialog either asks for consent to create one (`mailtoNeedsIdentityConsent`) or, when
 /// GoodMail may not create identities (`mailtoSenderMissing`), explains how to add it in Fastmail and offers the
 /// other ways. After an attempt, the dialog also lists the list's other ways, in case the first didn't work.
+///
+/// With `mailtoNeedsIdentityConsent`, every button that performs `.mailto` sits in a dialog that explains the
+/// identity and is named for creating it, so the app may take a performed `.mailto` as the consent (C24, C25).
+/// The row says the masked address is disabled only while `isMaskDisabled` says so: `disableMask` reports its own
+/// errors and doesn't say whether it worked.
 struct UnsubscribeControl: View {
     private let listName: String
     private let methods: [ListUnsubscribe.Method]
     private let maskedAddress: String?
+    private let isMaskDisabled: Bool
     private let previousDate: Date?
     private let mailtoNeedsIdentityConsent: Bool
     private let mailtoSenderMissing: Bool
@@ -27,14 +33,16 @@ struct UnsubscribeControl: View {
     @State private var status: String?
     @State private var page: UnsubscribePage?
 
+    /// - Parameter isMaskDisabled: whether `maskedAddress` is disabled now, as the app's own record of it says.
     init(
-        listName: String, methods: [ListUnsubscribe.Method], maskedAddress: String?, previousDate: Date?,
-        mailtoNeedsIdentityConsent: Bool, mailtoSenderMissing: Bool = false,
+        listName: String, methods: [ListUnsubscribe.Method], maskedAddress: String?, isMaskDisabled: Bool = false,
+        previousDate: Date?, mailtoNeedsIdentityConsent: Bool, mailtoSenderMissing: Bool = false,
         perform: @escaping (ListUnsubscribe.Method) async -> String?, disableMask: (() async -> Void)?
     ) {
         self.listName = listName
         self.methods = methods
         self.maskedAddress = maskedAddress
+        self.isMaskDisabled = isMaskDisabled
         self.previousDate = previousDate
         self.mailtoNeedsIdentityConsent = mailtoNeedsIdentityConsent
         self.mailtoSenderMissing = mailtoSenderMissing
@@ -93,26 +101,34 @@ struct UnsubscribeControl: View {
                 Button(title(for: method, isPrimary: false)) { run(method) }
             }
         }
-        if let maskedAddress, disableMask != nil {
-            Button("Disable Masked Address Instead") { disable(maskedAddress) }
+        if canDisableMask {
+            Button("Disable Masked Address Instead") { disable() }
         }
         Button("Cancel", role: .cancel) {}
     }
 
     private var dialogMessage: String {
-        let address = maskedAddress ?? "your address"
         guard let primary else {
             return mailtoSenderMissingText
         }
-        switch primary {
+        var text = description(of: primary)
+        if mailtoNeedsIdentityConsent, hasAttempted, alternatives.contains(where: Self.isMailto) {
+            text += "\n\nTo unsubscribe by email instead, Fastmail needs a sending identity for "
+                + "\(maskedAddress ?? "this address"). " + Self.identityCreationText
+        }
+        return text
+    }
+
+    private func description(of method: ListUnsubscribe.Method) -> String {
+        let address = maskedAddress ?? "your address"
+        switch method {
         case .oneClick(let url):
             return "GoodMail will ask \(url.host() ?? "the list") to remove \(address). The request comes straight "
                 + "from this device, so the list can see your IP address. No browser or cookies are involved."
         case .mailto(let link):
-            if mailtoNeedsIdentityConsent, let maskedAddress {
-                return "Fastmail needs a sending identity for \(maskedAddress) to send the unsubscribe email. "
-                    + "GoodMail can create it; it then appears in Fastmail under Settings → My email addresses, "
-                    + "where you can delete it."
+            if mailtoNeedsIdentityConsent {
+                return "Fastmail needs a sending identity for \(maskedAddress ?? "this address") to send the "
+                    + "unsubscribe email. " + Self.identityCreationText
             }
             var text = "GoodMail will email \(link.to.joined(separator: ", ")) from \(address)"
             if let subject = link.subject, !subject.isEmpty { text += " with the subject “\(subject)”" }
@@ -127,6 +143,13 @@ struct UnsubscribeControl: View {
         }
     }
 
+    private static let identityCreationText = "GoodMail can create it; it then appears in Fastmail under "
+        + "Settings → My email addresses, where you can delete it."
+
+    private static func isMailto(_ method: ListUnsubscribe.Method) -> Bool {
+        if case .mailto = method { true } else { false }
+    }
+
     private var mailtoSenderMissingText: String {
         let address = maskedAddress ?? "this address"
         return "Fastmail only lets apps send from a masked address that is a sending address. To unsubscribe by "
@@ -136,9 +159,13 @@ struct UnsubscribeControl: View {
     private func title(for method: ListUnsubscribe.Method, isPrimary: Bool) -> String {
         switch method {
         case .oneClick: isPrimary ? "Unsubscribe" : "Ask the List Again"
-        case .mailto: isPrimary
-            ? (mailtoNeedsIdentityConsent ? "Create and Send" : "Send Unsubscribe Email")
-            : "Send Unsubscribe Email Instead"
+        case .mailto:
+            switch (isPrimary, mailtoNeedsIdentityConsent) {
+            case (true, true): "Create and Send"
+            case (true, false): "Send Unsubscribe Email"
+            case (false, true): "Create Identity and Send Email Instead"
+            case (false, false): "Send Unsubscribe Email Instead"
+            }
         case .web: isPrimary ? "Open Unsubscribe Page" : "Open Unsubscribe Page Instead"
         }
     }
@@ -161,12 +188,17 @@ struct UnsubscribeControl: View {
         }
     }
 
+    private var canDisableMask: Bool {
+        maskedAddress != nil && disableMask != nil && !isMaskDisabled
+    }
+
     private var canOfferSomething: Bool {
-        primary != nil || (maskedAddress != nil && disableMask != nil)
+        primary != nil || canDisableMask
     }
 
     private var statusLine: String? {
         if let status { return status }
+        if isMaskDisabled, let maskedAddress { return "\(maskedAddress) is disabled; its mail now goes to Trash." }
         return previousDate.map { "Unsubscribe requested on \($0.formatted(.dateTime.day().month(.abbreviated)))" }
     }
 
@@ -181,13 +213,14 @@ struct UnsubscribeControl: View {
         }
     }
 
-    private func disable(_ address: String) {
+    /// Whether that worked shows in `isMaskDisabled`, so an earlier status line makes room for it.
+    private func disable() {
         guard let disableMask else { return }
         isWorking = true
         Task {
             await disableMask()
             isWorking = false
-            status = "\(address) is disabled; its mail now goes to Trash."
+            status = nil
         }
     }
 }

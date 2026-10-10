@@ -210,6 +210,9 @@ enum ComponentSamples {
         UnsubscribeControl(listName: "Weekly Digest", methods: ComponentSamples.webMethods, maskedAddress: nil,
                            previousDate: Date(timeIntervalSince1970: 1_791_500_000), mailtoNeedsIdentityConsent: false,
                            perform: { _ in nil }, disableMask: nil)
+        UnsubscribeControl(listName: "Fjord Outdoor", methods: ComponentSamples.oneClickMethods,
+                           maskedAddress: "fjord.k3x9@fastmail.example", isMaskDisabled: true, previousDate: nil,
+                           mailtoNeedsIdentityConsent: false, perform: { _ in nil }, disableMask: {})
     }
     .padding()
     .frame(width: 560)
