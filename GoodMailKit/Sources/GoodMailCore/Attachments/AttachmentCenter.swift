@@ -45,6 +45,8 @@ public final class AttachmentCenter {
     private let client: JMAPClient
     private let store: MailStore
     private let files: TemporaryFiles
+    /// Writes a cached attachment into a file being made. Tests swap it for one that breaks off halfway.
+    @ObservationIgnored var exportCached: @Sendable (_ blobId: String, _ into: FileHandle) async throws -> Void
 
     /// Bytes between two progress reports, so that a large download doesn't update the UI for every chunk.
     nonisolated private static let progressStep = 256 << 10
@@ -53,6 +55,7 @@ public final class AttachmentCenter {
         self.client = client
         self.store = store
         self.files = files
+        exportCached = { blobId, handle in try await store.exportAttachment(blobId: blobId, into: handle) }
     }
 
     public func progress(blobId: String) -> Progress? {
@@ -69,11 +72,9 @@ public final class AttachmentCenter {
     /// once the preview closes.
     public func previewURL(for part: EmailBodyPart) async throws -> URL {
         let name = SafeFilename.make(part.name, mimeType: part.type)
-        let store = store, files = files
+        let files = files, export = exportCached
         return try await fromCache(part) { blobId in
-            try await files.copy(named: name) { handle in
-                try await store.exportAttachment(blobId: blobId, into: handle)
-            }
+            try await files.copy(named: name) { handle in try await export(blobId, handle) }
         }
     }
 
@@ -94,24 +95,19 @@ public final class AttachmentCenter {
 
     /// Saves the attachment at `destination`, such as a save panel's choice, replacing what is there.
     ///
-    /// The attachment goes into a `TemporaryFiles` copy first, which then takes the destination's place in one
-    /// step, so a failure halfway leaves a file already at `destination` as it was.
+    /// The attachment goes into a `TemporaryFiles` copy on the destination's volume first, which then takes the
+    /// destination's place in one step, so a failure halfway leaves a file already at `destination` as it was. On
+    /// macOS the saved file is quarantined, like the copy.
     public func write(_ part: EmailBodyPart, to destination: URL) async throws {
-        let store = store, files = files
-        let copy = try await fromCache(part) { blobId in
-            try await files.copy(named: destination.lastPathComponent) { handle in
-                try await store.exportAttachment(blobId: blobId, into: handle)
-            }
-        }
         let isScoped = destination.startAccessingSecurityScopedResource()
         defer { if isScoped { destination.stopAccessingSecurityScopedResource() } }
-        do {
-            try await Self.replace(destination, with: copy)
-        } catch {
-            await files.discard(copy)
-            throw error
+        let files = files, export = exportCached
+        let copy = try await fromCache(part) { blobId in
+            try await files.copy(named: destination.lastPathComponent, toReplace: destination) { handle in
+                try await export(blobId, handle)
+            }
         }
-        await files.discard(copy)
+        try await files.replace(destination, with: copy)
     }
 
     /// Stops a download. Nothing of it stays in the cache, and whoever waits for it gets an error.
@@ -205,34 +201,6 @@ public final class AttachmentCenter {
         }
         await progress(received)
         return received
-    }
-
-    // MARK: Saving
-
-    /// Puts `copy` in the place of `destination`: whatever is there stays whole until it is swapped out. That only
-    /// works within one volume, so for a destination on another one, the copy is first copied next to it, into the
-    /// item-replacement folder the system keeps on that volume.
-    nonisolated private static func replace(_ destination: URL, with copy: URL) async throws {
-        let fileManager = FileManager.default
-        do {
-            _ = try fileManager.replaceItemAt(destination, withItemAt: copy)
-        } catch where isCrossDevice(error) {
-            let staging = try fileManager.url(
-                for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: destination, create: true)
-            defer { try? fileManager.removeItem(at: staging) }
-            let staged = staging.appending(path: copy.lastPathComponent)
-            try fileManager.copyItem(at: copy, to: staged)
-            _ = try fileManager.replaceItemAt(destination, withItemAt: staged)
-        }
-    }
-
-    nonisolated static func isCrossDevice(_ error: any Error) -> Bool {
-        var error: NSError? = error as NSError
-        while let current = error {
-            if current.domain == NSPOSIXErrorDomain, current.code == Int(EXDEV) { return true }
-            error = current.userInfo[NSUnderlyingErrorKey] as? NSError
-        }
-        return false
     }
 
     private static func name(of part: EmailBodyPart) -> String {

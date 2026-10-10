@@ -1,8 +1,10 @@
 import Foundation
 import MailPrivacy
+import Synchronization
 
 /// The only place decrypted attachment files are made: copies for Quick Look, sharing and saving, each in a folder
-/// of its own under `root`, deleted as soon as they aren't needed.
+/// of its own, deleted as soon as they aren't needed. They live under `root`, except copies that are to replace a
+/// saved file, which have to be on that file's volume (`copy(named:toReplace:write:)`).
 ///
 /// On iOS copies can only be read while the device is unlocked (complete protection); on macOS they are
 /// quarantined like other mail attachments. They are deleted when released (after `releaseDelay`), and all at
@@ -25,6 +27,9 @@ public actor TemporaryFiles {
     private let releaseDelay: Duration
     /// Released copies waiting for their delay, by folder.
     private var releases: [URL: Task<Void, Never>] = [:]
+    /// The folders of copies that are to replace a saved file. `purgeAllNow()` needs them without waiting for the
+    /// actor.
+    private nonisolated let replacements = Mutex<Set<URL>>([])
 
     public init(root: URL, releaseDelay: Duration) {
         self.root = root
@@ -34,7 +39,44 @@ public actor TemporaryFiles {
     /// Makes a new file named `name`, made safe by `SafeFilename`, and has `write` fill it. If `write` fails, the
     /// file is gone again.
     public func copy(named name: String, write: @Sendable (FileHandle) async throws -> Void) async throws -> URL {
-        let folder = root.appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        try await fill(root.appending(path: UUID().uuidString, directoryHint: .isDirectory), named: name, write: write)
+    }
+
+    /// Makes a new file like `copy(named:write:)`, to take the place of `destination` through `replace(_:with:)`.
+    ///
+    /// One file can replace another in one step only within a volume, so the copy goes into a new folder that the
+    /// system keeps for files being saved on the destination's volume. `purgeAllNow()` deletes it too. One that a
+    /// crash leaves on another volume than the app's stays there: the purge at launch can't reach it.
+    func copy(
+        named name: String, toReplace destination: URL, write: @Sendable (FileHandle) async throws -> Void
+    ) async throws -> URL {
+        let folder = try FileManager.default.url(
+            for: .itemReplacementDirectory, in: .userDomainMask, appropriateFor: destination, create: true
+        ).standardizedFileURL
+        replacements.withLock { _ = $0.insert(folder) }
+        return try await fill(folder, named: name, write: write)
+    }
+
+    /// Puts `copy`, made by `copy(named:toReplace:write:)`, in the place of `destination` in one step, so that a file
+    /// already there stays whole if that fails. The copy is gone afterwards either way.
+    func replace(_ destination: URL, with copy: URL) throws {
+        let folder = copy.deletingLastPathComponent().standardizedFileURL
+        defer {
+            if replacements.withLock({ $0.remove(folder) }) != nil { Self.remove(folder) }
+        }
+        _ = try FileManager.default.replaceItemAt(destination, withItemAt: copy)
+    }
+
+    /// The folders of the copies that are to replace a file, made and not yet gone.
+    nonisolated var replacementFolders: Set<URL> {
+        replacements.withLock { $0 }
+    }
+
+    /// Makes `name`, made safe by `SafeFilename`, in `folder`, and has `write` fill it. If that fails, the folder is
+    /// gone again.
+    private func fill(
+        _ folder: URL, named name: String, write: @Sendable (FileHandle) async throws -> Void
+    ) async throws -> URL {
         let file = folder.appending(path: SafeFilename.make(name, mimeType: nil), directoryHint: .notDirectory)
         do {
             try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
@@ -64,7 +106,8 @@ public actor TemporaryFiles {
             #endif
             return file
         } catch {
-            try? FileManager.default.removeItem(at: folder)
+            replacements.withLock { _ = $0.remove(folder) }
+            Self.remove(folder)
             throw error
         }
     }
@@ -85,13 +128,6 @@ public actor TemporaryFiles {
         }
     }
 
-    /// Deletes a copy now, whatever the release delay, e.g. one that was only staged for saving.
-    func discard(_ url: URL) {
-        guard let folder = folder(of: url) else { return }
-        releases.removeValue(forKey: folder)?.cancel()
-        Self.remove(folder)
-    }
-
     /// Deletes every released copy now, without waiting for its delay: for iOS, when the app goes to the
     /// background. Copies still shown stay.
     public func purgeReleased() {
@@ -102,10 +138,13 @@ public actor TemporaryFiles {
         releases = [:]
     }
 
-    /// Deletes every copy at once, released or not: when the macOS app quits, on sign-out, and when the token is
-    /// rejected. Synchronous, so it can run while the app terminates.
+    /// Deletes every copy at once, released or not, including those about to replace a saved file: when the macOS
+    /// app quits, on sign-out, and when the token is rejected. Synchronous, so it can run while the app terminates.
     public nonisolated func purgeAllNow() {
         Self.removeContents(of: root)
+        for folder in replacements.withLock({ folders in defer { folders = [] }; return folders }) {
+            Self.remove(folder)
+        }
     }
 
     /// Empties the app's own temporary directory, at launch, before anything uses it: decrypted copies that a

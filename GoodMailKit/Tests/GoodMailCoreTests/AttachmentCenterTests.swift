@@ -13,15 +13,16 @@ struct AttachmentCenterTests {
     let transport = AttachmentCenterTestsTransport()
     let store: MailStore
     let root = TemporaryFilesTests.Root()
+    let files: TemporaryFiles
     let center: AttachmentCenter
 
     static let confirmationSize = 184_320
 
     init() throws {
         store = try MailStore()
+        files = root.files()
         center = AttachmentCenter(
-            client: JMAPClient(token: "demo", transport: transport, maxRetries: 0), store: store,
-            files: root.files())
+            client: JMAPClient(token: "demo", transport: transport, maxRetries: 0), store: store, files: files)
     }
 
     static func part(blobId: String? = "e3-file0", name: String? = "Flight confirmation.pdf", size: Int? = 184_320)
@@ -91,7 +92,7 @@ struct AttachmentCenterTests {
         _ = try await center.previewURL(for: Self.part())
         _ = try await center.previewURL(for: Self.part(blobId: "e5-file0", name: "Invoice-2041.pdf", size: 61_440))
 
-        root.files().purgeAllNow()
+        files.purgeAllNow()
 
         #expect(root.contents.isEmpty)
     }
@@ -196,38 +197,102 @@ struct AttachmentCenterTests {
 
     // MARK: Saving
 
-    @Test func savingReplacesAFileOnlyWithACompleteCopy() async throws {
-        let folder = FileManager.default.temporaryDirectory.appending(path: "AttachmentCenterTests-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: folder) }
-        let destination = folder.appending(path: "Flight confirmation.pdf")
-        try Data("the user's own file".utf8).write(to: destination)
+    /// A folder of its own holding a file of the user's, which saving the confirmation replaces.
+    final class SaveFolder {
+        static let ownContent = Data("the user's own file".utf8)
 
-        transport.failsDownloads = true
-        await #expect(throws: (any Error).self) { try await center.write(Self.part(), to: destination) }
-        #expect(try Data(contentsOf: destination) == Data("the user's own file".utf8))
+        let url = FileManager.default.temporaryDirectory
+            .appending(path: "AttachmentCenterTests-\(UUID().uuidString)", directoryHint: .isDirectory)
+        var file: URL { url.appending(path: "Flight confirmation.pdf") }
 
-        transport.failsDownloads = false
-        try await center.write(Self.part(), to: destination)
-        #expect(try Data(contentsOf: destination) == (try await store.cachedAttachment(blobId: "e3-file0")))
-        #expect(try FileManager.default.contentsOfDirectory(atPath: folder.path) == ["Flight confirmation.pdf"])
-        #expect(root.contents.isEmpty)
+        init() throws {
+            try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+            try Self.ownContent.write(to: file)
+        }
 
-        let fresh = folder.appending(path: "Copy.pdf")
-        try await center.write(Self.part(), to: fresh)
-        #expect(try Data(contentsOf: fresh) == Data(contentsOf: destination))
-        #expect(transport.server.downloadCount == 2)
+        deinit {
+            try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: url.path)
+            try? FileManager.default.removeItem(at: url)
+        }
+
+        var contents: [String] {
+            (try? FileManager.default.contentsOfDirectory(atPath: url.path).sorted()) ?? []
+        }
     }
 
-    @Test func savingToAnotherVolumeIsRecognised() {
-        // The shape FileManager's replace reports when the two files are on different volumes.
-        let crossDevice = CocoaError(.fileWriteUnknown, userInfo: [
-            NSUnderlyingErrorKey: NSError(domain: NSCocoaErrorDomain, code: 512, userInfo: [
-                NSUnderlyingErrorKey: NSError(domain: NSPOSIXErrorDomain, code: Int(EXDEV)),
-            ]),
-        ])
-        #expect(AttachmentCenter.isCrossDevice(crossDevice))
-        #expect(!AttachmentCenter.isCrossDevice(CocoaError(.fileWriteNoPermission)))
+    /// Exports as usual, after noting the folders of the copies that are about to replace a file.
+    func notingStagedFolders(in seen: TemporaryFilesTests.SeenFolders) {
+        let files = files, export = center.exportCached
+        center.exportCached = { blobId, handle in
+            seen.add(files.replacementFolders)
+            try await export(blobId, handle)
+        }
+    }
+
+    @Test func savingPutsTheAttachmentInTheFilesPlace() async throws {
+        let folder = try SaveFolder()
+        let seen = TemporaryFilesTests.SeenFolders()
+        notingStagedFolders(in: seen)
+
+        transport.failsDownloads = true
+        await #expect(throws: (any Error).self) { try await center.write(Self.part(), to: folder.file) }
+        #expect(try Data(contentsOf: folder.file) == SaveFolder.ownContent)
+
+        transport.failsDownloads = false
+        try await center.write(Self.part(), to: folder.file)
+        #expect(try Data(contentsOf: folder.file) == (try await store.cachedAttachment(blobId: "e3-file0")))
+        #if os(macOS)
+        #expect(getxattr(folder.file.path, "com.apple.quarantine", nil, 0, 0, 0) > 0)
+        #endif
+
+        let fresh = folder.url.appending(path: "Copy.pdf")
+        try await center.write(Self.part(), to: fresh)
+        #expect(try Data(contentsOf: fresh) == Data(contentsOf: folder.file))
+        #expect(transport.server.downloadCount == 2)
+
+        // Each save went through a copy of its own, which is gone again.
+        #expect(folder.contents == ["Copy.pdf", "Flight confirmation.pdf"])
+        #expect(seen.folders.count == 2)
+        #expect(seen.folders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        #expect(files.replacementFolders.isEmpty)
+        #expect(root.contents.isEmpty)
+    }
+
+    @Test func aSaveThatBreaksOffHalfwayLeavesTheFileAsItWas() async throws {
+        let folder = try SaveFolder()
+        _ = try await center.data(for: Self.part())
+        let seen = TemporaryFilesTests.SeenFolders()
+        let files = files
+        center.exportCached = { _, handle in
+            try handle.write(contentsOf: Data("%PDF-1.7 and then the disk was full".utf8))
+            seen.add(files.replacementFolders)
+            throw CocoaError(.fileWriteOutOfSpace)
+        }
+
+        await #expect(throws: CocoaError(.fileWriteOutOfSpace)) { try await center.write(Self.part(), to: folder.file) }
+
+        #expect(try Data(contentsOf: folder.file) == SaveFolder.ownContent)
+        #expect(folder.contents == ["Flight confirmation.pdf"])
+        #expect(seen.folders.count == 1)
+        #expect(seen.folders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        #expect(files.replacementFolders.isEmpty)
+    }
+
+    @Test func aSaveThatCantTakeTheFilesPlaceLeavesItAsItWas() async throws {
+        let folder = try SaveFolder()
+        try FileManager.default.setAttributes([.posixPermissions: 0o555], ofItemAtPath: folder.url.path)
+        let seen = TemporaryFilesTests.SeenFolders()
+        notingStagedFolders(in: seen)
+
+        let error = await #expect(throws: CocoaError.self) { try await center.write(Self.part(), to: folder.file) }
+
+        #expect(error?.code == .fileWriteNoPermission)
+        #expect(try Data(contentsOf: folder.file) == SaveFolder.ownContent)
+        #expect(folder.contents == ["Flight confirmation.pdf"])
+        #expect(seen.folders.count == 1)
+        #expect(seen.folders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        #expect(files.replacementFolders.isEmpty)
+        #expect(await center.isCached(Self.part()))
     }
 }
 

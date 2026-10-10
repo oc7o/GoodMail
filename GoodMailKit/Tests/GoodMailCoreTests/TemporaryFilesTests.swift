@@ -1,4 +1,5 @@
 import Foundation
+import Synchronization
 import Testing
 @testable import GoodMailCore
 
@@ -17,6 +18,17 @@ struct TemporaryFilesTests {
 
         var contents: [String] {
             (try? FileManager.default.contentsOfDirectory(atPath: url.path)) ?? []
+        }
+    }
+
+    /// Folders noted while a test runs, such as those of copies that are only there for a moment.
+    final class SeenFolders: Sendable {
+        private let seen = Mutex<Set<URL>>([])
+
+        var folders: Set<URL> { seen.withLock { $0 } }
+
+        func add(_ folders: Set<URL>) {
+            seen.withLock { $0.formUnion(folders) }
         }
     }
 
@@ -116,6 +128,88 @@ struct TemporaryFilesTests {
         // Copies made afterwards still work.
         let next = try await files.copy(named: "Next.pdf", write: Self.write("next"))
         #expect(FileManager.default.fileExists(atPath: next.path))
+    }
+
+    // MARK: Copies that replace a saved file
+
+    /// A file of the user's, outside every root, for a copy to replace.
+    final class Destination {
+        let url = FileManager.default.temporaryDirectory
+            .appending(path: "TemporaryFilesTests-\(UUID().uuidString).pdf", directoryHint: .notDirectory)
+
+        init() throws { try Data("old".utf8).write(to: url) }
+
+        deinit { try? FileManager.default.removeItem(at: url) }
+
+        var text: String? { try? String(contentsOf: url, encoding: .utf8) }
+    }
+
+    @Test func aCopyThatReplacesAFileIsMadeBesideTheRootAndGoneOnceItDid() async throws {
+        let files = root.files()
+        let destination = try Destination()
+
+        let copy = try await files.copy(named: "../Invoice.pdf", toReplace: destination.url, write: Self.write("new"))
+
+        #expect(copy.lastPathComponent == "Invoice.pdf")
+        #expect(files.replacementFolders == [copy.deletingLastPathComponent().standardizedFileURL])
+        #expect(root.contents.isEmpty)
+        #expect(destination.text == "old")
+        #if os(macOS)
+        #expect(getxattr(copy.path, "com.apple.quarantine", nil, 0, 0, 0) > 0)
+        #endif
+
+        try await files.replace(destination.url, with: copy)
+
+        #expect(destination.text == "new")
+        #expect(!FileManager.default.fileExists(atPath: copy.deletingLastPathComponent().path))
+        #expect(files.replacementFolders.isEmpty)
+    }
+
+    @Test func aCopyThatCantReplaceItsFileIsGoneAllTheSame() async throws {
+        let files = root.files()
+        let destination = try Destination()
+        let copy = try await files.copy(named: "Invoice.pdf", toReplace: destination.url, write: Self.write("new"))
+        try FileManager.default.removeItem(at: copy)
+
+        await #expect(throws: (any Error).self) { try await files.replace(destination.url, with: copy) }
+
+        #expect(destination.text == "old")
+        #expect(!FileManager.default.fileExists(atPath: copy.deletingLastPathComponent().path))
+        #expect(files.replacementFolders.isEmpty)
+    }
+
+    @Test func aFailedCopyToReplaceAFileLeavesNothing() async throws {
+        struct Failure: Error {}
+        let files = root.files()
+        let destination = try Destination()
+        let seen = SeenFolders()
+
+        await #expect(throws: Failure.self) {
+            try await files.copy(named: "Half.pdf", toReplace: destination.url) { handle in
+                try handle.write(contentsOf: Data("half".utf8))
+                seen.add(files.replacementFolders)
+                throw Failure()
+            }
+        }
+
+        #expect(seen.folders.count == 1)
+        #expect(seen.folders.allSatisfy { !FileManager.default.fileExists(atPath: $0.path) })
+        #expect(files.replacementFolders.isEmpty)
+        #expect(destination.text == "old")
+    }
+
+    @Test func purgeAllNowAlsoDeletesCopiesAboutToReplaceAFile() async throws {
+        let files = root.files()
+        let destination = try Destination()
+        let copy = try await files.copy(named: "Invoice.pdf", toReplace: destination.url, write: Self.write("new"))
+
+        files.purgeAllNow()
+
+        #expect(!FileManager.default.fileExists(atPath: copy.deletingLastPathComponent().path))
+        #expect(files.replacementFolders.isEmpty)
+        // A save under way when that happens fails without touching the file.
+        await #expect(throws: (any Error).self) { try await files.replace(destination.url, with: copy) }
+        #expect(destination.text == "old")
     }
 
     @Test func purgingTheContainerTemporaryDirectoryDoesNothingOutsideAContainer() throws {
