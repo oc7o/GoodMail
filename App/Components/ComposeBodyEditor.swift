@@ -11,8 +11,11 @@ import ObjectiveC
 /// - `MailBodyFormatting` constrains what is typed and pasted, and Writing Tools may answer with rich text (D7).
 /// - Return in a list item starts the next item, Return in an empty item ends the list. The editor writes the
 ///   selection after the text, so this runs once both have arrived.
-/// - Files pasted or dropped become attachments through `onFiles`, never their paths as text (C27). On the Mac a
-///   pasted image without a file (a screenshot) goes to `onImage`, when given, so it can be attached too (D3).
+/// - Files pasted or dropped become attachments through `onFiles`, never their paths as text (C27). An image
+///   without a file (a screenshot, a copied picture, a photo dragged from Photos) goes to `onImage`, when given, so
+///   it can be attached too (D3); without `onImage`, a dropped image arrives as a file.
+///   The Mac reads them in the editor's own text view. iOS takes them through SwiftUI's drop handler and paste
+///   destination, which see what the text view leaves to them: drops without text, and pasted images and PDFs.
 /// - The system's own formatting bars are hidden in favour of `FormattingBar` and `FormattingControls`; the
 ///   context menu's formatting stays.
 /// - The editor grows with its text, so the composer's one scroll view does all the scrolling (R-editor E9).
@@ -50,8 +53,11 @@ struct ComposeBodyEditor: View {
                 EditorPasteboardInterceptor(onFiles: onFiles, onImage: onImage)
             }
             #else
-            .onDrop(of: [.fileURL], isTargeted: nil) { providers in
-                receiveDroppedFiles(providers)
+            .onDrop(of: EditorAttachmentItems.types, isTargeted: nil) { providers in
+                EditorAttachmentItems.receive(providers, onFiles: onFiles, onImage: onImage)
+            }
+            .pasteDestination(for: PastedAttachment.self) {
+                EditorAttachmentItems.receive($0, onFiles: onFiles, onImage: onImage)
             }
             #endif
     }
@@ -95,19 +101,85 @@ struct ComposeBodyEditor: View {
     }
 
     private static let objectReplacement: Character = "\u{FFFC}"
+}
 
-    #if os(iOS)
-    /// Drops the text view declines (files from Files or another app) arrive here as file URLs.
-    private func receiveDroppedFiles(_ providers: [NSItemProvider]) -> Bool {
-        let fileProviders = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
-        guard !fileProviders.isEmpty else { return false }
-        let onFiles = onFiles
-        Task { @MainActor in
-            var urls: [URL] = []
-            for provider in fileProviders {
-                if let url = await Self.fileURL(from: provider) { urls.append(url) }
+/// What a paste can attach on iOS: an image (a screenshot, a copied photo) or a PDF. None of them is text, so a text
+/// paste never matches and stays the editor's.
+struct PastedAttachment: Transferable {
+    let data: Data
+    let type: UTType
+
+    static var transferRepresentation: some TransferRepresentation {
+        PastedData(.png)
+        PastedData(.jpeg)
+        PastedData(.heic)
+        PastedData(.gif)
+        PastedData(.tiff)
+        PastedData(.pdf)
+    }
+}
+
+private struct PastedData: TransferRepresentation {
+    typealias Item = PastedAttachment
+
+    let type: UTType
+
+    init(_ type: UTType) {
+        self.type = type
+    }
+
+    @TransferRepresentationBuilder<PastedAttachment> var body: some TransferRepresentation<PastedAttachment> {
+        DataRepresentation(importedContentType: type) { [type] in PastedAttachment(data: $0, type: type) }
+    }
+}
+
+/// Files and images dropped on the editor or pasted into it, as attachments: a file URL or a file goes to `onFiles`,
+/// an image to `onImage` when the composer takes images (else as a file). Drops that carry text, or nothing but a
+/// web link, stay the editor's. Used on iOS; the Mac has its own route (`EditorPasteboardHook`).
+@MainActor enum EditorAttachmentItems {
+    static let types: [UTType] = [.fileURL, .data]
+
+    nonisolated static func isAttachment(_ provider: NSItemProvider) -> Bool {
+        let types = provider.registeredContentTypes
+        if types.contains(.fileURL) { return true }
+        if types.contains(where: { $0.conforms(to: .text) }) { return false }
+        // An image dragged from a web page also carries its address.
+        return types.contains { !$0.conforms(to: .url) }
+    }
+
+    static func receive(_ pasted: [PastedAttachment], onFiles: ([URL]) -> Void, onImage: ((Data, UTType) -> Void)?) {
+        var files: [URL] = []
+        for item in pasted {
+            if let onImage, item.type.conforms(to: .image) {
+                onImage(item.data, item.type)
+            } else if let url = kept(item.data, named: item.type.conforms(to: .image) ? "Image" : "Document",
+                                     type: item.type) {
+                files.append(url)
             }
-            if !urls.isEmpty { onFiles(urls) }
+        }
+        if !files.isEmpty { onFiles(files) }
+    }
+
+    /// Loads the attachments among `providers` and hands them over; returns whether there were any.
+    static func receive(
+        _ providers: [NSItemProvider], onFiles: @escaping ([URL]) -> Void, onImage: ((Data, UTType) -> Void)?
+    ) -> Bool {
+        let attachments = providers.filter(isAttachment)
+        guard !attachments.isEmpty else { return false }
+        Task { @MainActor in
+            var files: [URL] = []
+            for provider in attachments {
+                let types = provider.registeredContentTypes
+                if types.contains(.fileURL), let url = await fileURL(from: provider) {
+                    files.append(url)
+                } else if let onImage, let type = types.first(where: { $0.conforms(to: .image) }),
+                          let data = await data(from: provider, type: type) {
+                    onImage(data, type)
+                } else if let url = await file(from: provider) {
+                    files.append(url)
+                }
+            }
+            if !files.isEmpty { onFiles(files) }
         }
         return true
     }
@@ -119,7 +191,57 @@ struct ComposeBodyEditor: View {
             }
         }
     }
-    #endif
+
+    private static func data(from provider: NSItemProvider, type: UTType) async -> Data? {
+        await withCheckedContinuation { continuation in
+            _ = provider.loadDataRepresentation(for: type) { data, _ in
+                continuation.resume(returning: data)
+            }
+        }
+    }
+
+    /// The file itself when the app it comes from offers it in place. Otherwise the system's copy lasts only as long
+    /// as the call, so it is copied once more, into a folder of its own in the temporary directory that goes after
+    /// ten minutes; the composer reads it into the encrypted store long before.
+    private static func file(from provider: NSItemProvider) async -> URL? {
+        let types = provider.registeredContentTypes
+        guard let type = types.first(where: { !$0.conforms(to: .text) && !$0.conforms(to: .url) }) else { return nil }
+        return await withCheckedContinuation { continuation in
+            _ = provider.loadFileRepresentation(for: type, openInPlace: true) { url, isInPlace, _ in
+                guard let url else { return continuation.resume(returning: nil) }
+                continuation.resume(returning: isInPlace ? url : keptCopy(of: url))
+            }
+        }
+    }
+
+    private nonisolated static func keptCopy(of url: URL) -> URL? {
+        keep(named: url.lastPathComponent) { try FileManager.default.copyItem(at: url, to: $0) }
+    }
+
+    private nonisolated static func kept(_ data: Data, named name: String, type: UTType) -> URL? {
+        let fileExtension = type.preferredFilenameExtension.map { "." + $0 } ?? ""
+        return keep(named: name + fileExtension) { try data.write(to: $0) }
+    }
+
+    /// A file of its own in a new folder of the temporary directory, which goes after ten minutes.
+    private nonisolated static func keep(named name: String, _ write: (URL) throws -> Void) -> URL? {
+        let folder = FileManager.default.temporaryDirectory
+            .appending(path: "Dropped", directoryHint: .isDirectory)
+            .appending(path: UUID().uuidString, directoryHint: .isDirectory)
+        let file = folder.appending(path: name, directoryHint: .notDirectory)
+        do {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try write(file)
+        } catch {
+            try? FileManager.default.removeItem(at: folder)
+            return nil
+        }
+        Task {
+            try? await Task.sleep(for: .seconds(600))
+            try? FileManager.default.removeItem(at: folder)
+        }
+        return file
+    }
 }
 
 #if os(macOS)
