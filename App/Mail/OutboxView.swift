@@ -114,7 +114,7 @@ enum OutboxSection: CaseIterable, Identifiable {
     }
 }
 
-/// What the Outbox's buttons do; the Undo banner and the render harness use it too.
+/// What the Outbox's buttons do, outside the view; the render harness drives it too.
 @MainActor
 struct OutboxActions {
     let outbox: Outbox

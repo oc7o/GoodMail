@@ -170,6 +170,12 @@ struct OutboxNotices: View {
     let outbox: Outbox
 
     var body: some View {
+        if !outbox.notices.isEmpty {
+            toasts
+        }
+    }
+
+    private var toasts: some View {
         GlassEffectContainer(spacing: 8) {
             VStack(spacing: 8) {
                 ForEach(outbox.notices) { notice in
