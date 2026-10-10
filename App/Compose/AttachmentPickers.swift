@@ -74,9 +74,13 @@ private struct AttachmentPickerPresenter: ViewModifier {
                 }
             }
             #if os(iOS)
-            .fullScreenCover(isPresented: $pickers.isScanning) {
+            // A sheet, not a full-screen cover: a cover takes the composer off the screen, and a composer that
+            // disappears closes.
+            .sheet(isPresented: $pickers.isScanning) {
                 DocumentScanner { name, pdf in onData(pdf, name, .pdf) }
                     .ignoresSafeArea()
+                    .presentationDetents([.large])
+                    .interactiveDismissDisabled()
             }
             #else
             // Continuity Camera: File ▸ Import from iPhone or iPad sends photos and scans here.
