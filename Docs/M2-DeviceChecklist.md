@@ -138,7 +138,7 @@ the hold", D12 local-delay fallback).
 - [ ] A contact edited in Contacts while GoodMail runs is suggested with the new address (CNContactStoreDidChange).
 - [ ] Mac: the sandbox prompt appears (ENABLE_RESOURCE_ACCESS_CONTACTS) and the usage text reads right.
 
-## 6. Sending, Outbox, Undo (D12–D14, C2, C3)
+## 6. Sending, Outbox, Undo
 
 - [ ] **live** Send to yourself: the banner "Sending “…”… Undo" counts down ten seconds; the message arrives about
       15 seconds after Send. *Received headers: From and Return-Path as chosen, Message-ID on the From domain, Date in
@@ -178,7 +178,7 @@ the hold", D12 local-delay fallback).
       runs the processing task on demand.
 - [ ] After backgrounding with a Quick Look preview closed, the decrypted copy is gone (released copies purge).
 
-## 8. Masked Email (D19–D22, Q3)
+## 8. Masked Email
 
 - [ ] **live** Reply to mail that reached a masked address *that is one of your sending addresses* (Fastmail ▸
       Settings ▸ My email addresses): From is the mask without a name, no signature; *it sends; received headers show
@@ -234,7 +234,7 @@ the hold", D12 local-delay fallback).
       moves to `Unreadable/`; Try Again (or coming back to the app) opens the mail once the cause is gone.*
 - [ ] Mac quit with Quick Look copies open: *`tmp/Attachments` is empty afterwards.*
 
-## 11. Look and feel (Liquid Glass, §5.1)
+## 11. Look and feel (Liquid Glass)
 
 - [ ] Glass only on toolbars, the formatting bar, the Send button, the Undo banner, the Outbox pill and the toasts;
       message bodies, recipient tokens, attachment chips, the unsubscribe row and composer notices are plain content.
