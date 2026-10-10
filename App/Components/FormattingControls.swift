@@ -1,5 +1,8 @@
 import MailCompose
 import SwiftUI
+#if os(iOS)
+import UIKit
+#endif
 
 /// The composer's formatting controls: bold, italic, underline, strikethrough; a Text Style menu with the four
 /// sizes, the colour palette and monospace; lists; and links. On iOS they are the keyboard toolbar's content;
@@ -7,12 +10,15 @@ import SwiftUI
 ///
 /// They edit the same text and selection as `ComposeBodyEditor` (C12), so a control acts on what is selected
 /// there, or on the typing style at the insertion point, and shows the state of the selection, as in Mail.
+/// The link is edited in `LinkEditor` (a popover on the Mac) or in an alert on iOS (`LinkPrompt`).
 struct FormattingControls: View {
     @Binding private var text: AttributedString
     @Binding private var selection: AttributedTextSelection
 
     @Environment(\.fontResolutionContext) private var fontContext
+    #if os(macOS)
     @State private var isEditingLink = false
+    #endif
 
     init(text: Binding<AttributedString>, selection: Binding<AttributedTextSelection>) {
         _text = text
@@ -36,13 +42,7 @@ struct FormattingControls: View {
             .help("Strikethrough")
             textStyleMenu(state)
             listMenu(state)
-            Button("Link", systemImage: "link") { isEditingLink = true }
-                .help(state.link == nil ? "Add a link" : "Edit the link")
-                .popover(isPresented: $isEditingLink) {
-                    LinkEditor(url: state.link) { url in
-                        edit { $0.setLink(url, selection: &$1) }
-                    }
-                }
+            linkButton(state)
         }
         .labelStyle(.iconOnly)
         .toggleStyle(.button)
@@ -63,6 +63,24 @@ struct FormattingControls: View {
         toggle(title, systemImage: systemImage, isOn: isOn) { on in
             updateFont { change(&$0, on) }
         }
+    }
+
+    private func linkButton(_ state: FormattingState) -> some View {
+        #if os(macOS)
+        Button("Link", systemImage: "link") { isEditingLink = true }
+            .help(state.link == nil ? "Add a link" : "Edit the link")
+            .popover(isPresented: $isEditingLink) {
+                LinkEditor(url: state.link) { url in
+                    edit { $0.setLink(url, selection: &$1) }
+                }
+            }
+        #else
+        Button("Link", systemImage: "link") {
+            LinkPrompt.present(url: state.link) { url in
+                edit { $0.setLink(url, selection: &$1) }
+            }
+        }
+        #endif
     }
 
     private func textStyleMenu(_ state: FormattingState) -> some View {
@@ -254,7 +272,7 @@ struct LinkEditor: View {
         return digits.count >= 3 && text.allSatisfy { $0.isNumber || " +-()/".contains($0) }
     }
 
-    private static func displayString(_ url: URL) -> String {
+    static func displayString(_ url: URL) -> String {
         let string = url.absoluteString
         for scheme in ["mailto:", "tel:"] where string.lowercased().hasPrefix(scheme) {
             return String(string.dropFirst(scheme.count))
@@ -262,3 +280,53 @@ struct LinkEditor: View {
         return string
     }
 }
+
+#if os(iOS)
+/// The link editor on iOS. The formatting controls live in the keyboard toolbar, which goes away as soon as another
+/// field takes the keyboard, and with it anything presented from it; an alert presented by the window's top view
+/// controller stays. It accepts what `LinkEditor` accepts and asks again, with the reason, when the entry isn't a
+/// link.
+@MainActor enum LinkPrompt {
+    static func present(url: URL?, entry: String? = nil, problem: String? = nil, onDone: @escaping (URL?) -> Void) {
+        guard let presenter = topViewController() else { return }
+        let alert = UIAlertController(title: url == nil ? "Add Link" : "Edit Link", message: problem,
+                                      preferredStyle: .alert)
+        alert.addTextField { field in
+            field.text = entry ?? url.map(LinkEditor.displayString) ?? ""
+            field.placeholder = "https://… or name@example.com"
+            field.keyboardType = .URL
+            field.autocapitalizationType = .none
+            field.autocorrectionType = .no
+            field.clearButtonMode = .whileEditing
+        }
+        if url != nil {
+            alert.addAction(UIAlertAction(title: "Remove Link", style: .destructive) { _ in
+                MainActor.assumeIsolated { onDone(nil) }
+            })
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        let apply = UIAlertAction(title: url == nil ? "Add" : "Change", style: .default) { [weak alert] _ in
+            MainActor.assumeIsolated {
+                let typed = alert?.textFields?.first?.text ?? ""
+                if let link = LinkEditor.url(from: typed) {
+                    onDone(link)
+                } else {
+                    present(url: url, entry: typed,
+                            problem: "Enter a web address, an email address or a phone number.", onDone: onDone)
+                }
+            }
+        }
+        alert.addAction(apply)
+        alert.preferredAction = apply
+        presenter.present(alert, animated: true)
+    }
+
+    private static func topViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
+        let scene = scenes.first { $0.activationState == .foregroundActive } ?? scenes.first
+        var top = scene?.keyWindow?.rootViewController
+        while let presented = top?.presentedViewController { top = presented }
+        return top
+    }
+}
+#endif
