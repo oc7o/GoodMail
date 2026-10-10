@@ -2,6 +2,7 @@ import GoodMailCore
 import JMAPKit
 import MailCompose
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Opens a composer for a request: a window of its own on the Mac (D29), a sheet on iOS. Views get it from the
 /// environment; iOS menu commands get the focused scene's.
@@ -106,15 +107,34 @@ enum ComposeProblem: Identifiable {
 
 extension MailAccount {
     /// Turns an inline forward that can't be sent (its original is incomplete here, C20) into a forward as an
-    /// attachment, keeping what was written, and returns it; the inline one is deleted.
+    /// attachment, keeping what was written: sender, recipients, subject, text and the files the user added (the
+    /// original's own files travel inside the attached message). Returns it; the inline one is deleted only once
+    /// all of that is in the new one, and stays as it is when that fails.
     func forwardAsAttachment(instead composer: Composer) async -> Composer? {
         guard let original = composer.draft.original?.emailID,
               let replacement = try? await mail.compose(.forward(emailID: original, asAttachment: true))
         else { return nil }
+        // From first: it brings its identity's automatic Bcc, which the Bcc copied next then holds as before.
+        if replacement.from != composer.from { replacement.from = composer.from }
         replacement.to = composer.to
         replacement.cc = composer.cc
         replacement.bcc = composer.bcc
+        replacement.subject = composer.subject
         replacement.body = composer.body
+        do {
+            for attachment in composer.attachments where attachment.source == .local {
+                // The only copy of a scan or a pasted image is this draft's; deleting the draft deletes it.
+                let data = try await store.outgoingAttachmentData(id: attachment.id.uuidString)
+                // Its location was dealt with when it was first attached.
+                try await replacement.addAttachment(
+                    data, name: attachment.name,
+                    typeIdentifier: UTType(mimeType: attachment.type)?.identifier ?? UTType.data.identifier,
+                    keepingLocation: true)
+            }
+        } catch {
+            _ = await replacement.discard()
+            return nil
+        }
         _ = await composer.discard()
         return replacement
     }

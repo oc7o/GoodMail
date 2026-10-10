@@ -4,7 +4,7 @@ import SwiftUI
 
 struct MaskedEmailListView: View {
     @Bindable var model: MailModel
-    @Environment(MailAccount.self) private var account
+    @Environment(MainWindowState.self) private var window
 
     enum StateFilter: String, CaseIterable, Identifiable {
         case active = "Active"
@@ -63,7 +63,7 @@ struct MaskedEmailListView: View {
             }
             ToolbarItem(placement: .primaryAction) {
                 // ⌘N is New Message now; New Masked Email is ⌃⌘N in the File menu (D30).
-                Button("New Masked Email", systemImage: "plus") { account.isCreatingMaskedEmail = true }
+                Button("New Masked Email", systemImage: "plus") { window.newMaskedEmail(in: model) }
                     .help("New Masked Email (⌃⌘N)")
             }
         }

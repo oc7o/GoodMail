@@ -17,6 +17,7 @@ struct ComposeView: View {
     @FocusState private var isEditorFocused: Bool
     @Environment(MailAccount.self) private var account
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.compose) private var compose
 
     init(composer: Composer) {
         self.init(flow: ComposeFlow(composer: composer))
@@ -134,6 +135,7 @@ struct ComposeView: View {
                 ReadOnlyMessageBlock(
                     title: nil, html: flow.composer.previewHTML, text: flow.composer.previewText,
                     isCollapsible: false, inlineImage: { _ in nil })
+                    .environment(\.openURL, mailtoAction)
             case .editing:
                 ComposeBodyEditor(
                     text: Bindable(flow.composer).body, selection: $selection,
@@ -142,9 +144,16 @@ struct ComposeView: View {
                     .focused($isEditorFocused)
                     .accessibilityLabel("Message")
                 QuoteAndSignature(composer: flow.composer, account: account)
+                    .environment(\.openURL, mailtoAction)
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    /// A `mailto:` link in the quote, the signature or a draft's preview opens GoodMail's composer, writing from
+    /// the address the original came to (C8, D31), as in the reading pane.
+    private var mailtoAction: OpenURLAction {
+        .mailto(compose, sourceEmailID: flow.composer.draft.original?.emailID)
     }
 
     // MARK: Toolbar
@@ -243,8 +252,18 @@ final class ComposeFlow {
     }
 
     var title: String {
+        #if os(macOS)
+        // A window's title goes into the Mac's saved window state, a file outside GoodMail's encrypted store, so
+        // it doesn't carry the subject (§0.11): the title says what kind of message this is.
+        switch composer.kind {
+        case .new: "New Message"
+        case .reply, .replyAll: "Reply"
+        case .forward, .forwardAsAttachment: "Forward"
+        }
+        #else
         let subject = composer.subject.trimmingCharacters(in: .whitespaces)
         return subject.isEmpty ? "New Message" : subject
+        #endif
     }
 
     var saveStatusText: String {
@@ -476,9 +495,17 @@ final class ComposeFlow {
     }
 
     /// Replaces this inline forward, which can't be sent, with a forward as an attachment (C20) and returns it
-    /// for showing. On the Mac this window goes; on iOS the new composer takes the sheet's place.
+    /// for showing, with an address still typed in a recipient field. On the Mac this window goes; on iOS the
+    /// new composer takes the sheet's place.
     func forwardAsAttachment() async -> Composer? {
-        guard let account, let replacement = await account.forwardAsAttachment(instead: composer) else { return nil }
+        guard let account else { return nil }
+        commitEntries()
+        guard let replacement = await account.forwardAsAttachment(instead: composer) else {
+            alert = ComposeAlert(
+                title: "Couldn't Forward as Attachment",
+                message: "The message stays as it is. Try again, or remove attachments that are missing.")
+            return nil
+        }
         #if os(macOS)
         isFinished = true
         #endif
@@ -779,19 +806,29 @@ private struct AttachmentRow: View {
     private func chip(_ attachment: DraftAttachment) -> some View {
         let state = state(of: attachment)
         let composer = flow.composer
+        let remove: (() -> Void)? = composer.mode == .editing
+            ? { Task { await composer.removeAttachment(attachment.id) } } : nil
         return AttachmentChip(
             name: attachment.name, size: attachment.size,
-            typeIdentifier: UTType(mimeType: attachment.type)?.identifier, state: state,
-            onRemove: composer.mode == .editing ? { Task { await composer.removeAttachment(attachment.id) } } : nil
+            typeIdentifier: UTType(mimeType: attachment.type)?.identifier, state: state, onRemove: remove
         )
-        .onTapGesture {
-            switch state {
-            case .failed: flow.retryUploads()
-            case .missing:
+        .modifier(ChipAction(action: action(for: state, of: attachment), remove: remove))
+    }
+
+    /// What tapping a chip does: retry a failed upload, or attach a file again whose data is gone.
+    private func action(for state: AttachmentChip.State, of attachment: DraftAttachment) -> ChipAction.Action? {
+        let composer = flow.composer
+        let flow = flow
+        switch state {
+        case .failed:
+            return ChipAction.Action(title: "Retry Upload") { flow.retryUploads() }
+        case .missing:
+            return ChipAction.Action(title: "Attach Again…") {
                 Task { await composer.removeAttachment(attachment.id) }
                 flow.pickers.isImportingFiles = true
-            default: break
             }
+        default:
+            return nil
         }
     }
 
@@ -813,6 +850,38 @@ private struct AttachmentRow: View {
         guard let limit, limit > 0, bytes * 10 > limit * 7 else { return nil }
         let size = { (value: Int) in ByteCountFormatter.string(fromByteCount: Int64(value), countStyle: .file) }
         return "\(count) attachment\(count == 1 ? "" : "s") · \(size(bytes)) of \(size(limit))"
+    }
+}
+
+/// A chip that does something when tapped, as a control: a button to VoiceOver with the action named, a context
+/// menu with it and Remove, and a stop for the keyboard's focus that Space or Return acts on.
+private struct ChipAction: ViewModifier {
+    struct Action {
+        let title: String
+        let run: () -> Void
+    }
+
+    let action: Action?
+    let remove: (() -> Void)?
+
+    func body(content: Content) -> some View {
+        if let action {
+            content
+                .onTapGesture(perform: action.run)
+                .accessibilityAddTraits(.isButton)
+                .accessibilityAction(named: Text(action.title), action.run)
+                .contextMenu {
+                    Button(action.title, action: action.run)
+                    if let remove { Button("Remove", role: .destructive, action: remove) }
+                }
+                .focusable()
+                .onKeyPress(keys: [.space, .return]) { _ in
+                    action.run()
+                    return .handled
+                }
+        } else {
+            content
+        }
     }
 }
 

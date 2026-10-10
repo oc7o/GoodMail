@@ -107,7 +107,7 @@ struct ThreadListView: View {
             // Online, a triage change waits only for the moment it takes to send it.
             OutboxPill(waiting: counts.waiting, failed: counts.failed,
                        pendingChanges: isOffline ? model.pendingChangeCount : 0, isOffline: isOffline) {
-                model.destination = .outbox
+                model.showOutbox()
             }
             .padding(.bottom, 8)
             .help(model.connectionProblem ?? "Show the Outbox")

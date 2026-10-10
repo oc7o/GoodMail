@@ -6,6 +6,7 @@ import SwiftUI
 struct SidebarView: View {
     @Bindable var model: MailModel
     @Environment(AppModel.self) private var appModel
+    @Environment(MainWindowState.self) private var window
     @State private var renaming: SavedSearch?
     @State private var newName = ""
     @State private var isReplacingToken = false
@@ -73,7 +74,7 @@ struct SidebarView: View {
                 Button("Replace Token…", systemImage: "key") { isReplacingToken = true }
                 Divider()
                 Button("Sign Out…", systemImage: "rectangle.portrait.and.arrow.right") {
-                    Task { await appModel.beginSignOut() }
+                    Task { window.pendingSignOut = await appModel.beginSignOut() }
                 }
             } label: {
                 Label(model.username ?? "Account", systemImage: "person.crop.circle")
@@ -89,14 +90,14 @@ struct SidebarView: View {
         .sheet(isPresented: $isReplacingToken) { ReplaceTokenView() }
         .confirmationDialog(
             SignOutConfirmation.title, isPresented: isConfirmingSignOut, titleVisibility: .visible,
-            presenting: appModel.pendingSignOut
-        ) { _ in
-            Button("Sign Out and Delete", role: .destructive) { appModel.signOut() }
+            presenting: window.pendingSignOut
+        ) { summary in
+            Button(SignOutConfirmation.signOutTitle(for: summary), role: .destructive) { appModel.signOut() }
             Button("Show Outbox") {
-                appModel.pendingSignOut = nil
-                model.destination = .outbox
+                window.pendingSignOut = nil
+                model.showOutbox()
             }
-            Button("Cancel", role: .cancel) { appModel.pendingSignOut = nil }
+            Button("Cancel", role: .cancel) { window.pendingSignOut = nil }
         } message: { summary in
             Text(SignOutConfirmation.message(for: summary))
         }
@@ -108,7 +109,7 @@ struct SidebarView: View {
     }
 
     private var isConfirmingSignOut: Binding<Bool> {
-        Binding(get: { appModel.pendingSignOut != nil }, set: { if !$0 { appModel.pendingSignOut = nil } })
+        Binding(get: { window.pendingSignOut != nil }, set: { if !$0 { window.pendingSignOut = nil } })
     }
 
     private func badge(for mailbox: Mailbox) -> Int {
@@ -137,10 +138,33 @@ struct OutboxSidebarLabel: View {
 enum SignOutConfirmation {
     static let title = "Sign Out of GoodMail?"
 
-    /// "2 messages haven't been sent and 1 draft exists only on this device. Signing out deletes them."
+    /// "2 messages haven't been sent and 1 draft exists only on this device. Signing out deletes them." A message
+    /// on its way, held for Undo or with its outcome unknown, is no longer GoodMail's to delete: Fastmail may
+    /// send it whatever happens here, unless it is cancelled in the Outbox first.
     static func message(for summary: UnsentSummary) -> String {
-        let messages = summary.waiting + summary.sending + summary.failed
-        let drafts = summary.localOnlyDrafts
+        var sentences: [String] = []
+        let deleted = summary.waiting + summary.failed + summary.localOnlyDrafts
+        if let lost = UnsentMailText.lost(messages: summary.waiting + summary.failed, drafts: summary.localOnlyDrafts) {
+            sentences.append(lost + ". Signing out deletes " + (deleted == 1 ? "it." : "them."))
+        }
+        if summary.sending > 0 {
+            sentences.append(summary.sending == 1
+                ? "1 message is being sent and may still go out after you sign out."
+                : "\(summary.sending) messages are being sent and may still go out after you sign out.")
+        }
+        return sentences.joined(separator: " ")
+    }
+
+    /// The destructive button says Delete only when signing out deletes something.
+    static func signOutTitle(for summary: UnsentSummary) -> String {
+        summary.waiting + summary.failed + summary.localOnlyDrafts > 0 ? "Sign Out and Delete" : "Sign Out"
+    }
+}
+
+/// How mail that exists only on this device is named when signing out or in would delete it (D36).
+enum UnsentMailText {
+    /// "2 messages haven't been sent and 1 draft exists only on this device"; `nil` for none of either.
+    static func lost(messages: Int, drafts: Int) -> String? {
         var parts: [String] = []
         if messages > 0 {
             parts.append(messages == 1 ? "1 message hasn't been sent" : "\(messages) messages haven't been sent")
@@ -148,7 +172,18 @@ enum SignOutConfirmation {
         if drafts > 0 {
             parts.append(drafts == 1 ? "1 draft exists only on this device" : "\(drafts) drafts exist only on this device")
         }
-        return parts.joined(separator: " and ") + ". Signing out deletes " + (messages + drafts == 1 ? "it." : "them.")
+        return parts.isEmpty ? nil : parts.joined(separator: " and ")
+    }
+
+    /// Signing in with another account: what the account used before left here. `nil` when that couldn't be read.
+    static func otherAccount(_ summary: UnsentSummary?) -> String {
+        let messages = (summary?.waiting ?? 0) + (summary?.sending ?? 0) + (summary?.failed ?? 0)
+        guard let summary, let lost = lost(messages: messages, drafts: summary.localOnlyDrafts) else {
+            return "The account you used before still has mail on this device, and GoodMail couldn't check it for "
+                + "messages that weren't sent. Signing in with another account deletes it."
+        }
+        return "From the account you used before, " + lost + ". Signing in with another account deletes "
+            + (messages + summary.localOnlyDrafts == 1 ? "it." : "them.")
     }
 }
 

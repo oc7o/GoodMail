@@ -15,6 +15,9 @@ final class AppModel {
         case loading
         case signedOut
         case signedIn(MailAccount)
+        /// Signed in, but the mail on this device can't be opened right now (no space, the Keychain locked).
+        /// Nothing was moved or deleted; Try Again opens it once that has passed.
+        case unavailable(String)
     }
 
     enum SignInError: LocalizedError {
@@ -24,6 +27,11 @@ final class AppModel {
         /// Replace Token: the new token belongs to another Fastmail account (D18).
         case otherAccount
         case notSignedIn
+        /// Signing in with another account would delete what the account used before left unsent on this device
+        /// (D36): the user is asked first. `nil` when the stored mail couldn't be checked.
+        case unsentMailOfOtherAccount(UnsentSummary?)
+        /// The mail on this device can't be opened right now; nothing was moved or deleted.
+        case storeUnavailable(String)
 
         var errorDescription: String? {
             switch self {
@@ -38,23 +46,33 @@ final class AppModel {
                     + "with the new token."
             case .notSignedIn:
                 "Sign in to GoodMail first."
+            case .unsentMailOfOtherAccount(let summary):
+                UnsentMailText.otherAccount(summary)
+            case .storeUnavailable(let reason):
+                reason
             }
         }
     }
 
     private(set) var state: State = .loading
-    /// The local copy couldn't be opened, so it was moved aside and a new one started (D36); shown once.
-    var storeWasMovedAside = false
-    /// What Sign Out would delete, while the user decides (D36).
-    var pendingSignOut: UnsentSummary?
+    /// The local copy couldn't be opened, so it was moved aside and a new one started (D36). Kept until the
+    /// alert saying so was dismissed, even if the app ends before it could show.
+    var storeWasMovedAside: Bool {
+        didSet { UserDefaults.standard.set(storeWasMovedAside, forKey: Self.storeMovedAsideDefaultsKey) }
+    }
 
     private let keychain = Keychain(service: "dev.goodmail.GoodMail")
     private let tokenKey = "fastmail-api-token"
     private nonisolated static let storeKeyName = "mail-store-key"
     /// The account whose mail is on disk.
     private static let storeAccountDefaultsKey = "storeAccountID"
+    private static let storeMovedAsideDefaultsKey = "storeMovedAside"
     /// Demo mode: every client, a replacement token's included, talks to this server instead of Fastmail.
     private var demoServer: DemoTransport?
+
+    init() {
+        storeWasMovedAside = UserDefaults.standard.bool(forKey: Self.storeMovedAsideDefaultsKey)
+    }
 
     func restore() {
         guard case .loading = state else { return }
@@ -64,11 +82,22 @@ final class AppModel {
             return
         }
         #endif
-        if let token = try? keychain.read(tokenKey), !token.isEmpty, let store = try? openStore() {
-            state = .signedIn(makeAccount(client: JMAPClient(token: token), store: store))
-        } else {
-            state = .signedOut
+        do {
+            guard let token = try keychain.read(tokenKey), !token.isEmpty else {
+                state = .signedOut
+                return
+            }
+            state = .signedIn(makeAccount(client: JMAPClient(token: token), store: try openStore()))
+        } catch {
+            state = .unavailable(Self.explanation(of: error))
         }
+    }
+
+    /// Try Again, when the stored mail couldn't be opened.
+    func retryRestore() {
+        guard case .unavailable = state else { return }
+        state = .loading
+        restore()
     }
 
     #if DEBUG
@@ -89,7 +118,11 @@ final class AppModel {
     #endif
 
     /// Validates the token against the JMAP session and stores it on success.
-    func signIn(token: String) async throws {
+    ///
+    /// Mail left on this device by another account is deleted, but unsent mail never without asking (D36): unless
+    /// `deletingUnsentMailOfOtherAccount`, that throws `SignInError.unsentMailOfOtherAccount` for the user to
+    /// decide.
+    func signIn(token: String, deletingUnsentMailOfOtherAccount: Bool = false) async throws {
         let token = token.trimmingCharacters(in: .whitespacesAndNewlines)
         let client = makeClient(token: token)
         let session = try await validatedSession(of: client)
@@ -98,9 +131,19 @@ final class AppModel {
         // along with any changes it couldn't send before its token stopped working.
         let accountID = try? session.primaryAccountId(for: Capability.mail)
         if accountID == nil || UserDefaults.standard.string(forKey: Self.storeAccountDefaultsKey) != accountID {
+            if !deletingUnsentMailOfOtherAccount, FileManager.default.fileExists(atPath: Self.storeURL.path) {
+                let keychain = keychain
+                let unsent = await Self.unsentMail(inStoreAt: Self.storeURL) { try Self.storeKey(in: keychain) }
+                if unsent.map({ !$0.isEmpty }) ?? true { throw SignInError.unsentMailOfOtherAccount(unsent) }
+            }
             MailStore.destroy(at: Self.storeURL)
         }
-        let store = try openStore()
+        let store: MailStore
+        do {
+            store = try openStore()
+        } catch {
+            throw SignInError.storeUnavailable(Self.explanation(of: error))
+        }
         try keychain.write(token, for: tokenKey)
         UserDefaults.standard.set(accountID, forKey: Self.storeAccountDefaultsKey)
         state = .signedIn(makeAccount(client: client, store: store))
@@ -120,6 +163,12 @@ final class AppModel {
         if demoServer == nil { try keychain.write(token, for: tokenKey) }
         await account.mail.client.setToken(token)
         await account.mail.tokenChanged()
+        // Messages that failed only because the old token couldn't send go out now: Send was pressed for each,
+        // and replacing the token is what their row asked for. Nothing of them reached Fastmail (a 403).
+        guard account.mail.sendAvailability == .available else { return }
+        for item in account.mail.outbox.items where item.state == .failed(.tokenLacksSubmission) {
+            account.mail.outbox.retry(item.id)
+        }
     }
 
     /// The session of a token that is good enough to sign in with: Email and Masked Email (Email submission is
@@ -147,21 +196,19 @@ final class AppModel {
 
     // MARK: Signing out
 
-    /// Sign Out…: signs out at once when nothing would be lost, else asks first (D36).
-    func beginSignOut() async {
-        guard case .signedIn(let account) = state else { return }
+    /// Sign Out…: signs out at once when nothing would be lost. Otherwise returns what would be, for the window
+    /// that asked to show its confirmation (D36).
+    func beginSignOut() async -> UnsentSummary? {
+        guard case .signedIn(let account) = state else { return nil }
         let summary = await account.mail.unsentSummary()
-        if summary.isEmpty {
-            signOut()
-        } else {
-            pendingSignOut = summary
-        }
+        guard summary.isEmpty else { return summary }
+        signOut()
+        return nil
     }
 
     /// Forgets the account: the token, the stored mail with what waits to be sent, the key that could decrypt
     /// it, and every decrypted copy of an attachment.
     func signOut() {
-        pendingSignOut = nil
         if case .signedIn(let account) = state { account.stop() }
         TemporaryFiles.shared.purgeAllNow()
         BackgroundSending.cancelScheduledWork()
@@ -191,10 +238,20 @@ final class AppModel {
     /// A background task's turn (D35): sends what waits, whether or not a window ever started the account, and
     /// asks to run again while anything is left.
     func sendInBackground() async {
-        restore()
+        if case .unavailable = state { retryRestore() } else { restore() }
+        if case .unavailable = state {
+            // The stored mail can't be opened yet (say, no space): a later turn tries again.
+            BackgroundSending.schedule(BackgroundSending.Plan(refresh: true, processing: false))
+            return
+        }
         guard case .signedIn(let account) = state else { return }
-        let remains = await account.mail.sendPendingMail()
-        if remains { BackgroundSending.schedule(for: account.mail.outbox) }
+        // The next turn is asked for before this one works: iOS can end a turn early, and then nothing after the
+        // work runs. The outbox isn't known yet when the turn launched the app, so both kinds are asked for.
+        BackgroundSending.schedule(BackgroundSending.Plan(refresh: true, processing: true))
+        // When iOS ends the turn it cancels this task; returning then lets the turn end in time. What was cut
+        // short is picked up from its persisted state.
+        _ = await waitForWork { _ = await account.mail.sendPendingMail() }
+        BackgroundSending.schedule(for: account.mail.outbox)
     }
 
     private func makeAccount(
@@ -225,24 +282,14 @@ final class AppModel {
         URL.applicationSupportDirectory.appending(path: "GoodMail/Mail.sqlite")
     }
 
-    /// Opens the encrypted mail store. A store that can't be opened may hold mail that was never sent, so it is
-    /// moved aside, never deleted (D36), and a new one is started; the key stays, so a later version can still
-    /// read the old copy.
+    /// Opens the encrypted mail store; see `openStore(at:key:movedAside:)`. The key stays in the Keychain, so a
+    /// later version can still read a copy that was moved aside.
     private func openStore() throws -> MailStore {
         let keychain = keychain
-        func open() throws -> MailStore {
-            try MailStore(url: Self.storeURL) { try Self.storeKey(in: keychain) }
-        }
         // A Keychain that can't be read right now, say before first unlock, is no reason to give up
         // those unsent changes.
         _ = try Self.storeKey(in: keychain)
-
-        let store: MailStore
-        do {
-            store = try open()
-        } catch {
-            MailStore.moveAside(at: Self.storeURL)
-            store = try open()
+        let store = try Self.openStore(at: Self.storeURL, key: { try Self.storeKey(in: keychain) }) {
             storeWasMovedAside = true
         }
         // The key never leaves this device, so a backed-up copy would be dead weight.
@@ -251,6 +298,61 @@ final class AppModel {
         values.isExcludedFromBackup = true
         try? directory.setResourceValues(values)
         return store
+    }
+
+    /// Opens the store at `url`, creating it if needed.
+    ///
+    /// A store that is damaged, or that this device's key doesn't open, may hold mail that was never sent: it is
+    /// moved aside, never deleted, and a new one is started (D36); `movedAside` runs as soon as it moved. Every
+    /// other error leaves the files where they are and throws: no space, a file the system won't open yet, a
+    /// migration this version can't do. Those pass, or a later version fixes them, and the mail is still there.
+    static func openStore(
+        at url: URL, key: @escaping @Sendable () throws -> Data, movedAside: () -> Void
+    ) throws -> MailStore {
+        do {
+            return try MailStore(url: url, key: key)
+        } catch where isUnreadable(error) {
+            // A copy that couldn't be moved must not be opened afresh in its place.
+            guard MailStore.moveAside(at: url) != nil, !FileManager.default.fileExists(atPath: url.path) else {
+                throw error
+            }
+            movedAside()
+            do {
+                return try MailStore(url: url, key: key)
+            } catch {
+                // This attempt's database holds nothing. Left in place, a later move aside could push the copy
+                // just kept out of Unreadable/, which keeps one set only.
+                for suffix in ["", "-wal", "-shm"] {
+                    try? FileManager.default.removeItem(at: URL(fileURLWithPath: url.path + suffix))
+                }
+                throw error
+            }
+        }
+    }
+
+    /// What the store at `url` holds that was never sent or never reached Fastmail (D36), as Sign Out counts it;
+    /// `nil` when it can't be read.
+    static func unsentMail(inStoreAt url: URL, key: @escaping @Sendable () throws -> Data) async -> UnsentSummary? {
+        guard let store = try? MailStore(url: url, key: key) else { return nil }
+        let mail = MailModel(client: JMAPClient(token: ""), store: store, syncsInBackground: false) {}
+        return await mail.unsentSummary()
+    }
+
+    /// A damaged file, or one that isn't a database with this key: SQLite's CORRUPT and NOTADB, from GRDB.
+    nonisolated static func isUnreadable(_ error: any Error) -> Bool {
+        let error = error as NSError
+        return error.domain == "GRDB.DatabaseError" && [11, 26].contains(error.code & 0xFF)
+    }
+
+    /// What the unavailable screen says.
+    nonisolated static func explanation(of error: any Error) -> String {
+        let nsError = error as NSError
+        let isFull = (nsError.domain == "GRDB.DatabaseError" && nsError.code & 0xFF == 13)
+            || (nsError.domain == NSCocoaErrorDomain && nsError.code == NSFileWriteOutOfSpaceError)
+            || (nsError.domain == NSPOSIXErrorDomain && nsError.code == Int(ENOSPC))
+        if isFull { return "There isn't enough free space on this device. Free up some space, then try again." }
+        if let failure = error as? Keychain.Failure { return failure.localizedDescription }
+        return "GoodMail couldn't open the mail stored on this device (\(error.localizedDescription))."
     }
 
     private nonisolated static func storeKey(in keychain: Keychain) throws -> Data {
@@ -277,8 +379,6 @@ final class MailAccount {
     let attachments: AttachmentCenter
     let recipients: RecipientDirectory
     let unsubscriber: Unsubscriber
-    /// The Masked Email editor is up, e.g. after ⌃⌘N.
-    var isCreatingMaskedEmail = false
     /// The message sent last, for a few seconds: offline, the main window says when it goes out (§3.10).
     private(set) var lastSent: SentMessage?
     @ObservationIgnored private var starting: Task<Void, Never>?
@@ -316,11 +416,20 @@ final class MailAccount {
     func stop() {
         starting?.cancel()
         mail.stop()
+        // A download finishing after sign-out would make a decrypted copy that the sign-out purge never saw (D23).
+        for blobId in attachments.downloads.keys {
+            attachments.cancelDownload(blobId: blobId)
+        }
     }
 
     func register(_ flow: ComposeFlow) {
         flows.removeAll { $0.flow == nil || $0.flow === flow }
         flows.append(WeakFlow(flow: flow))
+    }
+
+    /// Whether a composer is on screen, with edits that may not be saved yet.
+    var hasOpenComposers: Bool {
+        flows.contains { $0.flow != nil }
     }
 
     /// Addresses typed in recipient fields but not yet tokens become recipients, as Return would make them, so

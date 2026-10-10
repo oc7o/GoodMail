@@ -31,8 +31,9 @@ struct ReplaceTokenView: View {
                             .foregroundStyle(.red)
                     }
                 } footer: {
-                    Text("Your mail, drafts and the Outbox stay as they are. You can delete the old token in "
-                         + "Fastmail afterwards.")
+                    Text("Your mail, drafts and the Outbox stay as they are, and messages that failed because the "
+                         + "old token couldn't send go out with the new one. You can delete the old token in Fastmail "
+                         + "afterwards.")
                 }
             }
             .formStyle(.grouped)

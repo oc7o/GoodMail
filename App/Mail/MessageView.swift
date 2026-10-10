@@ -127,13 +127,7 @@ struct MessageView: View {
     /// `mailto:` links open the composer, replying from the address this message came to (C8, D31); every other
     /// link opens as before.
     private var mailtoAction: OpenURLAction {
-        let compose = compose
-        let emailID = email.id
-        return OpenURLAction { url in
-            guard url.scheme?.lowercased() == "mailto", let link = MailtoLink(url) else { return .systemAction }
-            compose(.mailto(link, sourceEmailID: emailID))
-            return .handled
-        }
+        .mailto(compose, sourceEmailID: email.id)
     }
 
     private var recipients: String {
@@ -180,6 +174,18 @@ struct MessageView: View {
         if !files.isEmpty {
             Divider()
             AttachmentStrip(parts: files, actions: account.attachments)
+        }
+    }
+}
+
+extension OpenURLAction {
+    /// `mailto:` links open GoodMail's composer, which picks the sender by the message the link was in (C8, D31);
+    /// every other link opens as it would anyway.
+    @MainActor static func mailto(_ compose: ComposeAction, sourceEmailID: String?) -> OpenURLAction {
+        OpenURLAction { url in
+            guard url.scheme?.lowercased() == "mailto", let link = MailtoLink(url) else { return .systemAction }
+            compose(.mailto(link, sourceEmailID: sourceEmailID))
+            return .handled
         }
     }
 }

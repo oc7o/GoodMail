@@ -46,6 +46,7 @@ struct GoodMailApp: App {
 
 struct RootView: View {
     @Environment(AppModel.self) private var model
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some View {
         Group {
@@ -57,7 +58,20 @@ struct RootView: View {
             case .signedIn(let account):
                 MailView(model: account.mail)
                     .environment(account)
+            case .unavailable(let reason):
+                ContentUnavailableView {
+                    Label("GoodMail Can't Open Your Mail", systemImage: "exclamationmark.lock")
+                } description: {
+                    Text(reason + " Nothing was deleted.")
+                } actions: {
+                    Button("Try Again") { model.retryRestore() }
+                        .buttonStyle(.borderedProminent)
+                }
             }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // Say, the device was locked when a background task started the app.
+            if phase == .active, case .unavailable = model.state { model.retryRestore() }
         }
         .alert("GoodMail Started a New Local Copy", isPresented: isShowingStoreAlert) {
             Button("OK", role: .cancel) {}
@@ -68,21 +82,6 @@ struct RootView: View {
 
     private var isShowingStoreAlert: Binding<Bool> {
         Binding(get: { model.storeWasMovedAside }, set: { if !$0 { model.storeWasMovedAside = false } })
-    }
-}
-
-extension AppModel {
-    /// The app left the screen: drafts are saved on the device and to Fastmail, the Outbox gets a pass, and on
-    /// iOS released attachment copies go and the system is asked to come back for what is left (D8, D23, D35).
-    func enteredBackground() {
-        guard case .signedIn(let account) = state else { return }
-        #if os(iOS)
-        Task { await TemporaryFiles.shared.purgeReleased() }
-        #endif
-        Task {
-            await account.mail.prepareForBackground()
-            BackgroundSending.schedule(for: account.mail.outbox)
-        }
     }
 }
 
@@ -107,18 +106,3 @@ final class GoodMailAppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 #endif
-
-extension MailAccount {
-    /// Saves open composers, with what is still typed in their recipient fields, and makes one Outbox pass, but
-    /// waits at most `seconds`.
-    func prepareForQuit(waitingAtMost seconds: Double = 3) async {
-        commitTypedRecipients()
-        let mail = mail
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { await mail.prepareForBackground() }
-            group.addTask { try? await Task.sleep(for: .seconds(seconds)) }
-            await group.next()
-            group.cancelAll()
-        }
-    }
-}

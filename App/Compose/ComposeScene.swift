@@ -43,6 +43,13 @@ struct ComposeWindowRoot: View {
                     Button("Open GoodMail") { openWindow(id: "main") }
                         .buttonStyle(.borderedProminent)
                 }
+            case .unavailable:
+                ContentUnavailableView {
+                    Label("GoodMail can't open your mail right now", systemImage: "exclamationmark.lock")
+                } actions: {
+                    Button("Open GoodMail") { openWindow(id: "main") }
+                        .buttonStyle(.borderedProminent)
+                }
             case .signedIn(let account):
                 if let composer {
                     ComposeView(composer: composer)

@@ -22,6 +22,7 @@ struct MailCommands: Commands {
     @FocusedValue(\.replyTarget) private var replyTarget
     @FocusedValue(\.composeFlow) private var composeFlow
     @FocusedValue(\.composeAction) private var sceneCompose
+    @FocusedValue(\.mainWindow) private var mainWindow
     #if os(macOS)
     @Environment(\.openWindow) private var openWindow
     #endif
@@ -37,7 +38,7 @@ struct MailCommands: Commands {
             #endif
             Button("New Masked Email", action: newMaskedEmail)
                 .keyboardShortcut("n", modifiers: [.control, .command])
-                .disabled(account == nil)
+                .disabled(account == nil || mainWindow == nil)
         }
         CommandMenu("Message") {
             Button("Send") { composeFlow?.sendNow() }
@@ -95,9 +96,9 @@ struct MailCommands: Commands {
         #endif
     }
 
+    /// In the main window in front only: every window would otherwise show the sheet.
     private func newMaskedEmail() {
         guard let account else { return }
-        account.mail.destination = .maskedEmail
-        account.isCreatingMaskedEmail = true
+        mainWindow?.newMaskedEmail(in: account.mail)
     }
 }

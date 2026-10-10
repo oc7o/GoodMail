@@ -7,21 +7,29 @@ import SwiftUI
 struct MailView: View {
     @Bindable var model: MailModel
     @State private var presenter: ComposePresenter
+    @State private var window: MainWindowState
     @State private var undoReport: String?
     @Environment(MailAccount.self) private var account
     @Environment(\.scenePhase) private var scenePhase
     #if os(macOS)
     @Environment(\.openWindow) private var openWindow
+    #else
+    @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     #endif
 
-    /// - Parameter presenter: How composers are shown; the render harness passes its own.
-    init(model: MailModel, presenter: ComposePresenter = ComposePresenter()) {
+    /// - Parameters:
+    ///   - presenter: How composers are shown; the render harness passes its own.
+    ///   - window: This window's sheets and dialogs; the render harness passes its own.
+    init(
+        model: MailModel, presenter: ComposePresenter = ComposePresenter(), window: MainWindowState = MainWindowState()
+    ) {
         self.model = model
         _presenter = State(initialValue: presenter)
+        _window = State(initialValue: window)
     }
 
     var body: some View {
-        @Bindable var account = account
+        @Bindable var window = window
         let compose = presenter.action(for: model)
         NavigationSplitView {
             SidebarView(model: model)
@@ -44,9 +52,16 @@ struct MailView: View {
                     ContentUnavailableView("No Address Selected", systemImage: "theatermasks")
                 }
             case .outbox:
-                ContentUnavailableView(
-                    "Outbox", systemImage: "tray.and.arrow.up",
-                    description: Text("Messages go out as soon as Fastmail can take them."))
+                #if os(iOS)
+                // An iPhone shows this column only while it is pushed: then it is the Outbox itself.
+                if horizontalSizeClass == .compact {
+                    OutboxView(model: model)
+                } else {
+                    outboxPlaceholder
+                }
+                #else
+                outboxPlaceholder
+                #endif
             default:
                 if let id = model.selectedThreadID {
                     ThreadView(model: model, threadID: id)
@@ -57,9 +72,11 @@ struct MailView: View {
             }
         }
         .environment(\.compose, compose)
+        .environment(window)
         .focusedSceneValue(\.composeAction, compose)
+        .focusedSceneValue(\.mainWindow, window)
         .overlay(alignment: .bottom) {
-            SendBanner(account: account, undo: undo) { model.destination = .outbox }
+            SendBanner(account: account, undo: undo) { model.showOutbox() }
         }
         .overlay(alignment: .top) {
             OutboxNotices(outbox: model.outbox)
@@ -68,7 +85,7 @@ struct MailView: View {
             ComposeSheet(composer: composer)
                 .environment(account)
         }
-        .sheet(isPresented: $account.isCreatingMaskedEmail) {
+        .sheet(isPresented: $window.isCreatingMaskedEmail) {
             MaskedEmailEditor(model: model)
         }
         .alert(presenter.problem?.title ?? "", isPresented: isShowingProblem, presenting: presenter.problem) { problem in
@@ -110,12 +127,48 @@ struct MailView: View {
         }
     }
 
+    private var outboxPlaceholder: some View {
+        ContentUnavailableView(
+            "Outbox", systemImage: "tray.and.arrow.up",
+            description: Text("Messages go out as soon as Fastmail can take them."))
+    }
+
     private var isShowingProblem: Binding<Bool> {
         Binding(get: { presenter.problem != nil }, set: { if !$0 { presenter.problem = nil } })
     }
 
     private func undo(_ id: UUID) {
         Task { undoReport = await presenter.undo(id, in: model) }
+    }
+}
+
+/// What one main window shows by itself: its sheets and dialogs. The selection belongs to the account and every
+/// window shows it; these are asked for in one window and appear only there.
+@MainActor
+@Observable
+final class MainWindowState {
+    var isCreatingMaskedEmail = false
+    /// What Sign Out would delete, while the user decides (D36).
+    var pendingSignOut: UnsentSummary?
+
+    /// New Masked Email: ⌃⌘N, or + in the Masked Email list.
+    func newMaskedEmail(in mail: MailModel) {
+        mail.destination = .maskedEmail
+        isCreatingMaskedEmail = true
+    }
+}
+
+extension FocusedValues {
+    /// The main window in front, for the menu commands that open its sheets.
+    @Entry var mainWindow: MainWindowState?
+}
+
+extension MailModel {
+    /// Opens the Outbox and leaves the conversation that was open: on an iPhone, that conversation's screen
+    /// would otherwise stay in front of the Outbox.
+    func showOutbox() {
+        selectedThreadID = nil
+        destination = .outbox
     }
 }
 

@@ -6,6 +6,8 @@ struct OnboardingView: View {
     @State private var token = ""
     @State private var isSigningIn = false
     @State private var error: String?
+    /// Signing in with this token would delete unsent mail of the account used before; the user decides (D36).
+    @State private var unsentMailOfOtherAccount: String?
 
     static let tokenSettingsURL = URL(string: "https://app.fastmail.com/settings/security/tokens")!
     static let tokenSettingsPath = "Settings → Privacy & Security → Connected apps & API tokens → Manage API tokens"
@@ -22,6 +24,19 @@ struct OnboardingView: View {
             .frame(maxWidth: 520)
             .frame(maxWidth: .infinity)
         }
+        .confirmationDialog(
+            "Delete Mail of the Other Account?", isPresented: isConfirmingDeletion, titleVisibility: .visible,
+            presenting: unsentMailOfOtherAccount
+        ) { _ in
+            Button("Sign In and Delete", role: .destructive) { signIn(deletingUnsentMailOfOtherAccount: true) }
+            Button("Cancel", role: .cancel) {}
+        } message: { message in
+            Text(message)
+        }
+    }
+
+    private var isConfirmingDeletion: Binding<Bool> {
+        Binding(get: { unsentMailOfOtherAccount != nil }, set: { if !$0 { unsentMailOfOtherAccount = nil } })
     }
 
     private var header: some View {
@@ -95,13 +110,19 @@ struct OnboardingView: View {
     }
 
     private func signIn() {
+        signIn(deletingUnsentMailOfOtherAccount: false)
+    }
+
+    private func signIn(deletingUnsentMailOfOtherAccount: Bool) {
         guard !isSigningIn else { return }
         isSigningIn = true
         error = nil
         Task {
             defer { isSigningIn = false }
             do {
-                try await model.signIn(token: token)
+                try await model.signIn(token: token, deletingUnsentMailOfOtherAccount: deletingUnsentMailOfOtherAccount)
+            } catch AppModel.SignInError.unsentMailOfOtherAccount(let summary) {
+                unsentMailOfOtherAccount = UnsentMailText.otherAccount(summary)
             } catch {
                 self.error = error.localizedDescription
             }

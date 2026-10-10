@@ -11,8 +11,9 @@ import UIKit
 /// - Every flush, upload and submission runs inside `makeActivity()`'s activity: on iOS a background task, which
 ///   buys the time to finish what was started; on the Mac a process activity, so App Nap doesn't stall it.
 /// - When iOS sends the app to the background with work left, it asks for an app-refresh task, and for a
-///   processing task that needs a network while messages wait. Both run `AppModel.sendInBackground()` when iOS
-///   decides; the identifiers are permitted in `Config/GoodMail-Info.plist`.
+///   processing task that needs a network while messages wait, before that work, and again after it with what
+///   is left. Both run `AppModel.sendInBackground()` when iOS decides; the identifiers are permitted in
+///   `Config/GoodMail-Info.plist`.
 /// - A Send with more than 5 MB still to upload asks for a continued-processing task, which iOS shows with the
 ///   upload's progress and lets run on after the user leaves the app.
 @MainActor
@@ -32,46 +33,80 @@ enum BackgroundSending {
         #endif
     }
 
-    /// Asks iOS to wake the app for the outbox's work while there is any.
-    static func schedule(for outbox: Outbox) {
-        #if os(iOS)
-        guard outbox.hasPendingWork else { return }
-        let refresh = BGAppRefreshTaskRequest(identifier: refreshTaskID)
-        refresh.earliestBeginDate = Date(timeIntervalSinceNow: 60)
-        var requests: [BGTaskRequest] = [refresh]
+    /// What to ask iOS for.
+    struct Plan: Equatable {
+        /// An app-refresh task: anything left to do, such as a draft Fastmail doesn't have yet.
+        var refresh: Bool
+        /// A processing task that needs a network: messages waiting to go out.
+        var processing: Bool
+    }
+
+    /// What the outbox's work needs, and an open composer's, whose edits may not be saved yet.
+    static func plan(for outbox: Outbox, hasOpenComposers: Bool = false) -> Plan {
         let waits = outbox.items.contains { item in
             switch item.state {
             case .waiting, .sending, .cancelling: true
             case .held, .failed: false
             }
         }
-        if waits {
+        return Plan(refresh: outbox.hasPendingWork || hasOpenComposers || waits, processing: waits)
+    }
+
+    /// Asks iOS to wake the app for the outbox's work while there is any, and withdraws what is no longer needed.
+    static func schedule(for outbox: Outbox) {
+        schedule(plan(for: outbox))
+    }
+
+    /// Asks iOS for the tasks of `plan` and withdraws the others. A request replaces an earlier one of its kind.
+    static func schedule(_ plan: Plan) {
+        #if os(iOS)
+        var requests: [BGTaskRequest] = []
+        if plan.refresh {
+            let refresh = BGAppRefreshTaskRequest(identifier: refreshTaskID)
+            refresh.earliestBeginDate = Date(timeIntervalSinceNow: 60)
+            requests.append(refresh)
+        }
+        if plan.processing {
             // Uploads and submissions need the network, but not power: mail should go out on battery too.
             let processing = BGProcessingTaskRequest(identifier: processingTaskID)
             processing.requiresNetworkConnectivity = true
             processing.requiresExternalPower = false
             requests.append(processing)
         }
-        submit(requests)
+        let withdrawn = [plan.refresh ? nil : refreshTaskID, plan.processing ? nil : processingTaskID].compactMap { $0 }
+        submit(requests, cancelling: withdrawn)
         #endif
     }
 
     static func cancelScheduledWork() {
         #if os(iOS)
-        BGTaskScheduler.shared.cancelAllTaskRequests()
+        let previous = submitting
+        submitting = Task.detached(priority: .utility) {
+            await previous?.value
+            BGTaskScheduler.shared.cancelAllTaskRequests()
+        }
         #endif
     }
 
     #if os(iOS)
-    /// Submitting may wait for the scheduler, which wants that off the main thread.
-    private static func submit(_ requests: [BGTaskRequest]) {
+    /// Submitting may wait for the scheduler, which wants that off the main thread. One task does both, in
+    /// order, so that a later plan's requests never land before an earlier plan's.
+    private static func submit(_ requests: [BGTaskRequest], cancelling withdrawn: [String] = []) {
         let requests = requests.map(UncheckedSendable.init)
-        Task.detached(priority: .utility) {
+        let previous = submitting
+        submitting = Task.detached(priority: .utility) {
+            await previous?.value
+            for identifier in withdrawn {
+                BGTaskScheduler.shared.cancel(taskRequestWithIdentifier: identifier)
+            }
             for request in requests {
                 try? await BGTaskScheduler.shared.submitTaskRequest(request.value)
             }
         }
     }
+
+    /// The submission under way, which the next one waits for.
+    private static var submitting: Task<Void, Never>?
 
     /// For a Send with a lot still to upload: a continued-processing task that shows the upload's progress
     /// until the message is on Fastmail (held), has failed, or is gone from the Outbox (sent, or undone).

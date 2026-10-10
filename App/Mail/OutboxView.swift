@@ -12,6 +12,7 @@ struct OutboxView: View {
     @State private var isReplacingToken = false
     @State private var report: String?
     @State private var deleting: Outbox.Item?
+    @State private var deletingDraft: Outbox.DraftSummary?
 
     var body: some View {
         let outbox = model.outbox
@@ -22,7 +23,8 @@ struct OutboxView: View {
                 if !items.isEmpty {
                     Section(section.title) {
                         ForEach(items) { item in
-                            OutboxRow(item: item, isOnline: model.isOnline, actions: actions,
+                            OutboxRow(item: item, isOnline: model.isOnline,
+                                      tokenCanSend: model.sendAvailability == .available, actions: actions,
                                       replaceToken: { isReplacingToken = true }, delete: { deleting = item })
                         }
                     }
@@ -31,7 +33,7 @@ struct OutboxView: View {
             if !outbox.unsyncedDrafts.isEmpty {
                 Section("Drafts on This Device") {
                     ForEach(outbox.unsyncedDrafts) { draft in
-                        OutboxDraftRow(draft: draft, actions: actions)
+                        OutboxDraftRow(draft: draft, actions: actions) { deletingDraft = draft }
                     }
                 }
             }
@@ -70,6 +72,16 @@ struct OutboxView: View {
             Button("Cancel", role: .cancel) {}
         } message: { _ in
             Text("It won't be sent, and its copy in Drafts goes to Trash.")
+        }
+        .confirmationDialog(
+            "Delete “\(OutboxRow.subject(deletingDraft?.subject ?? ""))”?",
+            isPresented: Binding(get: { deletingDraft != nil }, set: { if !$0 { deletingDraft = nil } }),
+            titleVisibility: .visible, presenting: deletingDraft
+        ) { draft in
+            Button("Delete Draft", role: .destructive) { Task { await actions.delete(draft) } }
+            Button("Cancel", role: .cancel) {}
+        } message: { _ in
+            Text(OutboxDraftRow.deleteWarning)
         }
     }
 
@@ -178,6 +190,8 @@ struct OutboxActions {
 struct OutboxRow: View {
     let item: Outbox.Item
     let isOnline: Bool
+    /// Whether the account's token may send now, for a message that failed because an earlier one couldn't.
+    var tokenCanSend = false
     let actions: OutboxActions
     var replaceToken: () -> Void = {}
     var delete: () -> Void = {}
@@ -199,7 +213,8 @@ struct OutboxRow: View {
             }
             .padding(.vertical, 4)
             .contextMenu {
-                ForEach(Self.offeredActions(for: item.state, now: context.date, isOnline: isOnline), id: \.self) {
+                ForEach(Self.offeredActions(for: item.state, now: context.date, isOnline: isOnline,
+                                            tokenCanSend: tokenCanSend), id: \.self) {
                     button($0)
                 }
             }
@@ -221,7 +236,7 @@ struct OutboxRow: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                 }
-                Text(Self.status(of: item.state, now: now))
+                Text(Self.status(of: item.state, now: now, tokenCanSend: tokenCanSend))
                     .font(.subheadline)
                     .foregroundStyle(isFailed ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
                     .fixedSize(horizontal: false, vertical: true)
@@ -231,7 +246,8 @@ struct OutboxRow: View {
 
     private func buttons(now: Date) -> some View {
         HStack(spacing: 6) {
-            ForEach(Self.offeredActions(for: item.state, now: now, isOnline: isOnline), id: \.self) { action in
+            ForEach(Self.offeredActions(for: item.state, now: now, isOnline: isOnline, tokenCanSend: tokenCanSend),
+                    id: \.self) { action in
                 button(action)
             }
         }
@@ -266,15 +282,18 @@ struct OutboxRow: View {
     }
 
     /// The table in §5.6: nothing is offered for a message being cancelled, Cancel for a held one only before
-    /// its deadline, and Delete for a held one only online, since it has to be cancelled on Fastmail first.
-    static func offeredActions(for state: Outbox.State, now: Date, isOnline: Bool) -> [Action] {
+    /// its deadline, and Delete for a held one only online, since it has to be cancelled on Fastmail first. A
+    /// message that failed because the token couldn't send offers Replace Token… until the token can.
+    static func offeredActions(
+        for state: Outbox.State, now: Date, isOnline: Bool, tokenCanSend: Bool = false
+    ) -> [Action] {
         switch state {
         case .waiting: [.cancel, .edit, .delete]
         case .sending: [.cancel]
         case .cancelling: []
         case .held(_, let sendsAround):
             (now < cancelDeadline(sendsAround: sendsAround) ? [.cancel] : []) + (isOnline ? [.delete] : [])
-        case .failed(.tokenLacksSubmission): [.replaceToken, .edit, .delete]
+        case .failed(.tokenLacksSubmission) where !tokenCanSend: [.replaceToken, .edit, .delete]
         case .failed: [.edit, .retry, .delete]
         }
     }
@@ -284,8 +303,9 @@ struct OutboxRow: View {
         sendsAround.addingTimeInterval(Outbox.cancelDeadline - TimeInterval(Outbox.holdSeconds))
     }
 
-    static func status(of state: Outbox.State, now: Date) -> String {
+    static func status(of state: Outbox.State, now: Date, tokenCanSend: Bool = false) -> String {
         switch state {
+        case .failed(.tokenLacksSubmission) where tokenCanSend: "Not sent: the API token couldn't send mail then."
         case .waiting(.offline): "Waiting for connection"
         case .waiting(.uploading(let fraction)):
             fraction.map { "Uploading attachments – \(Int(($0 * 100).rounded())) %" } ?? "Uploading attachments"
@@ -323,10 +343,15 @@ struct OutboxRow: View {
     }
 }
 
-/// A draft written here that Fastmail doesn't have yet.
+/// A draft written here that Fastmail doesn't have yet. Delete asks first (`delete`), as for a message: what is
+/// written here exists nowhere else.
 struct OutboxDraftRow: View {
     let draft: Outbox.DraftSummary
     let actions: OutboxActions
+    let delete: () -> Void
+
+    static let deleteWarning =
+        "What was written on this device can't be recovered. A copy in Fastmail's Drafts goes to Trash."
 
     var body: some View {
         ViewThatFits(in: .horizontal) {
@@ -344,7 +369,7 @@ struct OutboxDraftRow: View {
         .padding(.vertical, 4)
         .contextMenu {
             Button("Open") { actions.open(draft) }
-            Button("Delete", role: .destructive) { Task { await actions.delete(draft) } }
+            Button("Delete", role: .destructive, action: delete)
         }
     }
 
@@ -371,7 +396,7 @@ struct OutboxDraftRow: View {
     private var buttons: some View {
         HStack(spacing: 6) {
             Button("Open") { actions.open(draft) }
-            Button("Delete", role: .destructive) { Task { await actions.delete(draft) } }
+            Button("Delete", role: .destructive, action: delete)
         }
         .buttonStyle(.bordered)
         .controlSize(.small)
