@@ -178,6 +178,11 @@ public final class AttachmentCenter {
             try await writer.finish(evictingBeyond: MailStore.attachmentCacheLimit)
         } catch {
             await writer.abort()
+            // Another write of the same attachment, such as prefetching storing it whole, stopped this one. If
+            // that write is done, the attachment is there all the same.
+            if error as? MailStoreError == .writerClosed, (try? await store.isAttachmentCached(blobId: blobId)) == true {
+                return
+            }
             throw error
         }
     }

@@ -121,6 +121,25 @@ struct AttachmentCenterTests {
         #expect(transport.server.downloadCount == 1)
     }
 
+    @Test func anOpenGoesOnWhenPrefetchingCachedTheSameAttachmentMeanwhile() async throws {
+        // Prefetching downloads small attachments whole and stores them in one step, which stops the writer of a
+        // download of the same attachment that is under way.
+        let prefetched = try await JMAPClient(token: "demo", transport: transport, maxRetries: 0)
+            .download(blobId: "e3-file0", type: "application/pdf")
+        transport.holdsDownloads = true
+        let opening = Task { try await center.previewURL(for: Self.part()) }
+        let sharing = Task { try await center.data(for: Self.part()) }
+        #expect(await eventually { center.progress(blobId: "e3-file0")?.received == 65_536 })
+
+        try await store.storeAttachment(prefetched, blobId: "e3-file0", type: "application/pdf", evictingBeyond: nil)
+        transport.releaseDownloads()
+
+        #expect(try Data(contentsOf: try await opening.value) == prefetched)
+        #expect(try await sharing.value == prefetched)
+        #expect(center.downloads.isEmpty)
+        #expect(try await store.cachedAttachment(blobId: "e3-file0") == prefetched)
+    }
+
     // MARK: Progress and failures
 
     @Test func progressIsReportedAndCancellingLeavesNothingCached() async throws {
