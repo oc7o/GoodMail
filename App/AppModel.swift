@@ -330,7 +330,12 @@ final class MailAccount {
     }
 
     func noteSent(_ id: UUID, subject: String) {
-        lastSent = SentMessage(id: id, subject: subject, at: Date())
+        let sent = SentMessage(id: id, subject: subject, at: Date())
+        lastSent = sent
+        Task {
+            try? await Task.sleep(for: .seconds(Self.offlineNoticeDuration))
+            if lastSent == sent { lastSent = nil }
+        }
     }
 
     /// Sent within the last few seconds and waiting for a connection: "Will send when you're back online".

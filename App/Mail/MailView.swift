@@ -127,6 +127,13 @@ struct SendBanner: View {
     let openOutbox: () -> Void
 
     var body: some View {
+        // The timeline runs only while there is something to show.
+        if account.mail.outbox.undoable != nil || account.lastSent != nil {
+            banner
+        }
+    }
+
+    private var banner: some View {
         TimelineView(.periodic(from: .now, by: 0.5)) { context in
             Group {
                 if let undoable = Self.undoable(account.mail.outbox.undoable, at: context.date) {
