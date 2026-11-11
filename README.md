@@ -5,9 +5,13 @@ An open-source, privacy-first mail client for [Fastmail](https://www.fastmail.co
 GoodMail is an independent project and is not affiliated with, endorsed by or sponsored by Fastmail Pty Ltd.
 "Fastmail" and "Masked Email" are trademarks of their respective owners.
 
-> Status: early development. M1 is done: you can read, triage and search mail, online and from the
-> encrypted local copy, save searches, and manage Masked Email. M2's composing works too: rich text, replies and
-> forwards, drafts, attachments, sending from masked addresses, an offline Outbox with Undo Send, and unsubscribe.
+> **Archived. This project is no longer maintained.** I stopped using Fastmail, so development has ended.
+> The code stays here as it is; issues and pull requests are closed. You're welcome to fork it under the MIT license.
+>
+> Where it stopped: M1 and M2 are done. You can read, triage and search mail, online and from the encrypted local
+> copy, save searches, and manage Masked Email. Composing works too: rich text, replies and forwards, drafts,
+> attachments, sending from masked addresses, an offline Outbox with Undo Send, and unsubscribe. M3 and later
+> were never started.
 
 ## Goals
 
@@ -18,6 +22,8 @@ GoodMail is an independent project and is not affiliated with, endorsed by or sp
 - Everything else a good mail client needs: threads, swipe actions, keyboard shortcuts, offline actions, and undo.
 
 ## Roadmap
+
+As planned before the project was archived. Only M0–M2 were built.
 
 | Milestone | Scope |
 |---|---|
