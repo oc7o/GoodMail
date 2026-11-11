@@ -2,6 +2,9 @@
 
 An open-source, privacy-first mail client for [Fastmail](https://www.fastmail.com), native on iOS and macOS (SwiftUI).
 
+GoodMail is an independent project and is not affiliated with, endorsed by or sponsored by Fastmail Pty Ltd.
+"Fastmail" and "Masked Email" are trademarks of their respective owners.
+
 > Status: early development. M1 is done: you can read, triage and search mail, online and from the
 > encrypted local copy, save searches, and manage Masked Email. M2's composing works too: rich text, replies and
 > forwards, drafts, attachments, sending from masked addresses, an offline Outbox with Undo Send, and unsubscribe.

@@ -5,6 +5,9 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 # Xcode 27 images are labelled by Xcode version, not by macOS version.
 jobs:
   test-packages:
